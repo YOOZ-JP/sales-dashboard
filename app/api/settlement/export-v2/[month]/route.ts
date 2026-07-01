@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
-import { fillInputV2Template } from "@/features/settlement/lib/export/input-v2-filler";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -99,6 +98,9 @@ export async function GET(
   }
 
   try {
+    const { fillInputV2Template } = await import(
+      "@/features/settlement/lib/export/input-v2-filler"
+    );
     const result = await fillInputV2Template({ month, records });
     return new NextResponse(result.buffer as unknown as BodyInit, {
       headers: {

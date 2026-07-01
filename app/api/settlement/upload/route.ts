@@ -13,16 +13,11 @@
  */
 import { NextResponse } from "next/server";
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
-import { createServiceClient, hasServiceRoleKey } from "@/features/settlement/lib/supabase/server";
 import type { Json } from "@/features/settlement/lib/supabase/types";
-import { parseFile } from "@/features/settlement/lib/parsers";
 import {
-  toSalesRecords,
-  buildLookupMaps,
   type TransformContext,
   type LookupMaps,
 } from "@/features/settlement/lib/aggregation/to-sales-records";
-import { writeToArchive } from "@/features/settlement/lib/storage/archive";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -30,6 +25,17 @@ export const maxDuration = 60;
 export async function POST(request: Request) {
   const unauthorized = requireSettlementApiAuth(request);
   if (unauthorized) return unauthorized;
+
+  const [supabaseServer, parsers, aggregation, archive] = await Promise.all([
+    import("@/features/settlement/lib/supabase/server"),
+    import("@/features/settlement/lib/parsers"),
+    import("@/features/settlement/lib/aggregation/to-sales-records"),
+    import("@/features/settlement/lib/storage/archive"),
+  ]);
+  const { createServiceClient, hasServiceRoleKey } = supabaseServer;
+  const { parseFile } = parsers;
+  const { toSalesRecords, buildLookupMaps } = aggregation;
+  const { writeToArchive } = archive;
 
   if (!hasServiceRoleKey()) {
     return NextResponse.json(
