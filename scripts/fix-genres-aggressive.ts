@@ -15,7 +15,7 @@ function stripEdition(title: string): string {
     .replace(/\s*（\d+）/g, '')
     .replace(/\s*\(\d+\)/g, '')
     .replace(/\s*\d+$/, '')
-    .replace(/　/g, ' ')
+    .replace(/\u3000/g, ' ')
     .trim();
 }
 

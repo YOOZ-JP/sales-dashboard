@@ -349,9 +349,7 @@ export default function DataUploadPage() {
   // 단일 파일 파싱 (내부용)
   const parseOneFile = useCallback(
     async (file: File): Promise<{ rows: ParsedRow[]; fmt: DetectedFormat }> => {
-
-      try {
-        const buffer = await file.arrayBuffer();
+      const buffer = await file.arrayBuffer();
 
         // 1단계: Excel 여부 판별 (매직 바이트)
         const magic = new Uint8Array(buffer.slice(0, 4));
@@ -472,12 +470,9 @@ export default function DataUploadPage() {
           rows = parseDmmSokuhochi(textContent);
         }
 
-        return { rows, fmt };
-      } catch (err) {
-        throw err;
-      }
+      return { rows, fmt };
     },
-    [t],
+    [],
   );
 
   // 여러 파일 처리 (합산 지원)
@@ -560,7 +555,7 @@ export default function DataUploadPage() {
         setErrorMessage(errMsg);
       }
     },
-    [parseOneFile, finalizeParsed, saveDebugLog, t],
+    [parseOneFile, finalizeParsed, saveDebugLog, t, uploadLogs],
   );
 
   const handleDrop = useCallback(

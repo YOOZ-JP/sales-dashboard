@@ -43,6 +43,12 @@ const platformCardItem = {
   show: { opacity: 1, y: 0, transition: { duration: 0.35, ease: [0.22, 1, 0.36, 1] as const } },
 };
 
+type ChartTooltipPayload = {
+  value?: string | number;
+  name?: string | number;
+  color?: string;
+};
+
 // ─── Skeletons ───────────────────────────────────────────────
 function KPISkeleton() {
   return (
@@ -202,7 +208,10 @@ export default function PlatformsClient({ initialData }: PlatformsClientProps) {
   // 기간 변경 시 1위 플랫폼 자동 선택
   useEffect(() => {
     if (displaySummary.length > 0) {
-      setSelectedPlatform(displaySummary[0].channel);
+      const handle = window.requestAnimationFrame(() => {
+        setSelectedPlatform(displaySummary[0].channel);
+      });
+      return () => window.cancelAnimationFrame(handle);
     }
   }, [displaySummary]);
 
@@ -602,15 +611,15 @@ export default function PlatformsClient({ initialData }: PlatformsClientProps) {
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--color-chart-grid)" />
                     <XAxis dataKey="label" tick={{ fill: 'var(--color-text-muted)', fontSize: 13 }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fill: 'var(--color-text-muted)', fontSize: 13 }} axisLine={false} tickLine={false} tickFormatter={formatShort} width={110} />
-                    <ReTooltip content={({ active, payload, label }: any) => {
+                    <ReTooltip content={({ active, payload, label }: { active?: boolean; payload?: readonly ChartTooltipPayload[]; label?: string | number }) => {
                       if (!active || !payload) return null;
-                      const sorted = [...payload].sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+                      const sorted = [...payload].sort((a, b) => Number(b.value ?? 0) - Number(a.value ?? 0));
                       return (
                         <div style={{ background: 'var(--color-surface)', border: '1px solid var(--color-glass-border)', borderRadius: 12, padding: '10px 14px', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
                           <p style={{ color: 'var(--color-text-secondary)', fontSize: 13, marginBottom: 6 }}>{label}</p>
                           {sorted.map((entry) => (
-                            <p key={entry.name} style={{ color: entry.color, fontSize: 14, fontWeight: 600 }}>
-                              {t(getPlatformBrand(entry.name).nameKR, getPlatformBrand(entry.name).nameJP) || entry.name}: {formatCurrency(entry.value)}
+                            <p key={String(entry.name)} style={{ color: entry.color, fontSize: 14, fontWeight: 600 }}>
+                              {t(getPlatformBrand(String(entry.name)).nameKR, getPlatformBrand(String(entry.name)).nameJP) || String(entry.name)}: {formatCurrency(Number(entry.value ?? 0))}
                             </p>
                           ))}
                         </div>

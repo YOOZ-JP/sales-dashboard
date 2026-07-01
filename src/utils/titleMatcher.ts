@@ -13,7 +13,7 @@ export function toCore(s: string): string {
     // 문장부호 정규화 (전각→반각)
     .replace(/～/g, '~').replace(/〜/g, '~')
     .replace(/！/g, '!').replace(/？/g, '?')
-    .replace(/　/g, ' ')
+    .replace(/\u3000/g, ' ')
     // 전각 괄호 → 반각 통일
     .replace(/［/g, '[').replace(/］/g, ']')
     // 부제/괄호 제거

@@ -54,15 +54,6 @@ function parseNum(val: unknown): number | null {
   return isNaN(n) ? null : n;
 }
 
-function parseFreeChapters(val: unknown): number {
-  if (!val || val === '-') return 0;
-  const s = String(val);
-  const m = s.match(/(\d+)~(\d+)/);
-  if (m) return parseInt(m[2]);
-  const n = parseInt(s);
-  return isNaN(n) ? 0 : n;
-}
-
 function normalizeFormat(val: unknown): string {
   if (!val) return 'WEBTOON';
   const s = String(val).toUpperCase().trim();

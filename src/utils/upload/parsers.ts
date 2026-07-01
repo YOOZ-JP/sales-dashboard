@@ -647,7 +647,7 @@ export function parseRentaSokuhochi(text: string): ParsedRow[] {
   // 일별 컬럼 찾기 (YYYY/MM/DD 형식)
   const dateCols: Array<{ idx: number; date: string }> = [];
   header.forEach((h, idx) => {
-    const m = h.match(/^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$/);
+    const m = h.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
     if (m) {
       dateCols.push({ idx, date: `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` });
     }
@@ -739,7 +739,7 @@ export function parseEbookjapanSokuhochi(text: string): ParsedRow[] {
     const amount = parseInt(String(cols[amountIdx] ?? '0').replace(/[¥,]/g, ''), 10) || 0;
     if (!titleJP || !rawDate || amount <= 0) continue;
 
-    const dm = rawDate.match(/(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})/);
+    const dm = rawDate.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
     if (!dm) continue;
     const saleDate = `${dm[1]}-${dm[2].padStart(2, '0')}-${dm[3].padStart(2, '0')}`;
 
@@ -836,12 +836,12 @@ export function parseDmmSokuhochi(text: string): ParsedRow[] {
 
     // 날짜: "2026年04月01日" / "2026/04/01" / "2025/04/01～2025/04/30"
     let saleDate = '';
-    const rangeMatch = rawDate.match(/^(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})日?\s*[～~]\s*\d{4}/);
+    const rangeMatch = rawDate.match(/^(\d{4})[/-年](\d{1,2})[/-月](\d{1,2})日?\s*[～~]\s*\d{4}/);
     if (rangeMatch) {
       saleDate = `${rangeMatch[1]}-${rangeMatch[2].padStart(2, '0')}-01`;
     } else {
       const m1 = rawDate.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
-      const m2 = rawDate.match(/(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})/);
+      const m2 = rawDate.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
       const m = m1 || m2;
       if (m) saleDate = `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
     }
@@ -904,7 +904,7 @@ export function parseLineMangaSokuhochi(text: string): ParsedRow[] {
     // 날짜: "2026年04月15日" 또는 "2026/04/15"
     let saleDate = '';
     const dm1 = rawDate.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
-    const dm2 = rawDate.match(/(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})/);
+    const dm2 = rawDate.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
     const dm = dm1 || dm2;
     if (!dm) continue;
     saleDate = `${dm[1]}-${dm[2].padStart(2, '0')}-${dm[3].padStart(2, '0')}`;

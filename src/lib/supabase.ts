@@ -30,7 +30,7 @@ export function extractBaseTitle(titleJp: string): string {
     .replace(/\(巻\)/g, '')
     .replace(/（巻）/g, '')
     // 괄호 없는 에디션 표기도 제거 (改訂版, 完全版 등)
-    .replace(/[\s　]*(改訂版|完全版|分冊版|特装版|連載版)/g, '')
+    .replace(/[\s\u3000]*(改訂版|完全版|分冊版|特装版|連載版)/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }

@@ -46,7 +46,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) setUser(await res.json());
-    } catch {}
+    } catch {
+      setUser(null);
+    }
   }, []);
 
   // 앱 마운트 시 세션 복원

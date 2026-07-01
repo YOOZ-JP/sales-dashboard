@@ -195,8 +195,12 @@ export default function DashboardClient({ initialData }: DashboardClientProps) {
   }, [startDate, endDate]);
   const [trendModeOverride, setTrendModeOverride] = useState<TrendMode | null>(null);
   // 기간 변경 시 자동 전환 리셋
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { setTrendModeOverride(null); }, [startDate, endDate]);
+  useEffect(() => {
+    const handle = window.requestAnimationFrame(() => {
+      setTrendModeOverride(null);
+    });
+    return () => window.cancelAnimationFrame(handle);
+  }, [startDate, endDate]);
   const trendMode: TrendMode = trendModeOverride ?? (isOneMonth ? 'daily' : 'monthly');
   const setTrendMode = (mode: TrendMode) => setTrendModeOverride(mode);
 
