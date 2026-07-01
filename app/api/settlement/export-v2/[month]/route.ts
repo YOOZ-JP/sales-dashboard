@@ -4,7 +4,7 @@ import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
 import { fillInputV2Template } from "@/features/settlement/lib/export/input-v2-filler";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 async function loadRecords(month: string): Promise<{ records: Record<string, unknown>[]; source: string }> {
   const supabaseConfigured =
