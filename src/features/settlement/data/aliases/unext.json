@@ -1,0 +1,47 @@
+{
+  "platform": "unext",
+  "channel_code": "u-next",
+  "client_code": "u_next",
+  "note": "U-NEXT (hol0002587_株式会社RIVERSE御中_YYYYMM.xlsx). Row-level rules reverse-engineered from raw 202603 vs GT 202604 (30 rows).",
+
+  "raw_source_file_pattern": "^hol\\d{7}_株式会社RIVERSE御中_\\d{6}\\.xlsx$",
+  "data_sheet": "コンテンツ明細",
+  "summary_sheet": "タイトル一覧",
+  "header_sheet": "ヘッダー",
+
+  "aggregation": {
+    "group_by": ["タイトル名"],
+    "sum_columns": {
+      "raw_sales": "売上",
+      "raw_bunpai": "分配額"
+    },
+    "rate_column": "料率"
+  },
+
+  "row_formulas": {
+    "after_tax_jpy": "Σ売上",
+    "total_amount_jpy": "round(Σ売上 × 1.10)",
+    "before_tax_jpy": "total_amount_jpy",
+    "fee_jpy": 0,
+    "after_tax_income_jpy": "Σ分配額",
+    "before_tax_income_jpy": "round(Σ分配額 × 1.10)",
+    "consumption_tax_jpy": "before_tax_income_jpy - after_tax_income_jpy",
+    "withholding_tax_jpy": 0
+  },
+
+  "title_normalize": [],
+
+  "default_type": "WT",
+  "default_distribution": "non-ex",
+  "default_rs": 0.4,
+  "tax_multiplier": 1.10,
+
+  "observations": [
+    "『コンテンツ明細』 has one row per episode/content unit (~2207 rows in 202603).",
+    "『タイトル一覧』 has one row per 作品 and matches GT 1:1 (30 rows).",
+    "『ヘッダー』 『集計対象期間』 yields sales_month (e.g. 2026/03/01-2026/03/31 → 2026-03-01).",
+    "料率 is constant 0.4 across every detail row (default_rs).",
+    "Titles match GT verbatim — no tilde / fullwidth normalization needed.",
+    "All 30 GT rows are type=WT, distribution_strategy=non-ex, channel=u-next, fee_jpy=0, withholding_tax_jpy=0."
+  ]
+}

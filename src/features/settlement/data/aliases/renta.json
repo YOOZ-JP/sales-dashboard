@@ -1,0 +1,63 @@
+{
+  "platform": "renta",
+  "client_code": "papyless",
+  "channel_code": "renta",
+  "description": "Renta (Papyless) CSV title/type normalization rules. Raw rows are episode-level (第N話) and must be aggregated per 'book' using these rules.",
+
+  "normalization": {
+    "tilde_full_to_wave": true,
+    "fullwidth_brackets_to_half": true,
+    "collapse_whitespace": true,
+    "strip_suffix_regex": [
+      { "pattern": "【フルカラー】", "flags": "g", "comment": "Color/vertical tag, does not influence aggregation." },
+      { "pattern": "(【特装版】)\\s*\\d+$", "replace": "$1", "comment": "Trailing volume number after 特装版 (e.g. 【特装版】1)." },
+      { "pattern": "(【分冊版】)\\s*\\d+$", "replace": "$1", "comment": "Trailing volume number after 分冊版." },
+      { "pattern": "第\\d+話\\s*(?:外伝\\d+)?(?:\\.\\d+)?$", "comment": "Episode tail '第N話', optional '外伝X' or '.X' suffix." },
+      { "pattern": "\\s*\\d+話$", "comment": "Episode tail ' N話' without 第 (e.g. デイジー, 俺一人だけカンストレベル帰還者)." },
+      { "pattern": "外伝\\d*$", "comment": "Side-story tail '外伝' after digits already removed (e.g. 双子兄妹のニューライフ外伝)." },
+      { "pattern": "\\s*シーズン\\d+プロローグ$", "comment": "Season prologue tail." },
+      { "pattern": "\\s*プロローグ$", "comment": "Prologue tail." },
+      { "pattern": "\\s*[（(]\\d+[）)]$", "comment": "Trailing volume in parens like 俺だけレベルMAXなビギナー（13）." }
+    ]
+  },
+
+  "classification": {
+    "comment": "Map raw title markers to GT 'type'. Order matters (first match wins).",
+    "rules": [
+      { "if_contains": "【分冊版】", "type": "EP" },
+      { "if_contains": "【連載版】", "type": "EP" },
+      { "if_contains": "【特装版】", "type": "EB" },
+      {
+        "if_contains": "【タテコミ】",
+        "sub": [
+          { "if_contains": "改訂版", "type": "WR" },
+          { "if_contains": "完全版", "type": "WT" },
+          { "if_else": true, "type": "WT_or_WR",
+            "comment": "Original タテコミ; becomes WR when a 完全版 sibling exists in the raw, otherwise WT." }
+        ]
+      },
+      { "if_ends_with_regex": "[（(]\\d+[）)]$", "type": "EB" },
+      { "default": true, "type": "EB" }
+    ]
+  },
+
+  "amount_formulas": {
+    "comment": "Derived from GT (202604): all 112 rows match exactly.",
+    "total_amount_jpy": "round_half_up( SUM(価格 * (売上冊数 + アップグレード冊数)) * 1.10 )",
+    "before_tax_jpy": "equals total_amount_jpy",
+    "after_tax_jpy": "SUM(価格 * (売上冊数 + アップグレード冊数))",
+    "consumption_tax_jpy": "floor( SUM(支払額) * 0.10 )",
+    "before_tax_income_jpy": "SUM(支払額) + consumption_tax_jpy = floor( SUM(支払額) * 1.10 )",
+    "after_tax_income_jpy": "SUM(支払額)",
+    "rs_rate": 0.37,
+    "fee_jpy": 0,
+    "withholding_tax_jpy": 0
+  },
+
+  "title_aliases": [],
+
+  "sibling_classification_notes": [
+    "For 【タテコミ】 base books WITHOUT 分冊版/連載版/特装版 markers, the human splits EACH book into at most 2 rows: WR (non-完全版, aka 'original/改訂版') and WT (完全版). If only one variant exists, the single row is WT.",
+    "Detection: strip [完全版] / 【完全版】 / [改訂版] / 【改訂版】 to get the base key. If at least one raw row has that base key with 完全版, then the non-完全版/non-改訂版 rows are typed WR."
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "platform": "piccoma_ads",
+  "client_code": "piccoma",
+  "channel_code": "piccoma_ads",
+  "_notes": {
+    "purpose": "Piccoma 動画リワード (video-reward) channel — users watch ads to earn unlock-currency.",
+    "raw_files": [
+      "動画リワード_株式会社RIVERSE_{YYYYMM}.xlsx (main)",
+      "動画リワード_株式会社RIVERSE_砂時計_{YYYYMM}.xlsx (sibling, single product)"
+    ],
+    "settlement_lag_months": 3,
+    "deposit_lag_months": 4,
+    "tax_rules": "raw sales & pay are tax-INCLUSIVE. GT uses: after_tax = round_half_up(sum/1.10); before_tax = round_half_up(after_tax*1.10); consumption_tax = floor(income*0.10); before_tax_income = consumption_tax + income.",
+    "rs_rate": 0.25,
+    "type": "AD"
+  },
+  "sheets": {
+    "daily_log": "動画リワード_株式会社RIVERSE",
+    "invoice": "お支払報告書_{YYYYMM}"
+  },
+  "daily_log_columns": {
+    "0": "日付 (2026年01月01日)",
+    "1": "出版社 (constant: 株式会社RIVERSE)",
+    "2": "書籍ID(出版社管理ID)",
+    "3": "作品名 — GROUP KEY (used as channel_title_jp / title_jp)",
+    "4": "OS (iOS | Android)",
+    "5": "動画リワード使用件数",
+    "6": "売上金額（税込） — per row, uses × 1.43",
+    "7": "R/S (0.25 fixed)",
+    "8": "精算金額(税込み) — per row, sales × 0.25"
+  },
+  "exclusive_titles": [
+    "4000年ぶりに帰還した大魔導士",
+    "F級四柱推命ハンター～運命を強奪せよ～",
+    "SSS級ランカー回帰する",
+    "レア度★1の英雄として生き残る方法~PICK ME UP~",
+    "伯爵家の末息子は最強プレイヤー",
+    "回帰した鉄血の猟犬",
+    "学士剣典",
+    "家来たちがガチで優秀すぎた件",
+    "拳王に転生した最強大魔導士",
+    "災いクラスの俺様英雄の帰還",
+    "災いクラスの俺様英雄の帰還（ノベル）",
+    "白龍公爵ペンドラゴン（ノベル）",
+    "盗掘王（ノベル）"
+  ],
+  "type_overrides": {}
+}

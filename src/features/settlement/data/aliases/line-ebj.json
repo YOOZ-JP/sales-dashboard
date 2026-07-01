@@ -1,0 +1,47 @@
+{
+  "platform": "ebj_line",
+  "client": "Line Digital Frontier",
+  "notes": [
+    "EBJ distributes to two bookstore families: LINEマンガ and ebookjapan (plus minor Yahoo!ショッピング carve-out that stays in ebj).",
+    "The CSV is tax-exclusive. GT total_amount_jpy = 販売額計 × 1.1 and before_tax_income_jpy = 許諾額計 × 1.1.",
+    "Row granularity in CSV is per chapter (単話) or per volume (単巻/全巻/blank). Aggregation key = (channel, type, normalized_title)."
+  ],
+  "title_normalization": {
+    "wave_dash_to_fullwidth_tilde": { "from": "〜", "to": "～" }
+  },
+  "store_to_channel": {
+    "LINEマンガ（APP）": "line",
+    "LINEマンガ（WEB）": "line",
+    "ebookjapan（web）": "ebj_or_ebj_webtoon",
+    "ebookjapan（APP）": "ebj_or_ebj_webtoon",
+    "ebookjapan（Yahoo! ショッピング）": "ebj_or_ebj_webtoon",
+    "_comment": "ebookjapan rows are split into `ebj` vs `ebj_webtoon` depending on the row's computed type."
+  },
+  "type_rules": [
+    { "match": "title contains 【タテヨミ】", "type": "WT", "exceptions": "WR when the title carries ［改訂版］ OR a sibling title (same base) carries [完全版]" },
+    { "match": "title contains 【分冊版】 or 【連載版】", "type": "EP" },
+    { "match": "販売単位区分 == 単話 (and title has no tag)", "type": "WT", "example": "年下旦那" },
+    { "match": "everything else (blank unit, 単巻, 全巻, 【特装版】)", "type": "EB" }
+  ],
+  "wr_detection_algorithm": "For every 【タテヨミ】 title in the file, group by base name (strip [完全版]/[改訂版]/【タテヨミ】). If a base group contains any [完全版] variant, non-full variants are WR. Titles explicitly marked ［改訂版］ are also WR.",
+  "channel_split_for_ebookjapan": {
+    "WT": "ebj_webtoon",
+    "WR": "ebj_webtoon",
+    "EP": "ebj",
+    "EB": "ebj"
+  },
+  "known_wr_titles_202604": [
+    "このご時世に家庭教師［改訂版］【タテヨミ】",
+    "スイッチ・オン［改訂版］【タテヨミ】",
+    "ワケあり姉妹の恋模様［改訂版］【タテヨミ】",
+    "召使い更生道［改訂版］【タテヨミ】",
+    "天才ハッカーたちのラブゲーム～ゼロ・デイ・アタック～【タテヨミ】",
+    "小悪魔なお隣さん［改訂版］【タテヨミ】",
+    "幼馴染のエロトラップ～発情した狼は甘すぎる～【タテヨミ】",
+    "罪と罰～すべては合意の上～［改訂版］【タテヨミ】",
+    "響弦文字【タテヨミ】"
+  ],
+  "excluded_from_this_parser": {
+    "line_ads": "71 GT rows with channel=line_ads come from `202603_LINE_AD/`, handled by line-ad.ts."
+  }
+}

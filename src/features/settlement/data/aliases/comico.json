@@ -1,0 +1,87 @@
+{
+  "platform": "comico",
+  "client_code": "comico_jp",
+  "channel_codes": {
+    "platform_sales": "comico jp",
+    "ads": "comico_ads"
+  },
+  "sheets": {
+    "settlement_letter": "精算書(JP)",
+    "platform_sales": "プラットフォーム売上現況",
+    "title_breakdown": "作品別売上現況",
+    "ads": "広告売上",
+    "mg": "MG内訳",
+    "exchange_rate": "為替レート"
+  },
+  "platform_sales_columns": {
+    "row_layout": "header row 0 + 1, data from row 2",
+    "0": "年",
+    "1": "月",
+    "2": "Content Type (comic | magazine_comic)",
+    "3": "Content ID",
+    "4": "プラットフォーム (always 'comico 日本')",
+    "5": "マスター作品名 (canonical title — use this)",
+    "7": "作品名",
+    "9": "購入の種類 (WEB / iOS / Google)",
+    "10": "コイン売上(税込) — paid coin, tax-incl",
+    "14": "合計 — paid + free coin, tax-incl",
+    "15": "(A)コイン売上(税抜) — paid coin tax-excl",
+    "20": "(F)分配率 — RS for paid coin",
+    "21": "(G)分配金[(E)×(F)] — paid distribution tax-excl",
+    "22": "(A')コイン売上(税抜) — free coin tax-excl",
+    "27": "(F')分配率 — RS for free coin",
+    "28": "(G')分配金[(E')×(F')] — free distribution tax-excl",
+    "30": "分配金[(G)+(G')] — total distribution tax-excl (rounded)",
+    "31": "精算対象分配金(税抜) — title-level total (only first row of group)"
+  },
+  "ads_columns": {
+    "row_layout": "header row 0, data from row 1",
+    "0": "年",
+    "1": "月",
+    "2": "広告位置 (Reward / Detail)",
+    "3": "タイプ (comic / magazine_comic)",
+    "4": "Content ID",
+    "5": "作品名",
+    "8": "マスター作品名 (use this)",
+    "9": "売上高 (tax-excl)",
+    "10": "分配率 (rs)",
+    "11": "分配金額 (tax-excl)",
+    "12": "通貨"
+  },
+  "formulas": {
+    "comic_type": {
+      "total_amount_jpy": "sum(col14) per title  (paid+free coin, tax-incl)",
+      "before_tax_income_jpy": "round(sum(col30) * 1.10)",
+      "rs": 0.5
+    },
+    "magazine_comic_type": {
+      "total_amount_jpy": "sum(col10) per title  (paid coin ONLY, tax-incl)",
+      "before_tax_income_jpy": "round(sum(col21) * 1.10)",
+      "rs": 0.55,
+      "notes": "magazine_comic rows set (F')=0.55 but (G')=0 because (A')=0"
+    },
+    "ads": {
+      "total_amount_jpy": "round(sum(売上高) * 1.10)",
+      "before_tax_income_jpy": "round(sum(分配金額) * 1.10)",
+      "rs": "directly from col10 (0.3 for comic, 0.2 for magazine_comic)"
+    }
+  },
+  "type_classification": {
+    "EB": "magazine_comic AND title contains 【特装版】",
+    "EP": "magazine_comic AND title contains 【分冊版】 (or other magazine_comic)",
+    "WR": "title contains 【全年齢版】  OR  base title has sibling `title + 【完全版】`",
+    "WT": "everything else (WEBTOON — including 【完全版】)"
+  },
+  "sales_month_rules": {
+    "comico jp": "from (年, 月) columns of プラットフォーム売上現況 (usually settlement month - 1)",
+    "comico_ads": "from (年, 月) columns of 広告売上 (usually settlement month - 2)"
+  },
+  "title_normalization": {
+    "note": "Titles in プラットフォーム売上現況 col5 already match GT channel_title_jp exactly, so no normalization needed. Specifically '～' (full-width wave dash) and '~' (half-width tilde) variants are preserved as-is, and markers 【完全版】/【全年齢版】/【分冊版】/【特装版】 are kept verbatim."
+  },
+  "type_overrides": {
+    "スパークリング・ベイビー": "WR",
+    "逃げれば、逃げるほどに": "WR",
+    "comment": "Documented in アテンダンス rule: when a sibling `title + 【完全版】` exists, the base form is the all-ages (WR) edition. The parser derives this automatically; entries here are for human reference."
+  }
+}

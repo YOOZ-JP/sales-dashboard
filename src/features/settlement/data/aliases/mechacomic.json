@@ -1,0 +1,33 @@
+{
+  "platform": "mechacomic",
+  "client_code": "amutus",
+  "channel_code": "mechacomic",
+  "description": "Title/type overrides for Mechacomic (Amutus / めちゃコミック). Keys are `${series}|${kind}` as emitted from スマートフォン明細/アプリ明細 detail sheets.",
+  "type_rules": {
+    "heuristic": {
+      "改訂版_in_title": "WR",
+      "has_kanzen_sibling": "WR",
+      "kind_contains_話": "WT",
+      "kind_is_巻_and_分冊版": "EP",
+      "kind_is_巻_else": "EB"
+    },
+    "overrides": {
+      "結婚商売[完全版]|巻": {
+        "type": "WT",
+        "note": "'結婚商売[完全版]' is sold as 巻 but GT classifies it as WT (not EB). Likely because it's a re-edit of a WT series that itself still exists; no 分冊版 form."
+      },
+      "融点～とけあい～【完全版】|巻": {
+        "type": "EP",
+        "note": "This 巻 row uses EP (not EB) because GT treats '完全版' of a WT sibling as the episode-packed edition, while '完全版【特装版】' takes the EB slot."
+      }
+    }
+  },
+  "title_normalization": {
+    "description": "No title mapping required for Mechacomic — raw シリーズ名 already matches GT channel_title_jp / title_jp 1:1 for all 107 rows in 202604."
+  },
+  "tax_rules": {
+    "total_amount_jpy": "round(sum(売上金額) * 1.10)",
+    "before_tax_jpy": "same as total_amount_jpy",
+    "before_tax_income_jpy": "floor(sum(支払) * 1.10)"
+  }
+}

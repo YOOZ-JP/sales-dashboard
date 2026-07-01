@@ -1,0 +1,25 @@
+{
+  "platform": "kadokawa",
+  "description": "Rules for KADOKAWA 支払通知書 CSV (Shift-JIS). PDF exists too but CSV is the primary source.",
+  "channel_code": "kadokawa",
+  "client_code": "kadokawa",
+  "csv_encoding": "shift_jis",
+  "series_rollup": [
+    {
+      "comment": "All volumes of 盗掘王 (incl. 分冊版) aggregate into a single GT row.",
+      "series_key": "盗掘王",
+      "pattern": "^盗掘王",
+      "gt_title": "盗掘王"
+    }
+  ],
+  "skip_titles": [],
+  "adjustment_titles": [
+    "消費税端数差額調整"
+  ],
+  "adjustment_attaches_to": "盗掘王",
+  "rules": {
+    "amount_is_tax_incl": true,
+    "tax_rate": 0.10,
+    "type": "EB"
+  }
+}

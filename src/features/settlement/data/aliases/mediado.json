@@ -1,0 +1,70 @@
+{
+  "platform": "mediado",
+  "client_code": "mediado",
+  "channel_code": "mediado_sales",
+  "description": "Title normalization + type/RS derivation rules for MediaDo (メディアドゥ) TSV settlement reports. Input files come from two subfolders: '…_コミック' (=COMIC/EB/EP) and '…_タテヨミ' (=WT/WR). 77 GT rows for 202604 settle against 77 unique タイトル名称s in the 202601 raw TSVs — no alias mapping is required on the title side.",
+  "file_detection": {
+    "subfolder_patterns": [
+      { "pattern": "BR\\d+_RIVERSE_コミック", "kind": "COMIC" },
+      { "pattern": "BR\\d+_RIVERSE_タテヨミ", "kind": "TATE" }
+    ],
+    "encoding": "utf-8",
+    "format": "tsv"
+  },
+  "title_normalization": {
+    "description": "No title mapping required — raw タイトル名称 matches GT channel_title_jp verbatim for all 77 rows in 202604, preserving full/half-width brackets (【】 vs [] vs ［］).",
+    "rules": []
+  },
+  "type_rules": {
+    "heuristic": {
+      "COMIC_folder": {
+        "title_has_【分冊版】_or_【連載版】": "EP",
+        "else": "EB"
+      },
+      "TATE_folder": {
+        "title_has_［改訂版］_or_[改訂版]": "WR",
+        "title_has_[完全版]_sibling_in_same_folder": "WR (the base, non-完全版 title is the legacy variant)",
+        "else": "WT"
+      }
+    },
+    "observed_distribution_202604": {
+      "WT": 53,
+      "EP": 10,
+      "WR": 10,
+      "EB": 4
+    }
+  },
+  "rs_rules": {
+    "description": "Each raw row reports a 料率 (one of 35, 40, or 45). A title can mix multiple rate tiers across bookstores. The GT `rs` string is formed by sorting the unique rates ascending and joining them.",
+    "format": {
+      "single_rate": "numeric: rate / 100 (e.g. 0.35, 0.4)",
+      "multi_rate": "'A/B%' or 'A/B/C%' sorted ascending (e.g. '35/40%', '35/40/45%')"
+    },
+    "effective_rs_rate": "max rate tier (used for the numeric rs_rate field)"
+  },
+  "tax_rules": {
+    "total_amount_jpy": "round( Σ(販売価格 × DL数) × 1.10 )",
+    "before_tax_jpy": "same as total_amount_jpy",
+    "after_tax_jpy": "round( Σ(販売価格 × DL数) )",
+    "after_tax_income_jpy": "round( Σ 税抜き金額 )",
+    "before_tax_income_jpy": "round( Σ 税抜き金額 × 1.10 )",
+    "consumption_tax_jpy": "before_tax_income_jpy - after_tax_income_jpy",
+    "withholding_tax_jpy": "0",
+    "fee_jpy": "0"
+  },
+  "known_wr_via_kanzen_sibling": {
+    "description": "TATE titles that have a sibling with '[完全版]' / '［完全版］' bracket tag get type=WR (they are the legacy variant). Listed here for traceability; the parser derives this dynamically from the TSV.",
+    "titles": [
+      "♂♀コンサルタント【タテヨミ】",
+      "サベージ・キャッスル～堕落の迷宮～【タテヨミ】",
+      "幼馴染のエロトラップ～発情した狼は甘すぎる～【タテヨミ】",
+      "融点～とけあい～【タテヨミ】"
+    ]
+  },
+  "settlement_lag_months": 3,
+  "notes": [
+    "Raw TSVs are UTF-8 despite docs sometimes claiming Shift-JIS.",
+    "Ends with a single blank row (empty 発行形態) — skipped on parse.",
+    "No rs numeric values were seen for 0.45 — top tier single-rate caps at 0.40 in this dataset."
+  ]
+}

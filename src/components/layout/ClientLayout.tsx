@@ -54,6 +54,7 @@ const navGroups: NavGroup[] = [
     label: { ko: '운영', ja: '運営' },
     items: [
       { to: '/upload', ko: '속보치 업로드', ja: '速報アップロード', icon: Upload },
+      { to: '/settlement', ko: '정산 / INPUT Export', ja: '精算 / INPUT Export', icon: FileText },
       { to: '/reports', ko: '리포트 다운로드', ja: 'レポートDL', icon: FileText },
       { to: '/data', ko: '데이터베이스 관리', ja: 'データベース管理', icon: Database },
     ],

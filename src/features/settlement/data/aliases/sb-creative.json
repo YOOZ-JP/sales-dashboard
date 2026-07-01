@@ -1,0 +1,33 @@
+{
+  "platform": "sb_creative",
+  "description": "SB Creative has two raw files: 月次の前払印税報告書 PDF (line items + MG table) and 支払通知書 eom PDF (monthly cash summary).",
+  "channel_code": "sb creative",
+  "client_code": "sb creative",
+  "rules": {
+    "amount_is_tax_incl": true,
+    "tax_rate": 0.10,
+    "type": "EB",
+    "emit_rows_with_net_zero_or_below": false
+  },
+  "series_rollup": [
+    {
+      "comment": "Strip volume markers and 分冊版 subtitle to get a single family per series.",
+      "pattern": "^(.*?)（コミック）",
+      "gt_title_group": 1
+    }
+  ],
+  "known_families": [
+    "売られた花嫁は義家族に溺愛される",
+    "赤い瞳の廃皇子",
+    "皇帝になるので離婚してください",
+    "暴君皇帝と離婚します",
+    "傲慢の時代",
+    "アカデミーの天才剣士"
+  ],
+  "notes": [
+    "Per-title rows on page 1–2 look like: `<TITLE> ¥<amount>` — they are tax-inclusive.",
+    "The MG table on the last page lists one row per MG title with current-period draw (¥当期MG取崩額).",
+    "GT emits one row per base family where (Σrows - MGdraw) > 0. In practice only the dominant family survives.",
+    "before_tax_income_jpy = net (tax-inclusive); after_tax_income_jpy = round(net / 1.10)."
+  ]
+}

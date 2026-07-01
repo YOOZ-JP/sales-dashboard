@@ -1,0 +1,55 @@
+{
+  "platform": "piccoma_gaiakuhan",
+  "client_code": "piccoma",
+  "client_label": "Piccoma",
+  "note": "Piccoma EPUB 外販 (external) — Piccoma distributes EPUBs on other JP ebook stores (ブックライブ, Kindle, まんがセゾン, U-NEXT, コミックシーモア, ebookjapan, パピレス, DMM, …) on our behalf and remits a royalty share.",
+  "gt_channel": "piccoma_sales",
+  "gt_channel_alternates": ["piccoma_gaiakuhan"],
+  "source_files": {
+    "payment_report": {
+      "pattern": "^外販お支払報告書 .*RIVERSE.*\\.xlsx$",
+      "primary_sheet": "【巻】外販お支払報告書",
+      "summary_sheet": "【巻】要約",
+      "header_row_label": "対象年月",
+      "header_columns": [
+        "対象年月",
+        "販売先",
+        "発行元",
+        "対象作品",
+        "巻数",
+        "受領額",
+        "分配料率",
+        "分配金"
+      ]
+    },
+    "invoice": {
+      "pattern": "^【請求書】ピッコマEPUB外販ロイヤリティー_.*\\.xlsx$",
+      "note": "Invoice sheet — aggregate per-title row; used as a cross-check only."
+    },
+    "pdf": {
+      "pattern": "\\.pdf$",
+      "note": "Ignored."
+    }
+  },
+  "defaults": {
+    "type": "EB",
+    "distribution_strategy": "exclusive",
+    "country": "JP",
+    "channel_code": "piccoma_gaiakuhan"
+  },
+  "formulas": {
+    "after_tax_jpy": "sum(受領額) per 対象作品",
+    "total_amount_jpy": "round(after_tax_jpy × 1.10)",
+    "before_tax_jpy": "total_amount_jpy",
+    "after_tax_income_jpy": "sum(分配金) per 対象作品",
+    "consumption_tax_jpy": "round(after_tax_income_jpy × 0.10)",
+    "before_tax_income_jpy": "after_tax_income_jpy + consumption_tax_jpy",
+    "rs_rate": "(分配料率 / 100)  (single rate per row, e.g. 60 → 0.60)"
+  },
+  "aggregation": "One emitted record per 対象作品 (title). 店舗 (販売先) × 巻数 × 対象年月 are collapsed — GT carries a single consolidated row per title for this channel.",
+  "totals_filter": "Rows where 対象年月 is empty or 分配料率 == '合計' are the totals footer → skip.",
+  "title_normalization": {
+    "note": "Raw 対象作品 is used verbatim as channel_title_jp and title_jp. No suffix stripping required."
+  },
+  "sales_month_rule": "Month embedded in filename prefix YYYYMM of 報告分 (〆報告分). Settlement = that same month's end."
+}

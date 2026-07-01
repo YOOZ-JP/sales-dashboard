@@ -1,0 +1,19 @@
+{
+  "$comment": "DMM / FANZA title aliases. Keys are `<type>|<gt_title>`. When present, the parser uses alias.series + alias.type for lookup instead of the GT title.",
+  "direct": {
+    "EB|融点 [完全版](巻)": {
+      "series": "融点〜とけあい〜[完全版]【特装版】",
+      "type": "EB",
+      "note": "GT records bound-volume (EB) with a shortened display name; raw rows use the full series name with 【特装版】 suffix."
+    }
+  },
+  "rules": [
+    "For any GT title ending with 【分冊版】, the parser also tries the title with 【分冊版】 stripped (recorder sometimes appends it to WT/EP rows).",
+    "For any GT title not ending with 【分冊版】, the parser also tries the title with 【分冊版】 appended (recorder sometimes omits it on EP rows).",
+    "♥ is stripped from titles before matching (e.g. 我が家のヒモ男♥【分冊版】 → 我が家のヒモ男【分冊版】).",
+    "Fullwidth tilde ～ (U+FF5E) is unified with wave dash 〜 (U+301C) before matching.",
+    "Fullwidth brackets ［ ］ are converted to ASCII [ ].",
+    "Fullwidth digits ０-９ are normalised to 0-9.",
+    "All spaces (both ASCII and ideographic) and ♥ are stripped in the canonical key."
+  ]
+}

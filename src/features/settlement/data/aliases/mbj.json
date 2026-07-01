@@ -1,0 +1,52 @@
+{
+  "platform": "mbj",
+  "client_code": "mbj",
+  "channel_code": "mbj_sales",
+  "description": "Title normalization and type rules for MBJ (Media Do Books Japan). MBJ emits one .xls per bookstore site (Apple Books, アニメイトブックストア, etc.); all share the same schema with a single detail sheet and `合計` totals row at the bottom.",
+  "title_normalization": {
+    "description": "Raw `タイトル` includes episode / volume suffix; strip them to match GT channel_title_jp.",
+    "rules": [
+      {
+        "pattern": "第[０-９0-9]+(\\.[０-９0-9]+)?話$",
+        "action": "strip_trailing",
+        "example": "ライブ配信で会いましょう第4話 → ライブ配信で会いましょう"
+      },
+      {
+        "pattern": "（[０-９0-9]+([～〜-][０-９0-9]+)?）$",
+        "action": "strip_trailing",
+        "example": "俺だけレベルMAXなビギナー（１） → 俺だけレベルMAXなビギナー"
+      }
+    ],
+    "series_to_gt_title_kr": {
+      "ライブ配信で会いましょう": "무너지고 다시봐요 (웹툰)",
+      "ライブ配信で会いましょう【分冊版】": "무너지고 다시봐요 (웹툰)",
+      "小悪魔なお隣さん【分冊版】": "이웃사촌 (웹툰)",
+      "俺だけレベルMAXなビギナー": "나 혼자 만렙 뉴비 (웹툰)",
+      "融点～とけあい～［完全版］【特装版】": "절대역 (웹툰)"
+    }
+  },
+  "type_rules": {
+    "description": "Per-row type determined from フォーマット + タイトル; all rows in a series share one type.",
+    "heuristic": {
+      "format_contains_webtoon": "WT",
+      "title_contains_分冊版": "EP",
+      "title_has_volume_suffix": "EB",
+      "title_contains_完全版_or_特装版": "EB",
+      "default": "EB"
+    }
+  },
+  "tax_rules": {
+    "raw_is_tax_exclusive": true,
+    "total_amount_jpy": "round(sum(売上金額) * 1.10)",
+    "before_tax_jpy": "same as total_amount_jpy",
+    "after_tax_jpy": "sum(売上金額)",
+    "before_tax_income_jpy": "floor(sum(支払金額) * 1.10)",
+    "after_tax_income_jpy": "sum(支払金額)",
+    "consumption_tax_jpy": "before_tax_income_jpy - sum(支払金額)",
+    "withholding_tax_jpy": 0
+  },
+  "rs_label_rules": {
+    "single_rate": "e.g. 60% when all 分配料率 cells are 0.60",
+    "mixed_rate": "e.g. 50/60% when a webtoon series mixes 0.50 (Animate) and 0.60 (Apple Books) tiers"
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "platform": "line_ad",
+  "client_code": "line_dl_frontier",
+  "client_label": "Line Digital Frontier",
+  "channel_code": "line_ads",
+  "note": "LINE Digital Frontier 広告印税(外部PF) — per-title videoad settlement CSV (Shift-JIS).",
+  "file_patterns": {
+    "raw_source": "\\d{8}_N\\d+_R\\d+_N\\d+_.*RIVERSE.*\\.csv$",
+    "filename_date": "^(\\d{4})(\\d{2})(\\d{2})_"
+  },
+  "encoding": "shift_jis",
+  "columns": {
+    "title": "タイトル",
+    "product_id": "商品ID",
+    "sales_amount": "売上額(基準額)",
+    "payment_amount": "支払額",
+    "rate": "配分料率",
+    "format": "販売形式",
+    "region": "販売地域",
+    "sales_month": "報告年月",
+    "period": "対象期間",
+    "notify_date": "通知日付",
+    "pay_due": "支払期日",
+    "pretax_10": "税抜金額(10%)",
+    "pretax_other": "税抜金額(対象外)",
+    "consumption_tax": "消費税(10%)",
+    "withholding_tax": "源泉税",
+    "total": "合計金額",
+    "note": "備考",
+    "pay_content": "お支払内容"
+  },
+  "defaults": {
+    "type": "AD",
+    "distribution_strategy": "non-ex",
+    "country": "JP"
+  },
+  "formulas": {
+    "after_tax_jpy": "round(売上額(基準額))",
+    "total_amount_jpy": "round(after_tax_jpy * 1.10)",
+    "before_tax_jpy": "total_amount_jpy",
+    "after_tax_income_jpy": "round(支払額)",
+    "consumption_tax_jpy": "floor(after_tax_income_jpy * 0.10)",
+    "before_tax_income_jpy": "after_tax_income_jpy + consumption_tax_jpy",
+    "rs_rate": "parseFloat(配分料率 strip %)/100",
+    "withholding_tax_jpy": "toNumber(源泉税)"
+  },
+  "sales_month_rule": "報告年月 YYYY/MM/DD → YYYY-MM-01 (report month = sales month)",
+  "title_normalization": {
+    "note": "Raw title is used verbatim as channel_title_jp; the GT's title_jp applies a single space before [完全版] but channel_title_jp matches raw exactly."
+  }
+}

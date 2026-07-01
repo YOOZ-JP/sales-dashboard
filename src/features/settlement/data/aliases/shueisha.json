@@ -1,0 +1,31 @@
+{
+  "platform": "shueisha",
+  "description": "Image-only PDF — OCR via tesseract (jpn) with multi-pass preprocessing.",
+  "client_code": "shueisha",
+  "channel_code_by_source": {
+    "mangamee_ad": "manga mee",
+    "jumptoon": "Jumptoon"
+  },
+  "type_by_source": {
+    "mangamee_ad": "AD",
+    "jumptoon": "EB"
+  },
+  "channel_title_suffix": {
+    "mangamee_ad": "(広告)",
+    "jumptoon_danko": "(単行本)",
+    "jumptoon_wakon": "(話配信)"
+  },
+  "sales_month": {
+    "mangamee_ad": "2025-11-01",
+    "jumptoon": "2025-11-01"
+  },
+  "ocr_helper_script": "scripts/shueisha_ocr.py",
+  "ocr_tolerance_yen": 2,
+  "notes": [
+    "Payment amount on each row = 税込 value → GT before_tax_income_jpy.",
+    "Titles come in 4 families: 再婚承認を要求します / 生まれ変わってもよろしく / 喧嘩独学 / ザ・ボクサー.",
+    "Rate is always 50% royalty. payment = input_amt // 2 (floor).",
+    "MangaMee rows are AD type, channel='manga mee'.",
+    "Jumptoon rows split by 販路: 単行本版 vs 話配信 → channel_title_jp suffix differs ('単行本' vs '話配信'); both EB type, channel='Jumptoon'."
+  ]
+}

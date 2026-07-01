@@ -1,0 +1,85 @@
+{
+  "platform": "booklive",
+  "description": "Title and type normalization rules for BookLive raw file.",
+  "store_to_channel": {
+    "ブックライブ": "booklive",
+    "ブッコミ": "bookcomi"
+  },
+  "wt_to_type": {
+    "WT": "WT",
+    "版面": "EP"
+  },
+  "type_overrides": [
+    {
+      "comment": "Raw titles that should be typed EB (electronic book) when wt=版面 — derived from GT.",
+      "match": { "wt": "版面" },
+      "titles": [
+        "俺だけレベルMAXなビギナー",
+        "腐食人【特装版】",
+        "肝臓を奪われた妻",
+        "融点〜とけあい〜[完全版]【特装版】"
+      ],
+      "type": "EB"
+    },
+    {
+      "comment": "Raw titles that should be typed WR (web raw / full-book WT) when wt=WT.",
+      "match": { "wt": "WT" },
+      "titles": [
+        "融点〜とけあい〜"
+      ],
+      "type": "WR"
+    }
+  ],
+  "title_aliases": [
+    {
+      "comment": "Full-title rewrites where GT uses a completely different title than raw.",
+      "from_raw": "融点〜とけあい〜[完全版]【特装版】",
+      "to_gt": "融点 [完全版](巻)"
+    },
+    {
+      "from_raw": "タランタランタラン~鳴り響く音にのせて【タテヨミ】",
+      "to_gt": "#N/A"
+    },
+    {
+      "comment": "[完全版]→【完全版】 + space additions for sabage case.",
+      "from_raw": "サベージ・キャッスル〜堕落の迷宮〜[完全版]【タテヨミ】",
+      "to_gt": "サベージ・キャッスル ~堕落の迷宮~ 【完全版】"
+    }
+  ],
+  "title_rewrites_by_context": [
+    {
+      "comment": "When wt=版面 and raw title has no 【分冊版】 marker, some titles get 【分冊版】 appended in GT.",
+      "match": { "wt": "版面" },
+      "titles_needing_bunsatsu_suffix": [
+        "ワケあり姉妹の恋模様",
+        "召使い更生道"
+      ]
+    },
+    {
+      "comment": "When wt=版面 and raw title ends with 【分冊版】, some titles DROP the suffix in GT.",
+      "match": { "wt": "版面" },
+      "titles_dropping_bunsatsu_suffix": [
+        "堅物上司に今日もイン！"
+      ]
+    },
+    {
+      "comment": "When wt=WT, 【タテヨミ】 is stripped unless GT retains it (resolved via best-match).",
+      "note": "Implemented via variant set in parser; no hardcoded list."
+    }
+  ],
+  "normalization_rules": {
+    "tilde_variants": ["〜", "～"],
+    "tilde_canonical": "~",
+    "bracket_pairs": [["［", "["], ["］", "]"]],
+    "fullwidth_digits_to_halfwidth": true,
+    "strip_whitespace_for_canonical": true,
+    "kanzen_bracket_equivalence": ["[完全版]", "【完全版】"],
+    "stripable_suffix_markers": ["【タテヨミ】", "【分冊版】", "【特装版】"]
+  },
+  "amounts": {
+    "total_amount_jpy": "round(raw.BookLive売上 × 1.10)",
+    "before_tax_income_jpy": "raw.権利元取分(税込) — i.e. raw already computes it as pre + ctax",
+    "consumption_tax_jpy": "raw.消費税額",
+    "note": "GT may differ from raw.権利元取分(税込) by -1 yen on ~40% of rows due to Excel ROUND quirks (tolerance ±1)."
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "platform": "cmoa",
+  "note": "NTTsolmare / コミックシーモア. Row-level rules derived from 202601 (settlement 202604) reverse-engineering.",
+  "rules": [
+    {
+      "pattern": "〜",
+      "replace": "～",
+      "note": "raw file mixes U+301C wave-dash with U+FF5E full-width tilde; canonical channel_title_jp uses U+FF5E"
+    }
+  ],
+  "type_rules": [
+    { "suffix": "【タテヨミ】", "type": "WT", "note": "vertical-scroll webtoon" },
+    { "suffix": "【分冊版】", "type": "EP", "note": "episodic (chapter) release" },
+    { "suffix": "【連載版】", "type": "EP", "note": "serialized chapter release (also EP)" },
+    { "default": true, "type": "EB", "note": "volume / 特装版 / no suffix → eBook" }
+  ],
+  "type_overrides": {
+    "♂♀コンサルタント【タテヨミ】": "WR",
+    "サベージ・キャッスル～堕落の迷宮～【タテヨミ】": "WR",
+    "融点【タテヨミ】": "WR",
+    "天才ハッカーたちのラブゲーム～ゼロ・デイ・アタック～【タテヨミ】": "WR"
+  },
+  "default_rs": 0.40,
+  "default_distribution": "non-ex",
+  "tax_multiplier": 1.10,
+  "raw_source_file_pattern": "_N1100_\\d{6}_meisai_ALL\\.tsv$",
+  "detail_source_file_pattern": "_N1399_\\d{6}_meisai_M_Basic-ALL_contents\\.tsv$"
+}

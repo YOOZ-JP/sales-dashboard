@@ -1,0 +1,53 @@
+{
+  "platform": "mangabang",
+  "client_code": "amazia",
+  "channel_code": "mangabang",
+  "note": "Amazia / マンガBANG! ticket-model settlement. Row-level rules derived from 202603 (settlement 202604) reverse-engineering.",
+  "raw_files": {
+    "detail": "mangabang_RIVERSE_ticket_\\d{6}\\.csv",
+    "summary": "RIVERSE様_支払通知書\\.xlsx"
+  },
+  "csv_encoding": "shift_jis",
+  "csv_skip_prefix_rows": 1,
+  "csv_columns": {
+    "年月": "sales_month (e.g. 2026年3月)",
+    "出版社": "publisher label (always 'リバース')",
+    "タイトル名": "channel_title_jp",
+    "話": "episode number",
+    "販売件数": "units sold",
+    "単価（税込）": "unit price, tax-incl (ticket yen-equivalent)",
+    "単価（税抜）": "unit price, tax-excl",
+    "総収益": "row revenue, tax-incl = units × 単価税込",
+    "総収益（税抜）": "row revenue, tax-excl = units × 単価税抜",
+    "版権料率": "RS rate in percent (35 → 0.35)",
+    "版権元収益（税込）": "publisher share, tax-incl = 総収益(税込) × rs",
+    "巻番号": "volume number",
+    "管理コード": "management code"
+  },
+  "title_normalization": [
+    {
+      "pattern": "〜",
+      "replace": "～",
+      "note": "raw uses U+301C wave-dash; GT canonical uses U+FF5E full-width tilde"
+    }
+  ],
+  "type_rules": [
+    { "suffix": "【タテヨミ】", "type": "WT", "note": "vertical-scroll webtoon default" }
+  ],
+  "type_overrides": {
+    "融点～とけあい～【タテヨミ】": "WR"
+  },
+  "default_rs": 0.35,
+  "default_distribution": "non-ex",
+  "tax_multiplier": 1.10,
+  "formulas": {
+    "total_amount_jpy": "round(sum(総収益（税抜）) × 1.10)",
+    "before_tax_jpy": "= total_amount_jpy (no fee layer)",
+    "after_tax_jpy": "sum(総収益（税抜）) (integer)",
+    "before_tax_income_jpy": "round(sum(版権元収益（税込）))",
+    "consumption_tax_jpy": "floor(before_tax_income_jpy × 10 / 110)",
+    "after_tax_income_jpy_a": "before_tax_income_jpy - consumption_tax_jpy",
+    "note": "±1 yen rounding tolerance applied during verification; raw per-row 版権元(税込) sums carry cent-level residuals from 67*0.35=23.45"
+  },
+  "settlement_lag_months": 1
+}

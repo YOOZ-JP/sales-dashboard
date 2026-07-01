@@ -1,0 +1,121 @@
+/**
+ * Top-level parse dispatcher.
+ *
+ * Parsers that bundle heavy / Node-incompatible dependencies
+ * (pdf-parse pulls in pdfjs which references the browser-only
+ * DOMMatrix global) are imported lazily so the /api/upload route can
+ * boot in Vercel serverless even when those modules can't be evaluated
+ * at top level. A regular xlsx/csv upload therefore never touches the
+ * PDF code paths.
+ */
+import type { ParseResult } from "@/features/settlement/lib/schema/sales";
+import { detectPlatform } from "./registry";
+
+// Lightweight parsers — safe to eager-import.
+import { parseCmoa } from "./cmoa";
+import { parsePiccoma } from "./piccoma";
+import { parseLineEbj } from "./line-ebj";
+import { parseBooklive } from "./booklive";
+import { parseRenta } from "./renta";
+import { parseMechacomic } from "./mechacomic";
+import { parseComico } from "./comico";
+import { parseDmm } from "./dmm";
+import { parseLineAd } from "./line-ad";
+import { parseUnext } from "./unext";
+import { parsePiccomaGaiakuhan } from "./piccoma-gaiakuhan";
+import { parsePiccomaAds } from "./piccoma-ads";
+import { parseMediado } from "./mediado";
+import { parseMbj } from "./mbj";
+import { parseMangabang } from "./mangabang";
+import { parseKadokawa } from "./kadokawa";
+import { parseLezhinBeltoon } from "./lezhin-beltoon";
+import { parseBeaglee } from "./beaglee";
+
+export type ParserFn = (opts: {
+  filename: string;
+  buffer: Buffer;
+  folderName?: string;
+}) => Promise<ParseResult>;
+
+type LazyParser = () => Promise<ParserFn>;
+
+const EAGER: Record<string, ParserFn> = {
+  cmoa: parseCmoa,
+  piccoma: parsePiccoma,
+  ebj_line: parseLineEbj,
+  booklive: parseBooklive,
+  renta: parseRenta,
+  mechacomic: parseMechacomic,
+  comico: parseComico,
+  dmm: parseDmm,
+  line_ad: parseLineAd,
+  u_next: parseUnext,
+  piccoma_gaiakuhan: parsePiccomaGaiakuhan,
+  piccoma_ads: parsePiccomaAds,
+  mediado: parseMediado,
+  mbj: parseMbj,
+  mangabang: parseMangabang,
+  kadokawa: parseKadokawa,
+  beltoon: parseLezhinBeltoon,
+  lezhin: parseLezhinBeltoon,
+  beaglee: parseBeaglee,
+};
+
+// Parsers that import pdf-parse (which references DOMMatrix at module
+// eval) or spawn child processes. Loaded only when that platform is
+// actually detected — so a plain xlsx upload never pays the cost.
+const LAZY: Record<string, LazyParser> = {
+  shueisha: async () => (await import("./shueisha")).parseShueisha,
+  ichijinsha: async () => (await import("./ichijinsha")).parseIchijinsha,
+  sb_creative_m: async () => (await import("./sb-creative")).parseSbCreative,
+  sb_creative_e: async () => (await import("./sb-creative")).parseSbCreative,
+};
+
+export async function parseFile(opts: {
+  filename: string;
+  buffer: Buffer;
+  folderName?: string;
+  headerSample?: string[];
+  sheetNames?: string[];
+}): Promise<ParseResult & { detection_confidence: number }> {
+  const detection = detectPlatform(opts);
+  const code = detection.platform_code;
+
+  const eager = EAGER[code];
+  const lazyGetter = LAZY[code];
+  const parser = eager ?? (lazyGetter ? await lazyGetter() : null);
+
+  if (!parser) {
+    return {
+      platform_code: code,
+      sales_month: null,
+      settlement_month: "",
+      records: [],
+      errors: [`no parser for platform: ${code}`],
+      detection_confidence: detection.confidence,
+    };
+  }
+
+  const result = await parser({
+    filename: opts.filename,
+    buffer: opts.buffer,
+    folderName: opts.folderName,
+  });
+  return { ...result, detection_confidence: detection.confidence };
+}
+
+// Re-export for callers that still look at the registry / detection directly.
+export { detectPlatform };
+
+// Flat map that behaves like the old PARSERS export — async resolution
+// so callers can `await PARSERS[code]({...})` transparently.
+export const PARSERS: Record<string, ParserFn> = {
+  ...EAGER,
+  // Wrap each lazy parser so its signature stays ParserFn.
+  ...Object.fromEntries(
+    Object.entries(LAZY).map(([code, getter]) => [
+      code,
+      async (opts) => (await getter())(opts),
+    ]),
+  ),
+};

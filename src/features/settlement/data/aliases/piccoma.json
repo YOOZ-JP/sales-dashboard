@@ -1,0 +1,37 @@
+{
+  "platform": "piccoma",
+  "note": "Piccoma (Kakao Piccoma JP). Row-level rules derived from 202603 (settlement 202604) reverse-engineering. Uses the 取次report + 出版社report pair.",
+  "rules": [],
+  "type_rules": [
+    { "suffix": "（ノベル）", "type": "WN", "note": "Novel-series titles (horizontal 話 distribution, novel format)" },
+    { "default_from_column": "話", "type": "WT", "note": "Horizontal/chapter distribution defaults to WT (webtoon)" },
+    { "default_from_column": "巻", "type": "EB", "note": "Volume distribution defaults to EB (eBook/volume)" }
+  ],
+  "type_overrides": {
+    "サベージ・キャッスル～堕落の迷宮～　改訂版": "WR",
+    "ナマモノ [改訂版]": "WR",
+    "天才ハッカーたちのラブゲーム～ゼロ・デイ・アタック～": "WR",
+    "幼馴染のエロトラップ~発情した狼は甘すぎる~": "WR",
+    "私が捨てた男の奴隷になった": "WR",
+    "融点～とけあい～": "WR",
+    "避けられない愛　改訂版": "WR",
+    "響弦文字": "WR",
+    "結婚商売【完全版】【分冊版】": "EP"
+  },
+  "default_distribution": "non-ex",
+  "tax_multiplier": 1.10,
+  "settlement_lag_months": 1,
+  "raw_source_files": {
+    "summary": "取次report_株式会社RIVERSE_\\d{8}_v\\d+\\.xlsx",
+    "detail": "出版社report_株式会社RIVERSE_\\d{8}_\\d+\\.xlsx"
+  },
+  "formulas": {
+    "total_amount_jpy": "excel_round(detail_sales_sum(title, col_type) * 1.10)",
+    "before_tax_income_jpy": "floor(max(取次.精算対象当月売上[col_type], 取次.最終精算[col_type]) * 1.10)",
+    "after_tax_income_jpy_a": "max(取次.精算対象当月売上[col_type], 取次.最終精算[col_type])",
+    "after_tax_jpy": "round(total_amount_jpy / 1.10)",
+    "before_tax_jpy": "total_amount_jpy (fee_jpy = 0)",
+    "consumption_tax_jpy": "before_tax_income_jpy - after_tax_income_jpy_a",
+    "note": "col_type is 話 for WT/WR/WN, 巻 for EB/EP. excel_round = floor(x + 0.5) (round half up, not banker's). before_tax_income floor because Excel truncates at the 1-yen boundary."
+  }
+}
