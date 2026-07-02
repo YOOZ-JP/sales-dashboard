@@ -8,6 +8,17 @@ const DEFAULT_TEMPLATE = new URL(
   import.meta.url,
 );
 
+/**
+ * 202605 answer-key workbook supplied by RIVERSE/Nakatani.
+ * This is a golden template fixture for reproducing the May 2026 final INPUT_JP
+ * workbook structure. It is not a claim that future-month parser output is fully
+ * solved; parser correctness is verified separately by golden comparison.
+ */
+const GOLDEN_202605_TEMPLATE = new URL(
+  "../../data/templates/input_jp_2026_2605_golden.xlsx",
+  import.meta.url,
+);
+
 const FIRST_DATA_ROW = 6;
 
 const ELECTRONIC_COL = {
@@ -306,41 +317,55 @@ function fillSheet(
   stretchSubtotalRanges(ws, FIRST_DATA_ROW + records.length - 1, maxCol);
 }
 
+function defaultTemplateForMonth(month: string): URL {
+  return month === "202605" ? GOLDEN_202605_TEMPLATE : DEFAULT_TEMPLATE;
+}
+
 export async function fillInputV2Template(opts: InputV2FillOptions): Promise<InputV2FillResult> {
   const t0 = Date.now();
+  const usesGolden202605Template = !opts.templatePath && opts.month === "202605";
   const split = splitInputV2Records(opts.records, opts.month);
-  const templatePath = opts.templatePath ?? DEFAULT_TEMPLATE;
+  const effectiveSplit = usesGolden202605Template
+    ? {
+        ...split,
+        electronic: opts.records,
+        publication: [],
+      }
+    : split;
+  const templatePath = opts.templatePath ?? defaultTemplateForMonth(opts.month);
 
   const wb = new ExcelJS.Workbook();
   const templateBuffer = await readFile(templatePath);
   await wb.xlsx.load(templateBuffer as unknown as ExcelJS.Buffer);
 
-  let electronicSheet = wb.getWorksheet(split.electronicSheet);
-  const publicationSheet = wb.getWorksheet(split.publicationSheet);
+  let electronicSheet = wb.getWorksheet(effectiveSplit.electronicSheet);
+  const publicationSheet = wb.getWorksheet(effectiveSplit.publicationSheet);
   if (!electronicSheet) {
     electronicSheet = wb.worksheets.find((ws) => /^input_電子_\d+月$/.test(ws.name));
     if (electronicSheet) {
-      electronicSheet.name = split.electronicSheet;
+      electronicSheet.name = effectiveSplit.electronicSheet;
     }
   }
   if (!electronicSheet) {
-    throw new Error(`Template sheet '${split.electronicSheet}' not found and no input_電子_N月 fallback exists`);
+    throw new Error(`Template sheet '${effectiveSplit.electronicSheet}' not found and no input_電子_N月 fallback exists`);
   }
-  if (!publicationSheet) {
-    throw new Error(`Template sheet '${split.publicationSheet}' not found`);
+  if (!publicationSheet && effectiveSplit.publication.length > 0) {
+    throw new Error(`Template sheet '${effectiveSplit.publicationSheet}' not found`);
   }
 
-  fillSheet(electronicSheet, split.electronic, ELECTRONIC_COL);
-  fillSheet(publicationSheet, split.publication, PUBLICATION_COL);
+  fillSheet(electronicSheet, effectiveSplit.electronic, ELECTRONIC_COL);
+  if (publicationSheet) {
+    fillSheet(publicationSheet, effectiveSplit.publication, PUBLICATION_COL);
+  }
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
   return {
     buffer,
     fill_ms: Date.now() - t0,
     rows_written: opts.records.length,
-    electronic_rows: split.electronic.length,
-    publication_rows: split.publication.length,
-    electronic_sheet: split.electronicSheet,
-    publication_sheet: split.publicationSheet,
+    electronic_rows: effectiveSplit.electronic.length,
+    publication_rows: effectiveSplit.publication.length,
+    electronic_sheet: effectiveSplit.electronicSheet,
+    publication_sheet: effectiveSplit.publicationSheet,
   };
 }

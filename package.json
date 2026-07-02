@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
+    "settlement:compare-golden": "node --import tsx scripts/compare-input-jp-golden.ts",
     "content-master:import": "node --import tsx scripts/content-master-import.ts",
     "deploy": "vercel build --prod && vercel deploy --prebuilt --prod"
   },

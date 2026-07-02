@@ -17,7 +17,7 @@ export async function GET(
   const month = rawMonth.replace(/\.xlsx$/i, "");
   if (!/^\d{6}$/.test(month)) {
     return NextResponse.json(
-      { error: "month must be YYYYMM, e.g. 202604" },
+      { error: "month must be YYYYMM, e.g. 202605" },
       { status: 400 },
     );
   }
@@ -27,7 +27,7 @@ export async function GET(
     return NextResponse.json(
       {
         error: `No data available for ${month}`,
-        details: "No uploaded/processed settlement data exists yet. Upload files first, then export again.",
+        details: "No uploaded/processed settlement data exists yet. Upload files first, then preview again.",
       },
       { status: 404 },
     );
@@ -37,27 +37,23 @@ export async function GET(
     const { fillInputV2Template } = await import(
       "@/features/settlement/lib/export/input-v2-filler"
     );
+    const { workbookBufferToPreview } = await import(
+      "@/features/settlement/lib/export/workbook-preview"
+    );
     const result = await fillInputV2Template({ month, records });
-    return new NextResponse(result.buffer as unknown as BodyInit, {
-      headers: {
-        "Content-Type":
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "Content-Disposition":
-          `attachment; filename="JP_INPUT_V2_${month}.xlsx"; ` +
-          `filename*=UTF-8''JP_INPUT_V2_${month}.xlsx`,
-        "X-Export-V2-Source": source,
-        "X-Export-V2-Rows": String(result.rows_written),
-        "X-Export-V2-Electronic-Rows": String(result.electronic_rows),
-        "X-Export-V2-Publication-Rows": String(result.publication_rows),
-        "X-Export-V2-Electronic-Sheet": result.electronic_sheet,
-        "X-Export-V2-Publication-Sheet": result.publication_sheet,
-        "X-Export-V2-Fill-Ms": String(result.fill_ms),
-      },
+    const preview = await workbookBufferToPreview(result.buffer, {
+      month,
+      source,
+      rowsWritten: result.rows_written,
+      electronicRows: result.electronic_rows,
+      publicationRows: result.publication_rows,
+      generatedAt: new Date().toISOString(),
     });
+    return NextResponse.json(preview);
   } catch (err) {
     return NextResponse.json(
       {
-        error: "Failed to generate INPUT v2 xlsx",
+        error: "Failed to generate INPUT v2 preview",
         details: err instanceof Error ? err.message : String(err),
       },
       { status: 500 },

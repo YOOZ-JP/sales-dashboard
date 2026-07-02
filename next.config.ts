@@ -6,7 +6,14 @@ const nextConfig: NextConfig = {
   },
   outputFileTracingIncludes: {
     '/api/settlement/upload': ['./src/features/settlement/data/aliases/**/*'],
-    '/api/settlement/export-v2/[month]': ['./src/features/settlement/data/templates/input_jp_2026_v2_template.xlsx'],
+    '/api/settlement/export-v2/[month]': [
+      './src/features/settlement/data/templates/input_jp_2026_v2_template.xlsx',
+      './src/features/settlement/data/templates/input_jp_2026_2605_golden.xlsx',
+    ],
+    '/api/settlement/preview-v2/[month]': [
+      './src/features/settlement/data/templates/input_jp_2026_v2_template.xlsx',
+      './src/features/settlement/data/templates/input_jp_2026_2605_golden.xlsx',
+    ],
   },
   serverExternalPackages: ['exceljs'],
 };

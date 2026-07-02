@@ -37,3 +37,10 @@ nul
 
 # Supabase temp files
 supabase/.temp/
+
+# Local settlement analysis scratch files may contain sensitive workbook-derived data
+/tmp_2605_analysis/
+
+# Local agent plans/permissions/config; never commit machine-specific agent files
+.hermes/
+.claude/settings.local.json
