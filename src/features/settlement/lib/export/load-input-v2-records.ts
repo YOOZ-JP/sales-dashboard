@@ -27,7 +27,6 @@ export async function loadInputV2Records(
   const missingEnv = [
     "NEXT_PUBLIC_SUPABASE_URL",
     "NEXT_PUBLIC_SUPABASE_ANON_KEY",
-    "SUPABASE_SERVICE_ROLE_KEY",
   ].filter((name) => !process.env[name]);
 
   if (missingEnv.length > 0) {
@@ -43,8 +42,11 @@ export async function loadInputV2Records(
   }
 
   try {
-    const { createServiceClient } = await import("@/features/settlement/lib/supabase/server");
-    const supabase = createServiceClient();
+    // Match the rest of the dashboard: use the service-role key when it exists,
+    // otherwise fall back to the normal server anon client. Preview/export are
+    // protected by the dashboard cookie before this loader runs, so lack of a
+    // service key should not make a healthy Vercel deployment look broken.
+    const { supabaseServer: supabase } = await import("@/lib/supabase-server");
     const batchIso = `${month.slice(0, 4)}-${month.slice(4, 6)}-01`;
     const PAGE = 1000;
     const all: Record<string, unknown>[] = [];
