@@ -18,6 +18,7 @@ import dynamic from 'next/dynamic';
 
 const TitleMasterTab = dynamic(() => import('@/components/data/TitleMasterTab'), { ssr: false });
 const MasterSettingsTab = dynamic(() => import('@/components/data/MasterSettingsTab'), { ssr: false });
+const ContentMasterTab = dynamic(() => import('@/components/data/ContentMasterTab'), { ssr: false });
 
 // ============================================================
 // Shared styles & animation variants
@@ -148,7 +149,7 @@ export default function DataPage() {
   useEffect(() => { return () => {}; }, []);
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<'sales' | 'titles' | 'settings'>('sales');
+  const [activeTab, setActiveTab] = useState<'sales' | 'titles' | 'content' | 'settings'>('sales');
 
   // 매출 삭제 모달
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -654,6 +655,7 @@ export default function DataPage() {
         {([
           { key: 'sales' as const, label: t('매출 원본', '売上データ') },
           { key: 'titles' as const, label: t('작품 정보', '作品情報') },
+          { key: 'content' as const, label: t('작품 마스터', '作品マスター') },
           { key: 'settings' as const, label: t('기본 설정', '基本設定') },
         ]).map((tab) => (
           <button
@@ -673,6 +675,9 @@ export default function DataPage() {
 
       {/* Title Master Tab */}
       {activeTab === 'titles' && <TitleMasterTab />}
+
+      {/* Content Master Tab */}
+      {activeTab === 'content' && <ContentMasterTab />}
 
       {/* Master Settings Tab */}
       {activeTab === 'settings' && <MasterSettingsTab />}
