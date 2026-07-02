@@ -22,7 +22,13 @@ export async function GET(
     );
   }
 
-  const { records, source } = await loadInputV2Records(month);
+  const { records, source, loadError } = await loadInputV2Records(month);
+  if (loadError) {
+    return NextResponse.json(
+      { error: loadError.error, details: loadError.details },
+      { status: loadError.status },
+    );
+  }
   if (records.length === 0) {
     return NextResponse.json(
       {

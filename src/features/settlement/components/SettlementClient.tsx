@@ -41,13 +41,15 @@ export default function SettlementClient() {
   const activeMonth = useMemo(() => (validMonth ? toIsoMonth(month) : ''), [month, validMonth]);
 
   function changeMonth(next: string) {
+    if (next === month) return;
     setMonth(next);
     // Drop a preview that no longer matches the selected month so nothing stale is shown.
     if (preview && preview.month !== next) {
       setPreview(null);
       setActiveSheet(null);
-      setPreviewError(null);
     }
+    // An error message always refers to the previously selected month; never keep it.
+    setPreviewError(null);
   }
 
   async function loadPreview(targetMonth = month) {
@@ -82,6 +84,11 @@ export default function SettlementClient() {
     setUploading(true);
     setMessage(null);
     setResults([]);
+    // The current preview predates this upload; drop it now so a failed upload
+    // (before loadPreview runs) never leaves stale data on screen.
+    setPreview(null);
+    setActiveSheet(null);
+    setPreviewError(null);
     try {
       const fd = new FormData();
       for (const file of files) fd.append('files', file);
