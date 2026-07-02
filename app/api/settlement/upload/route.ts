@@ -8,8 +8,8 @@
  *   4. Build sales_records rows via the shared transformer
  *
  * Requires the same dashboard refresh-token cookie as protected pages.
- * The DB is touched via the Supabase service-role client, so this route
- * must never be exposed as an unauthenticated public endpoint.
+ * The DB is touched only after the dashboard cookie guard passes, using the
+ * same server Supabase client as the rest of the dashboard.
  */
 import { NextResponse } from "next/server";
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
@@ -26,25 +26,16 @@ export async function POST(request: Request) {
   const unauthorized = requireSettlementApiAuth(request);
   if (unauthorized) return unauthorized;
 
-  const [supabaseServer, parsers, aggregation, archive] = await Promise.all([
-    import("@/features/settlement/lib/supabase/server"),
+  const [sharedSupabase, parsers, aggregation, archive] = await Promise.all([
+    import("@/lib/supabase-server"),
     import("@/features/settlement/lib/parsers"),
     import("@/features/settlement/lib/aggregation/to-sales-records"),
     import("@/features/settlement/lib/storage/archive"),
   ]);
-  const { createServiceClient, hasServiceRoleKey } = supabaseServer;
+  const { supabaseServer: supabase } = sharedSupabase;
   const { parseFile } = parsers;
   const { toSalesRecords, buildLookupMaps } = aggregation;
   const { writeToArchive } = archive;
-
-  if (!hasServiceRoleKey()) {
-    return NextResponse.json(
-      { error: "Supabase is not configured" },
-      { status: 503 },
-    );
-  }
-
-  const supabase = createServiceClient();
 
   const form = await request.formData();
   const files = form.getAll("files") as File[];
@@ -76,10 +67,15 @@ export async function POST(request: Request) {
   // Preload client/channel lookup maps
   let lookups: LookupMaps;
   try {
-    const [{ data: clients }, { data: channels }] = await Promise.all([
+    const [{ data: clients, error: clientsError }, { data: channels, error: channelsError }] = await Promise.all([
       supabase.from("clients").select("*"),
       supabase.from("channels").select("*"),
     ]);
+    if (clientsError || channelsError) {
+      throw new Error(
+        [clientsError?.message, channelsError?.message].filter(Boolean).join("; "),
+      );
+    }
     lookups = buildLookupMaps({ clients: clients ?? [], channels: channels ?? [] });
   } catch (e) {
     return NextResponse.json(
@@ -152,7 +148,7 @@ export async function POST(request: Request) {
     // 4. Insert raw_records (JSONB line-items)
     let rawRecordIds: Map<number, string> | undefined;
     if (parsed.records.length > 0) {
-      const { data: insertedRaws } = await supabase
+      const { data: insertedRaws, error: rawsErr } = await supabase
         .from("raw_records")
         .insert(
           parsed.records.map((r) => ({
@@ -162,6 +158,10 @@ export async function POST(request: Request) {
           })),
         )
         .select("id, row_index");
+      if (rawsErr) {
+        results.push({ file: f.name, error: `raw_records insert: ${rawsErr.message}` });
+        continue;
+      }
       if (insertedRaws) {
         rawRecordIds = new Map(insertedRaws.map((r) => [r.row_index, r.id]));
       }

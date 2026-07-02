@@ -17,6 +17,22 @@ export type InputV2LoadError = {
   details: string;
 };
 
+function formatSupabaseError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const obj = err as Record<string, unknown>;
+    const parts = [obj.message, obj.details, obj.hint, obj.code]
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
+    if (parts.length > 0) return parts.join(" | ");
+    try {
+      return JSON.stringify(obj);
+    } catch {
+      return String(err);
+    }
+  }
+  return String(err);
+}
+
 export async function loadInputV2Records(
   month: string,
 ): Promise<{
@@ -77,7 +93,7 @@ export async function loadInputV2Records(
       if (lookupFailures.length > 0) {
         throw new Error(
           lookupFailures
-            .map(([table, error]) => `${table} lookup failed: ${(error as { message: string }).message}`)
+            .map(([table, error]) => `${table} lookup failed: ${formatSupabaseError(error)}`)
             .join("; "),
         );
       }
@@ -104,7 +120,7 @@ export async function loadInputV2Records(
     }
     return { records: all, source: "supabase", loadError: null };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = formatSupabaseError(err);
     console.warn("[input-v2] Supabase fetch failed:", message);
     return {
       records: [],

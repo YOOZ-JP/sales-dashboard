@@ -15,7 +15,7 @@
  */
 import { NextResponse } from "next/server";
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
-import { createServiceClient, hasServiceRoleKey } from "@/features/settlement/lib/supabase/server";
+import { supabaseServer as supabase } from "@/lib/supabase-server";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -27,9 +27,6 @@ export async function POST(
   const unauthorized = requireSettlementApiAuth(request);
   if (unauthorized) return unauthorized;
 
-  if (!hasServiceRoleKey()) {
-    return NextResponse.json({ error: "Supabase not configured" }, { status: 503 });
-  }
   const { month } = await params;
   if (!/^\d{6}$/.test(month)) {
     return NextResponse.json({ error: "month must be YYYYMM" }, { status: 400 });
@@ -38,8 +35,6 @@ export async function POST(
   if (body.confirm !== true) {
     return NextResponse.json({ error: "confirm=true required" }, { status: 400 });
   }
-
-  const supabase = createServiceClient();
 
   const batchIso = `${month.slice(0, 4)}-${month.slice(4, 6)}-01`;
   const ymPrefix = `${month.slice(0, 4)}-${month.slice(4, 6)}`;
