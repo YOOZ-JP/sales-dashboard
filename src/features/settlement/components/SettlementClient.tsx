@@ -10,9 +10,16 @@ type UploadResult = {
   platform?: string;
   parsed_rows?: number;
   sales_records_written?: number;
+  settlement_month?: string | null;
+  sales_month?: string | null;
   error?: string;
   errors?: string[];
 };
+
+// "2026-05-01" → "202605" (server months are ISO first-of-month dates).
+function isoToYyyymm(iso: string) {
+  return iso.slice(0, 7).replace('-', '');
+}
 
 type ResetResult = Record<string, unknown> & { ok?: boolean; error?: string };
 
@@ -112,6 +119,10 @@ export default function SettlementClient() {
   const { t } = useApp();
   const now = new Date();
   const defaultMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+  // 'auto': the server reads the settlement month out of each file's content
+  // and the field below is display-only. 'manual': the operator's month is
+  // sent with the upload and overrides whatever the files say.
+  const [monthMode, setMonthMode] = useState<'auto' | 'manual'>('auto');
   const [month, setMonth] = useState(defaultMonth);
   const [files, setFiles] = useState<SelectedFile[]>([]);
   const filesRef = useRef<SelectedFile[]>([]);
@@ -188,12 +199,17 @@ export default function SettlementClient() {
     const added = map.size - before;
     const duplicates = incoming.length - added;
     const parts: string[] = [t(`${added}개 파일 추가됨`, `${added}件のファイルを追加しました`)];
-    // If the dropped folder/files name a settlement month, follow it so the
-    // upload and preview target that month instead of the current calendar month.
+    // If the dropped folder/files name a settlement month, prefill the field.
+    // In auto mode this is only a preview hint — the month actually stored is
+    // read from each file's content on the server after upload.
     const detected = detectMonthFromPaths(incoming);
     if (detected && detected !== month) {
       changeMonth(detected);
-      parts.push(t(`정산월을 ${detected}로 자동 설정`, `精算月を${detected}に自動設定`));
+      parts.push(
+        monthMode === 'auto'
+          ? t(`폴더 이름 기준 예상 정산월: ${detected} (업로드 후 파일 내용으로 확정)`, `フォルダ名からの推定精算月: ${detected}（アップロード後にファイル内容で確定）`)
+          : t(`정산월을 ${detected}로 자동 설정`, `精算月を${detected}に自動設定`),
+      );
     }
     if (duplicates > 0) parts.push(t(`중복 ${duplicates}개 제외`, `重複${duplicates}件を除外`));
     if (unreadable > 0) parts.push(t(`읽지 못한 항목 ${unreadable}개 제외`, `読み込めなかった項目${unreadable}件を除外`));
@@ -249,7 +265,9 @@ export default function SettlementClient() {
   }
 
   async function upload() {
-    if (!validMonth || uploading) return;
+    if (uploading) return;
+    // Auto mode needs no month up front — the server derives it per file.
+    if (monthMode === 'manual' && !validMonth) return;
     // Snapshot the latest list now so files added/removed mid-upload can't shift batches.
     const selected = filesRef.current.slice();
     if (selected.length === 0) return;
@@ -268,14 +286,18 @@ export default function SettlementClient() {
       // replaceMonth must clear the month exactly once. A 413 is rejected by the
       // platform before the route runs, so the flag stays pending; any other
       // response reached the server, so later requests must not send it again.
-      let replacePending = replaceMonth;
+      // In auto mode there is no confirmed target month before upload, so a
+      // destructive clear is never sent (the checkbox is also disabled).
+      let replacePending = monthMode === 'manual' && replaceMonth;
       const aggregated: UploadResult[] = [];
       let failedFiles = 0;
 
       const send = async (chunk: SelectedFile[]) => {
         const fd = new FormData();
         for (const sf of chunk) fd.append('files', sf.file);
-        fd.append('activeMonth', activeMonth);
+        // Omitting activeMonth switches the server to content-based month
+        // detection; sending it makes the manual month override file content.
+        if (monthMode === 'manual') fd.append('activeMonth', activeMonth);
         if (trimmedFolder) fd.append('folder', trimmedFolder);
         const sentReplace = replacePending;
         if (sentReplace) fd.append('replaceMonth', '1');
@@ -330,12 +352,43 @@ export default function SettlementClient() {
         setMessage(t('업로드 실패: 모든 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.', 'アップロード失敗: すべてのファイル送信に失敗しました。下の結果をご確認ください。'));
         return;
       }
-      setMessage(
+      const parts: string[] = [
         failedFiles === 0
           ? t('업로드 처리가 끝났습니다. 아래 결과를 확인해 주세요.', 'アップロード処理が完了しました。下の結果をご確認ください。')
           : t(`업로드 처리가 끝났습니다. ${failedFiles}개 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.`, `アップロード処理が完了しました。${failedFiles}件のファイル送信に失敗しました。下の結果をご確認ください。`),
-      );
-      await loadPreview(month);
+      ];
+
+      // Which month should the preview show? Manual mode: the operator's
+      // month. Auto mode: the month(s) the server actually stored the rows
+      // under — the file content is the final truth, not the folder-name
+      // prefill shown in the field before upload.
+      let previewMonth: string | null = monthMode === 'manual' ? month : null;
+      if (monthMode === 'auto') {
+        const uploadedMonths = Array.from(
+          new Set(
+            aggregated
+              .filter((r) => !r.error && (r.sales_records_written ?? 0) > 0 && typeof r.settlement_month === 'string')
+              .map((r) => isoToYyyymm(r.settlement_month as string)),
+          ),
+        ).sort();
+        if (uploadedMonths.length === 1) {
+          previewMonth = uploadedMonths[0];
+          changeMonth(previewMonth);
+          parts.push(t(`파일 내용에서 정산월 ${previewMonth}을(를) 확인했습니다.`, `ファイル内容から精算月 ${previewMonth} を確認しました。`));
+        } else if (uploadedMonths.length > 1) {
+          parts.push(t(
+            `서로 다른 정산월(${uploadedMonths.join(', ')})의 파일이 함께 저장되었습니다. '직접 입력'으로 바꿔 확인할 정산월을 입력한 뒤 '미리보기 새로고침'을 눌러 주세요.`,
+            `異なる精算月（${uploadedMonths.join(', ')}）のファイルがまとめて保存されました。「手動入力」に切り替えて確認したい精算月を入力してから「プレビュー更新」を押してください。`,
+          ));
+        } else {
+          parts.push(t(
+            '저장된 데이터에서 정산월을 확인하지 못했습니다. 아래 결과의 메시지를 확인해 주세요.',
+            '保存されたデータから精算月を確認できませんでした。下の結果のメッセージをご確認ください。',
+          ));
+        }
+      }
+      setMessage(parts.join(' '));
+      if (previewMonth) await loadPreview(previewMonth);
     } catch (err) {
       setMessage(`${t('업로드 실패', 'アップロード失敗')}: ${(err as Error).message}`);
     } finally {
@@ -390,13 +443,35 @@ export default function SettlementClient() {
       <section className="grid gap-4 lg:grid-cols-[320px_1fr]">
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <label className="block text-sm font-semibold text-slate-800 dark:text-slate-100">{t('정산월', '精算月')}</label>
+          <div className="mt-2 grid grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-950">
+            {(['auto', 'manual'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => {
+                  setMonthMode(mode);
+                  // Auto mode never sends a destructive clear; drop the flag
+                  // so it can't silently carry over when switching back.
+                  if (mode === 'auto') setReplaceMonth(false);
+                }}
+                className={`rounded-md px-2 py-1.5 text-xs font-semibold transition ${monthMode === mode ? 'bg-white text-blue-700 shadow-sm dark:bg-slate-800 dark:text-blue-300' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}
+              >
+                {mode === 'auto' ? t('파일에서 자동 인식', 'ファイルから自動判定') : t('직접 입력', '手動入力')}
+              </button>
+            ))}
+          </div>
           <input
             value={month}
             onChange={(e) => changeMonth(e.target.value.replace(/\D/g, '').slice(0, 6))}
             placeholder="202605"
-            className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-950 outline-none focus:border-blue-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white"
+            disabled={monthMode === 'auto'}
+            className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-950 outline-none focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white dark:disabled:bg-slate-900 dark:disabled:text-slate-400"
           />
-          <p className="mt-2 text-xs text-slate-500">{t('YYYYMM 형식입니다. 예: 202605', 'YYYYMM形式です。例: 202605')}</p>
+          <p className="mt-2 text-xs text-slate-500">
+            {monthMode === 'auto'
+              ? t('업로드한 파일 내용에서 정산월을 자동으로 읽어옵니다. 업로드가 끝나면 확인된 월이 여기에 표시됩니다.', 'アップロードしたファイル内容から精算月を自動で読み取ります。アップロード完了後、確認された月がここに表示されます。')
+              : t('YYYYMM 형식입니다. 예: 202605', 'YYYYMM形式です。例: 202605')}
+          </p>
 
           <label className="mt-5 block text-sm font-semibold text-slate-800 dark:text-slate-100">{t('폴더 힌트', 'フォルダヒント')}</label>
           <input
@@ -407,14 +482,22 @@ export default function SettlementClient() {
           />
           <p className="mt-2 text-xs text-slate-500">{t('플랫폼 자동판별 보조값입니다. 모르면 비워두셔도 됩니다.', 'プラットフォーム自動判別の補助値です。不明な場合は空欄でも問題ありません。')}</p>
 
-          <label className="mt-5 flex items-start gap-2 rounded-lg bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/40 dark:text-blue-100">
+          <label className={`mt-5 flex items-start gap-2 rounded-lg bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/40 dark:text-blue-100 ${monthMode === 'auto' ? 'opacity-60' : ''}`}>
             <input
               type="checkbox"
               checked={replaceMonth}
               onChange={(e) => setReplaceMonth(e.target.checked)}
+              disabled={monthMode === 'auto'}
               className="mt-0.5"
             />
-            <span>{t('이번 업로드 전에 해당 월의 기존 정산 행을 비웁니다. 반복 테스트할 때만 켜 주세요.', '今回のアップロード前に該当月の既存精算行を削除します。繰り返しテストする場合のみオンにしてください。')}</span>
+            <span>
+              {t('이번 업로드 전에 해당 월의 기존 정산 행을 비웁니다. 반복 테스트할 때만 켜 주세요.', '今回のアップロード前に該当月の既存精算行を削除します。繰り返しテストする場合のみオンにしてください。')}
+              {monthMode === 'auto' && (
+                <span className="mt-1 block text-blue-700 dark:text-blue-300">
+                  {t("자동 인식 모드에서는 지울 대상 월이 업로드 전에 정해지지 않아 사용할 수 없습니다. 필요하면 '직접 입력'으로 바꿔 주세요.", '自動判定モードでは削除対象の月がアップロード前に確定しないため使用できません。必要な場合は「手動入力」に切り替えてください。')}
+                </span>
+              )}
+            </span>
           </label>
         </div>
 
@@ -472,7 +555,7 @@ export default function SettlementClient() {
           <div className="mt-5 flex flex-wrap gap-3">
             <button
               onClick={upload}
-              disabled={!validMonth || files.length === 0 || uploading}
+              disabled={(monthMode === 'manual' && !validMonth) || files.length === 0 || uploading}
               className="inline-flex items-center rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
             >
               {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <UploadCloud className="mr-2 h-4 w-4" />}
@@ -533,6 +616,7 @@ export default function SettlementClient() {
                   <th className="py-2 pr-3">{t('플랫폼', 'プラットフォーム')}</th>
                   <th className="py-2 pr-3">{t('파싱 행', '解析行')}</th>
                   <th className="py-2 pr-3">{t('정산 행', '精算行')}</th>
+                  <th className="py-2 pr-3">{t('정산월', '精算月')}</th>
                   <th className="py-2 pr-3">{t('메시지', 'メッセージ')}</th>
                 </tr>
               </thead>
@@ -548,6 +632,7 @@ export default function SettlementClient() {
                       <td className="py-2 pr-3">{r.platform ?? '-'}</td>
                       <td className="py-2 pr-3">{r.parsed_rows ?? '-'}</td>
                       <td className="py-2 pr-3">{r.sales_records_written ?? '-'}</td>
+                      <td className="py-2 pr-3">{typeof r.settlement_month === 'string' ? isoToYyyymm(r.settlement_month) : '-'}</td>
                       <td className="py-2 pr-3 text-xs text-slate-500">{r.error ?? r.errors?.join('; ') ?? '-'}</td>
                     </tr>
                   );

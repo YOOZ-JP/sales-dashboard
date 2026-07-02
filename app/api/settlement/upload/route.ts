@@ -13,6 +13,7 @@
  */
 import { NextResponse } from "next/server";
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
+import { resolveSettlementMonth } from "@/features/settlement/lib/resolve-settlement-month";
 import type { Json } from "@/features/settlement/lib/supabase/types";
 import {
   type TransformContext,
@@ -103,13 +104,28 @@ export async function POST(request: Request) {
     }
 
     // Settlement-month resolution:
-    //   · When the operator explicitly picked a month in the UI, trust
-    //     it — this is the "I'm processing May now" intent.
-    //   · Otherwise fall back to whatever the parser could derive.
-    //
-    // The parser's value is still kept on raw_uploads.sales_month so
-    // it's visible when auditing which period the file actually covers.
-    const effectiveSettlement = activeMonth ?? parsed.settlement_month ?? null;
+    //   · When the operator explicitly picked a month in the UI (manual
+    //     mode), trust it — this is the "I'm processing May now" intent.
+    //   · Otherwise (auto mode) only the month parsed from the file
+    //     content counts. A file with records but no detectable month is
+    //     rejected here, before any DB write — never bucketed into the
+    //     current date.
+    const resolution = resolveSettlementMonth({
+      activeMonth,
+      parsedSettlementMonth: parsed.settlement_month,
+      hasRecords: parsed.records.length > 0,
+    });
+    if (!resolution.ok) {
+      results.push({
+        file: f.name,
+        platform: parsed.platform_code,
+        parsed_rows: parsed.records.length,
+        sales_month: parsed.sales_month || null,
+        error: resolution.error,
+      });
+      continue;
+    }
+    const effectiveSettlement = resolution.month;
 
     // 2. Archive the raw file into Supabase Storage (upload-debug bucket).
     let archivePath: string | null = null;
@@ -170,7 +186,13 @@ export async function POST(request: Request) {
     // 5. Transform → sales_records
     let salesWritten = 0;
     if (parsed.records.length > 0) {
-      const batch = activeMonth ?? effectiveSettlement ?? new Date().toISOString().slice(0, 7) + "-01";
+      // resolveSettlementMonth guarantees a month whenever records exist;
+      // this guard only keeps TypeScript honest and catches regressions.
+      const batch = effectiveSettlement;
+      if (!batch) {
+        results.push({ file: f.name, error: "internal: settlement month missing for records" });
+        continue;
+      }
       const ctx: TransformContext = {
         settlement_month: batch,
         platform_code: parsed.platform_code,
@@ -209,6 +231,8 @@ export async function POST(request: Request) {
       confidence: parsed.detection_confidence,
       parsed_rows: parsed.records.length,
       sales_records_written: salesWritten,
+      settlement_month: effectiveSettlement,
+      sales_month: parsed.sales_month || null,
       archive_path: archivePath,
       errors: parsed.errors,
     });
