@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN!;
 const AUTH0_M2M_CLIENT_ID = process.env.AUTH0_M2M_CLIENT_ID!;
 const AUTH0_M2M_CLIENT_SECRET = process.env.AUTH0_M2M_CLIENT_SECRET!;
+const TEMP_ACCESS_TOKEN = "rvjp-temporary-mock-access-token";
 
 // GET: 사용자 정보 조회
 export async function GET(request: NextRequest) {
@@ -12,6 +13,15 @@ export async function GET(request: NextRequest) {
   }
 
   const token = authHeader.replace("Bearer ", "");
+  // TODO: 임시 우회 로그인입니다. 운영 Auth0 복구 후 제거하세요.
+  if (token === TEMP_ACCESS_TOKEN) {
+    return NextResponse.json({
+      email: "temporary@riverse.local",
+      name: "RIVERSE 임시 접속",
+      picture: undefined,
+    });
+  }
+
   const res = await fetch(`https://${AUTH0_DOMAIN}/userinfo`, {
     headers: { Authorization: `Bearer ${token}` },
   });

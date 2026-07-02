@@ -17,11 +17,21 @@ const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN!;
 const AUTH0_CLIENT_ID = process.env.AUTH0_CLIENT_ID!;
 const AUTH0_CLIENT_SECRET = process.env.AUTH0_CLIENT_SECRET!;
 const REFRESH_TOKEN_MAX_AGE = 60 * 60 * 24 * 7;
+const TEMP_ACCESS_TOKEN = "rvjp-temporary-mock-access-token";
+const TEMP_REFRESH_TOKEN = "rvjp-temporary-mock-refresh-token";
 
 export async function POST(request: NextRequest) {
   const refreshToken = request.cookies.get("X-REFRESH-TOKEN")?.value;
   if (!refreshToken) {
     return NextResponse.json({ error: "No refresh token" }, { status: 401 });
+  }
+
+  // TODO: 임시 우회 로그인입니다. 운영 Auth0 복구 후 제거하세요.
+  if (refreshToken === TEMP_REFRESH_TOKEN) {
+    return NextResponse.json({
+      accessToken: TEMP_ACCESS_TOKEN,
+      expiresIn: REFRESH_TOKEN_MAX_AGE,
+    });
   }
 
   const auth0Res = await fetch(`https://${AUTH0_DOMAIN}/oauth/token`, {

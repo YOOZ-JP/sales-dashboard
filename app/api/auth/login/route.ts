@@ -18,12 +18,36 @@ const AUTH0_CLIENT_ID = process.env.AUTH0_CLIENT_ID!;
 const AUTH0_CLIENT_SECRET = process.env.AUTH0_CLIENT_SECRET!;
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE!;
 const REFRESH_TOKEN_MAX_AGE = 60 * 60 * 24 * 7; // 7일
+const TEMP_ACCESS_TOKEN = "rvjp-temporary-mock-access-token";
+const TEMP_REFRESH_TOKEN = "rvjp-temporary-mock-refresh-token";
 
 export async function POST(request: NextRequest) {
   const { email, password } = (await request.json()) as {
     email: string;
     password: string;
   };
+
+  // TODO: 임시 우회 로그인입니다. 운영 Auth0 메일/로그인 이슈 해결 후 반드시 제거하고 Auth0 흐름으로 복구하세요.
+  if (/^\d+$/.test(String(password ?? ""))) {
+    const response = NextResponse.json({
+      accessToken: TEMP_ACCESS_TOKEN,
+      expiresIn: REFRESH_TOKEN_MAX_AGE,
+      user: {
+        email: "temporary@riverse.local",
+        name: "RIVERSE 임시 접속",
+      },
+    });
+
+    response.cookies.set("X-REFRESH-TOKEN", TEMP_REFRESH_TOKEN, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: REFRESH_TOKEN_MAX_AGE,
+    });
+
+    return response;
+  }
 
   const auth0Res = await fetch(`https://${AUTH0_DOMAIN}/oauth/token`, {
     method: "POST",

@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
-import { Mail, Lock, Eye, EyeOff, TrendingUp } from 'lucide-react';
+import { Lock, Eye, EyeOff, TrendingUp } from 'lucide-react';
 import { useAuth } from '@/providers/AuthProvider';
 
 // ---------------------------------------------------------------------------
@@ -52,11 +52,15 @@ export default function LoginPage() {
     setLoading(true);
 
     const formData = new FormData(e.currentTarget);
+    const temporaryCode = String(formData.get('password') ?? '').trim();
+    if (!/^\d+$/.test(temporaryCode)) {
+      setError('숫자만 입력하면 임시로 접속할 수 있습니다.');
+      setLoading(false);
+      return;
+    }
+
     try {
-      await login(
-        formData.get('email') as string,
-        formData.get('password') as string,
-      );
+      await login('temporary@riverse.local', temporaryCode);
       router.push('/dashboard');
     } catch (err) {
       setError(err instanceof Error ? err.message : '로그인 실패');
@@ -163,41 +167,16 @@ export default function LoginPage() {
             <TrendingUp size={20} className="text-ring" />
             <h2 className="text-2xl font-bold text-foreground">로그인</h2>
           </div>
-          <p className="mb-8 text-[13px] text-muted-foreground">매출 현황 보드에 접속합니다.</p>
+          <p className="mb-8 text-[13px] text-muted-foreground">지금은 임시 접속 모드입니다. 아무 숫자나 입력하면 접속됩니다.</p>
 
           <form onSubmit={handleSubmit} noValidate>
-            {/* 이메일 */}
-            <div className="mb-5">
-              <label
-                htmlFor="email"
-                className="mb-1.5 block text-[12px] font-medium text-muted-foreground"
-              >
-                이메일
-              </label>
-              <div className="relative">
-                <Mail
-                  size={15}
-                  className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-muted-foreground/60"
-                />
-                <input
-                  id="email"
-                  name="email"
-                  type="email"
-                  required
-                  autoComplete="email"
-                  placeholder="name@company.com"
-                  className="w-full rounded-[10px] border border-input bg-input/40 py-3 pl-10 pr-3.5 text-[14px] text-foreground placeholder:text-muted-foreground/40 transition-[border-color,box-shadow] duration-200 outline-none focus:border-ring focus:shadow-[0_0_0_3px_rgba(56,169,248,0.15)]"
-                />
-              </div>
-            </div>
-
-            {/* 비밀번호 */}
+            {/* 임시 숫자 접속 코드 */}
             <div className="mb-7">
               <label
                 htmlFor="password"
                 className="mb-1.5 block text-[12px] font-medium text-muted-foreground"
               >
-                비밀번호
+                임시 접속 숫자
               </label>
               <div className="relative">
                 <Lock
@@ -209,7 +188,10 @@ export default function LoginPage() {
                   name="password"
                   type={showPassword ? 'text' : 'password'}
                   required
-                  autoComplete="current-password"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  autoComplete="off"
+                  placeholder="예: 1234"
                   className="w-full rounded-[10px] border border-input bg-input/40 py-3 pl-10 pr-11 text-[14px] text-foreground transition-[border-color,box-shadow] duration-200 outline-none focus:border-ring focus:shadow-[0_0_0_3px_rgba(56,169,248,0.15)]"
                 />
                 <button
@@ -224,7 +206,7 @@ export default function LoginPage() {
               </div>
             </div>
 
-            {/* 에러 메시지 */}
+            {/* 에러/안내 메시지 */}
             {error && (
               <div className="mb-4 rounded-lg border border-destructive/20 bg-destructive/10 px-3.5 py-2.5 text-center text-[13px] text-destructive">
                 {error}
@@ -241,15 +223,6 @@ export default function LoginPage() {
             </button>
           </form>
 
-          {/* 비밀번호 찾기 */}
-          <div className="mt-5 text-center">
-            <button
-              type="button"
-              className="cursor-pointer bg-transparent text-[12px] text-muted-foreground/60 transition-colors hover:text-ring"
-            >
-              비밀번호를 잊으셨나요?
-            </button>
-          </div>
         </motion.div>
       </div>
     </div>
