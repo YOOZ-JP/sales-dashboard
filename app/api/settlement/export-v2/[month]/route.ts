@@ -55,8 +55,6 @@ export async function GET(
         "X-Export-V2-Rows": String(result.rows_written),
         "X-Export-V2-Electronic-Rows": String(result.electronic_rows),
         "X-Export-V2-Publication-Rows": String(result.publication_rows),
-        "X-Export-V2-Electronic-Sheet": result.electronic_sheet,
-        "X-Export-V2-Publication-Sheet": result.publication_sheet,
         "X-Export-V2-Fill-Ms": String(result.fill_ms),
       },
     });
