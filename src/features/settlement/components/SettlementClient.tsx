@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
-import { AlertCircle, CheckCircle2, Download, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
+import { useMemo, useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
+import { AlertCircle, CheckCircle2, Download, FolderOpen, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import InputPreviewTable, { type PreviewData } from './InputPreviewTable';
 
@@ -20,13 +20,71 @@ function toIsoMonth(yyyymm: string) {
   return `${yyyymm.slice(0, 4)}-${yyyymm.slice(4, 6)}-01`;
 }
 
+type SelectedFile = { file: File; relativePath: string };
+
+function fileKey(sf: SelectedFile) {
+  return `${sf.relativePath}|${sf.file.size}|${sf.file.lastModified}`;
+}
+
+// React/TS don't type the non-standard directory-picker attributes; the cast keeps them on the DOM input.
+const folderInputProps = { webkitdirectory: '', directory: '' } as unknown as InputHTMLAttributes<HTMLInputElement>;
+
+// Chrome returns at most 100 entries per readEntries() call; keep reading until it comes back empty.
+// A read error still resolves with the entries gathered so far, flagged so the caller can count it.
+function readAllDirectoryEntries(
+  reader: FileSystemDirectoryReader,
+): Promise<{ entries: FileSystemEntry[]; errored: boolean }> {
+  return new Promise((resolve) => {
+    const all: FileSystemEntry[] = [];
+    const readBatch = () => {
+      reader.readEntries(
+        (entries) => {
+          if (entries.length === 0) return resolve({ entries: all, errored: false });
+          all.push(...entries);
+          readBatch();
+        },
+        () => resolve({ entries: all, errored: true }),
+      );
+    };
+    readBatch();
+  });
+}
+
+// Collects files under an entry into `collected`; returns how many entries could not be read.
+async function collectFilesFromEntry(entry: FileSystemEntry, collected: SelectedFile[]): Promise<number> {
+  if (entry.isFile) {
+    const file = await new Promise<File | null>((resolve) =>
+      (entry as FileSystemFileEntry).file(resolve, () => resolve(null)),
+    );
+    if (!file) return 1;
+    collected.push({ file, relativePath: entry.fullPath.replace(/^\//, '') });
+    return 0;
+  }
+  if (entry.isDirectory) {
+    let reader: FileSystemDirectoryReader;
+    try {
+      reader = (entry as FileSystemDirectoryEntry).createReader();
+    } catch {
+      return 1;
+    }
+    const { entries: children, errored } = await readAllDirectoryEntries(reader);
+    let skipped = errored ? 1 : 0;
+    for (const child of children) skipped += await collectFilesFromEntry(child, collected);
+    return skipped;
+  }
+  return 1;
+}
+
 export default function SettlementClient() {
   const { t } = useApp();
   const now = new Date();
   const defaultMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
   const [month, setMonth] = useState(defaultMonth);
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<SelectedFile[]>([]);
+  const filesRef = useRef<SelectedFile[]>([]);
   const [folderHint, setFolderHint] = useState('');
+  const [dragActive, setDragActive] = useState(false);
+  const [selectionNote, setSelectionNote] = useState<string | null>(null);
   const [replaceMonth, setReplaceMonth] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -79,6 +137,77 @@ export default function SettlementClient() {
     }
   }
 
+  function addFiles(incoming: SelectedFile[], unreadable: number) {
+    if (incoming.length === 0 && unreadable === 0) return;
+    const topFolder = incoming.find((sf) => sf.relativePath.includes('/'))?.relativePath.split('/')[0];
+    if (topFolder) setFolderHint((prev) => (prev.trim() ? prev : topFolder));
+
+    // Use a ref-backed latest snapshot so overlapping async folder traversals
+    // merge into the newest list without causing side effects inside a React updater.
+    const map = new Map(filesRef.current.map((sf) => [fileKey(sf), sf] as const));
+    const before = map.size;
+    for (const sf of incoming) map.set(fileKey(sf), sf);
+
+    const nextFiles = Array.from(map.values());
+    filesRef.current = nextFiles;
+    setFiles(nextFiles);
+
+    const added = map.size - before;
+    const duplicates = incoming.length - added;
+    const parts: string[] = [t(`${added}개 파일 추가됨`, `${added}件のファイルを追加しました`)];
+    if (duplicates > 0) parts.push(t(`중복 ${duplicates}개 제외`, `重複${duplicates}件を除外`));
+    if (unreadable > 0) parts.push(t(`읽지 못한 항목 ${unreadable}개 제외`, `読み込めなかった項目${unreadable}件を除外`));
+    setSelectionNote(parts.join(' · '));
+  }
+
+  function onFileInputChange(e: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(e.target.files ?? []).map((file) => ({
+      file,
+      relativePath: file.webkitRelativePath || file.name,
+    }));
+    addFiles(picked, 0);
+    // Reset so selecting the same files/folder again still fires onChange.
+    e.target.value = '';
+  }
+
+  function onDragOver(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    if (!dragActive) setDragActive(true);
+  }
+
+  function onDragLeave(e: DragEvent<HTMLDivElement>) {
+    // dragleave also fires when moving over children; only deactivate when actually leaving the zone.
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragActive(false);
+  }
+
+  async function onDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDragActive(false);
+    // Entries and files must be captured synchronously: the DataTransfer item list
+    // is cleared as soon as the handler yields to an await.
+    const captured = Array.from(e.dataTransfer?.items ?? [])
+      .filter((item) => item.kind === 'file')
+      .map((item) => ({
+        entry: typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null,
+        file: item.getAsFile(),
+      }));
+    const collected: SelectedFile[] = [];
+    let unreadable = 0;
+    if (captured.length > 0) {
+      for (const { entry, file } of captured) {
+        if (entry) unreadable += await collectFilesFromEntry(entry, collected);
+        else if (file) collected.push({ file, relativePath: file.name });
+        else unreadable += 1;
+      }
+    } else {
+      for (const file of Array.from(e.dataTransfer?.files ?? [])) {
+        collected.push({ file, relativePath: file.name });
+      }
+    }
+    addFiles(collected, unreadable);
+  }
+
   async function upload() {
     if (!validMonth || files.length === 0 || uploading) return;
     setUploading(true);
@@ -91,7 +220,7 @@ export default function SettlementClient() {
     setPreviewError(null);
     try {
       const fd = new FormData();
-      for (const file of files) fd.append('files', file);
+      for (const sf of files) fd.append('files', sf.file);
       fd.append('activeMonth', activeMonth);
       if (folderHint.trim()) fd.append('folder', folderHint.trim());
       if (replaceMonth) fd.append('replaceMonth', '1');
@@ -184,23 +313,52 @@ export default function SettlementClient() {
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <label className="flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 p-8 text-center transition hover:border-blue-500 dark:border-slate-700">
+          <div
+            onDragOver={onDragOver}
+            onDragLeave={onDragLeave}
+            onDrop={onDrop}
+            className={`flex min-h-44 flex-col items-center justify-center rounded-xl border-2 border-dashed p-8 text-center transition ${dragActive ? 'border-blue-500 bg-blue-50 dark:bg-blue-950/30' : 'border-slate-300 dark:border-slate-700'}`}
+          >
             <UploadCloud className="mb-3 h-10 w-10 text-blue-600" />
-            <span className="text-sm font-semibold text-slate-800 dark:text-slate-100">{t('정산 원본 파일 선택', '精算原本ファイルを選択')}</span>
-            <span className="mt-1 text-xs text-slate-500">{t('여러 파일을 한 번에 선택할 수 있습니다.', '複数ファイルを一度に選択できます。')}</span>
-            <input
-              type="file"
-              multiple
-              className="hidden"
-              onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
-            />
-          </label>
+            <span className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+              {t('정산 원본 파일이나 폴더를 여기로 드래그하세요', '精算原本ファイルやフォルダをここにドラッグしてください')}
+            </span>
+            <span className="mt-1 text-xs text-slate-500">
+              {t('폴더를 통째로 놓으면 하위 파일까지 모두 추가됩니다. 중복 파일은 자동으로 제외됩니다.', 'フォルダごとドロップすると配下のファイルもすべて追加されます。重複ファイルは自動的に除外されます。')}
+            </span>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <label className="inline-flex cursor-pointer items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition hover:border-blue-500 dark:border-slate-700 dark:text-slate-100">
+                <UploadCloud className="mr-1.5 h-3.5 w-3.5" />
+                {t('파일 선택', 'ファイルを選択')}
+                <input type="file" multiple className="hidden" onChange={onFileInputChange} />
+              </label>
+              <label className="inline-flex cursor-pointer items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition hover:border-blue-500 dark:border-slate-700 dark:text-slate-100">
+                <FolderOpen className="mr-1.5 h-3.5 w-3.5" />
+                {t('폴더 선택', 'フォルダを選択')}
+                <input type="file" multiple className="hidden" onChange={onFileInputChange} {...folderInputProps} />
+              </label>
+            </div>
+          </div>
+
+          {selectionNote && <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{selectionNote}</p>}
 
           {files.length > 0 && (
             <div className="mt-4 rounded-lg bg-slate-50 p-3 text-sm dark:bg-slate-950">
-              <div className="font-semibold text-slate-800 dark:text-slate-100">{t(`선택된 파일 ${files.length}개`, `選択されたファイル ${files.length}件`)}</div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-semibold text-slate-800 dark:text-slate-100">{t(`선택된 파일 ${files.length}개`, `選択されたファイル ${files.length}件`)}</div>
+                <button
+                  onClick={() => {
+                    filesRef.current = [];
+                    setFiles([]);
+                    setSelectionNote(null);
+                  }}
+                  className="text-xs font-semibold text-red-600 hover:underline dark:text-red-400"
+                >
+                  {t('전체 해제', 'すべて解除')}
+                </button>
+              </div>
               <ul className="mt-2 max-h-28 space-y-1 overflow-auto text-xs text-slate-600 dark:text-slate-300">
-                {files.map((file) => <li key={`${file.name}-${file.size}`}>{file.name}</li>)}
+                {files.map((sf) => <li key={fileKey(sf)}>{sf.relativePath}</li>)}
               </ul>
             </div>
           )}
