@@ -3,18 +3,13 @@ import { readFile } from "node:fs/promises";
 
 import { splitInputV2Records } from "./input-v2-routing";
 
-const DEFAULT_TEMPLATE = new URL(
-  "../../data/templates/input_jp_2026_v2_template.xlsx",
-  import.meta.url,
-);
-
 /**
- * 202605 answer-key workbook supplied by RIVERSE/Nakatani.
- * This is a golden template fixture for reproducing the May 2026 final INPUT_JP
- * workbook structure. It is not a claim that future-month parser output is fully
- * solved; parser correctness is verified separately by golden comparison.
+ * 202605 answer-key workbook supplied by RIVERSE/Nakatani. It is the default
+ * template for every month: its input_電子_5月 sheet is renamed to the target
+ * month's input_電子_N月 sheet on fill. It has no input_出版 sheet, so all
+ * records route to the electronic sheet when this default is in effect.
  */
-const GOLDEN_202605_TEMPLATE = new URL(
+const DEFAULT_TEMPLATE = new URL(
   "../../data/templates/input_jp_2026_2605_golden.xlsx",
   import.meta.url,
 );
@@ -317,22 +312,20 @@ function fillSheet(
   stretchSubtotalRanges(ws, FIRST_DATA_ROW + records.length - 1, maxCol);
 }
 
-function defaultTemplateForMonth(month: string): URL {
-  return month === "202605" ? GOLDEN_202605_TEMPLATE : DEFAULT_TEMPLATE;
-}
-
 export async function fillInputV2Template(opts: InputV2FillOptions): Promise<InputV2FillResult> {
   const t0 = Date.now();
-  const usesGolden202605Template = !opts.templatePath && opts.month === "202605";
+  // The golden default template only has the electronic sheet; splitting into a
+  // publication sheet only applies when an explicit template provides one.
+  const usesGoldenDefaultTemplate = !opts.templatePath;
   const split = splitInputV2Records(opts.records, opts.month);
-  const effectiveSplit = usesGolden202605Template
+  const effectiveSplit = usesGoldenDefaultTemplate
     ? {
         ...split,
         electronic: opts.records,
         publication: [],
       }
     : split;
-  const templatePath = opts.templatePath ?? defaultTemplateForMonth(opts.month);
+  const templatePath = opts.templatePath ?? DEFAULT_TEMPLATE;
 
   const wb = new ExcelJS.Workbook();
   const templateBuffer = await readFile(templatePath);

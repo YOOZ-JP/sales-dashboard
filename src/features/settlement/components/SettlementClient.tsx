@@ -29,9 +29,10 @@ function fileKey(sf: SelectedFile) {
 // React/TS don't type the non-standard directory-picker attributes; the cast keeps them on the DOM input.
 const folderInputProps = { webkitdirectory: '', directory: '' } as unknown as InputHTMLAttributes<HTMLInputElement>;
 
-// Vercel rejects request bodies over ~4.5MB with 413 before the route runs,
-// so uploads are split into size- and count-capped batches.
-const BATCH_MAX_FILES = 10;
+// Vercel rejects request bodies over ~4.5MB with 413 before the route runs, and
+// parsing several workbooks in one invocation can exceed the function timeout (504),
+// so each file is sent as its own request.
+const BATCH_MAX_FILES = 1;
 const BATCH_MAX_BYTES = 3_500_000;
 
 function buildBatches(selected: SelectedFile[]): SelectedFile[][] {
@@ -49,6 +50,16 @@ function buildBatches(selected: SelectedFile[]): SelectedFile[][] {
   }
   if (current.length > 0) batches.push(current);
   return batches;
+}
+
+// Finds a YYYYMM month in folder or file names (e.g. "202605/...", "202605_mangabang").
+// The lookbehind/lookahead keep it from matching inside longer digit runs like timestamps.
+function detectMonthFromPaths(incoming: SelectedFile[]): string | null {
+  for (const sf of incoming) {
+    const m = sf.relativePath.match(/(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)/);
+    if (m) return `${m[1]}${m[2]}`;
+  }
+  return null;
 }
 
 // Chrome returns at most 100 entries per readEntries() call; keep reading until it comes back empty.
@@ -177,6 +188,13 @@ export default function SettlementClient() {
     const added = map.size - before;
     const duplicates = incoming.length - added;
     const parts: string[] = [t(`${added}개 파일 추가됨`, `${added}件のファイルを追加しました`)];
+    // If the dropped folder/files name a settlement month, follow it so the
+    // upload and preview target that month instead of the current calendar month.
+    const detected = detectMonthFromPaths(incoming);
+    if (detected && detected !== month) {
+      changeMonth(detected);
+      parts.push(t(`정산월을 ${detected}로 자동 설정`, `精算月を${detected}に自動設定`));
+    }
     if (duplicates > 0) parts.push(t(`중복 ${duplicates}개 제외`, `重複${duplicates}件を除外`));
     if (unreadable > 0) parts.push(t(`읽지 못한 항목 ${unreadable}개 제외`, `読み込めなかった項目${unreadable}件を除外`));
     setSelectionNote(parts.join(' · '));
@@ -290,37 +308,16 @@ export default function SettlementClient() {
       let abortRemaining = false;
       for (let i = 0; i < batches.length; i++) {
         const batch = batches[i];
-        setMessage(t(`업로드 중... 배치 ${i + 1}/${totalBatches}`, `アップロード中... バッチ ${i + 1}/${totalBatches}`));
+        setMessage(t(
+          `업로드 중... 파일 ${i + 1}/${totalBatches}: ${batch[0].relativePath}`,
+          `アップロード中... ファイル ${i + 1}/${totalBatches}: ${batch[0].relativePath}`,
+        ));
         try {
           const { res, sentReplace } = await send(batch);
-          if (sentReplace && res.status !== 413 && !res.ok) {
-            // If the one-time clear-month request reached the server but failed,
-            // do not continue later batches in an uncleared/ambiguous month.
-            await handleResponse(res, batch);
-            abortRemaining = true;
-          } else if (res.status === 413 && batch.length > 1) {
-            // The batch as a whole is too large; retry once per file so only
-            // genuinely oversized files fail. No further retries after that.
-            setMessage(t(
-              `배치 ${i + 1}/${totalBatches}이 용량 제한(413)에 걸려 파일별로 재시도합니다...`,
-              `バッチ ${i + 1}/${totalBatches} が容量制限(413)のため、ファイルごとに再試行します...`,
-            ));
-            for (const sf of batch) {
-              try {
-                const single = await send([sf]);
-                if (single.sentReplace && single.res.status !== 413 && !single.res.ok) {
-                  await handleResponse(single.res, [sf]);
-                  abortRemaining = true;
-                  break;
-                }
-                await handleResponse(single.res, [sf]);
-              } catch (err) {
-                recordFailure([sf], (err as Error).message);
-              }
-            }
-          } else {
-            await handleResponse(res, batch);
-          }
+          await handleResponse(res, batch);
+          // If the one-time clear-month request reached the server but failed,
+          // do not continue later files in an uncleared/ambiguous month.
+          if (sentReplace && res.status !== 413 && !res.ok) abortRemaining = true;
         } catch (err) {
           recordFailure(batch, (err as Error).message);
         }
