@@ -27,9 +27,15 @@ async function requireValidAccessToken(request: NextRequest): Promise<boolean> {
 
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error('Missing Supabase service-role environment variables');
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !key) throw new Error('Missing Supabase env');
   return createClient(url, key);
+}
+
+function getContentMasterSource() {
+  // Production has anon Supabase env. When service role is absent, read only
+  // through a DB view that deliberately excludes raw_data and private batches.
+  return process.env.SUPABASE_SERVICE_ROLE_KEY ? 'content_master' : 'content_master_public';
 }
 
 /**
@@ -46,7 +52,7 @@ export async function GET(request: NextRequest) {
   // 활성 행만 대상으로 분류 필드를 조회해 애플리케이션 단에서 집계한다.
   // (테이블 규모가 수백 건 수준이라 별도 RPC 없이 충분히 가볍다.)
   const { data, error, count } = await getSupabaseAdmin()
-    .from('content_master')
+    .from(getContentMasterSource())
     .select('status, genre, label, format', { count: 'exact' })
     .eq('is_active', true);
 
