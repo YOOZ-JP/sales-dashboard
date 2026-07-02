@@ -10,18 +10,29 @@
  *   計上日付, ジャンル, 書名, 版数, 勘定科目, 摘要, 消費税率, 軽減税率,
  *   合計金額（明細）, 所得税等（明細）, 合計金額, 合計消費税金額, ..., 支払元名称
  *
- * Detail rows (one per 書名 × 計上日付 month) have:
- *   合計金額（明細）= tax-inclusive royalty for that 書名/month
+ * Emission rules (matched against the accountant's INPUT sheet):
+ *   - One record per non-zero detail row. The same 書名 legitimately appears
+ *     several times with different 勘定科目 (原稿料 / 版権料 / 出版印税 /
+ *     二次的利用印税) and amounts — these are distinct GT rows, not dupes.
+ *   - 勘定科目 → type via aliases.account_type_map (原稿料→MF, 出版印税→PP,
+ *     版権料→PP, 二次的利用印税→EB); unmapped accounts fall back to rules.type.
+ *   - Exception: series listed in aliases.series_rollup (盗掘王 incl. 分冊版)
+ *     keep the historical behaviour of collapsing into one aggregated record,
+ *     and the admin row 「消費税端数差額調整」 is apportioned into the
+ *     configured rollup series.
  *
- * Aggregate columns repeat the grand total on every row:
- *   合計金額 = sum of all 合計金額（明細）= the single GT before_tax_income_jpy
+ * Dates:
+ *   - settlement_month (per record) = the exact 支払日 (e.g. 2026-05-29);
+ *     the GT sheet stores the full payment date, so the transformer preserves
+ *     it. The file-level ParseResult.settlement_month stays first-of-month
+ *     for batch bucketing.
+ *   - sales_month (per record) = the end of the accounting period, i.e. the
+ *     last day of the month before the 支払日 month. Individual 計上日付 can
+ *     post into the payment month (e.g. 素材費 posted 05/14 paid 05/29) but
+ *     the GT books the whole notice under the closed period (2026-04-30).
  *
- * Rules:
- *   - Skip the admin row 「消費税端数差額調整」 (zero in our data).
- *   - Collapse all "盗掘王 …" variants into one series → channel_title_jp = "盗掘王"
- *     sum of all 合計金額（明細）rows = GT before_tax_income_jpy
- *   - after_tax_income = sum / 1.10 (but an exact figure is the aggregate
- *     「合計金額 - 合計消費税金額」 which we prefer).
+ * Amounts (per detail row, 合計金額（明細） is tax-inclusive):
+ *   after_tax_income = round(amount / 1.1), consumption_tax = amount − after.
  */
 import iconv from "iconv-lite";
 import Papa from "papaparse";
@@ -48,6 +59,30 @@ function matchSeries(title: string): { series: string; gt_title: string } | null
   return null;
 }
 
+/** Last day of the month preceding the given ISO date (accounting period end). */
+function periodEndBefore(isoDate: string): string {
+  const y = Number(isoDate.slice(0, 4));
+  const m = Number(isoDate.slice(5, 7));
+  const d = new Date(Date.UTC(y, m - 1, 0)); // day 0 of month m = last day of m-1
+  return d.toISOString().slice(0, 10);
+}
+
+function splitAmount(taxIncl: number): { after: number; tax: number } {
+  const after = Math.round(taxIncl / (1 + aliases.rules.tax_rate));
+  return { after, tax: taxIncl - after };
+}
+
+function parseIsoDateLike(v: string | undefined): string | null {
+  const s = String(v ?? "").trim();
+  const compact = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
+  const separated = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (separated) {
+    return `${separated[1]}-${separated[2].padStart(2, "0")}-${separated[3].padStart(2, "0")}`;
+  }
+  return null;
+}
+
 export async function parseKadokawa({ buffer, filename }: { filename: string; buffer: Buffer }): Promise<ParseResult> {
   const errors: string[] = [];
 
@@ -70,12 +105,32 @@ export async function parseKadokawa({ buffer, filename }: { filename: string; bu
     return { platform_code: "kadokawa", sales_month: null, settlement_month: null, records: [], errors: ["csv empty"] };
   }
 
-  // Aggregate per series.
-  const seriesAgg = new Map<string, { gt_title: string; incomeTaxIncl: number; raw_titles: Set<string>; months: Set<string> }>();
+  // Determine settlement / sales month based on the CSV header cells.
+  const first = rows[0]!;
+  const payDate = first["支払日"];
+  const isoPay = parseIsoDateLike(payDate);
+  const settlementMonth = isoPay ? `${isoPay.slice(0, 7)}-01` : null;
+  // Accounting period end: last day of the month before payment. Fallback
+  // when 支払日 is unreadable: newest 計上日付 across details.
+  let latestCal: string | null = null;
+  for (const r of rows) {
+    const c = (r["計上日付"] ?? "").trim();
+    if (!c) continue;
+    if (!latestCal || c > latestCal) latestCal = c;
+  }
+  const salesMonth = isoPay
+    ? periodEndBefore(isoPay)
+    : latestCal
+      ? latestCal.slice(0, 7).replace(/\//g, "-") + "-01"
+      : null;
+
+  const accountTypeMap: Record<string, string> = aliases.account_type_map ?? {};
   const skipTitles = new Set<string>(aliases.skip_titles ?? []);
   const adjustmentTitles = new Set<string>(aliases.adjustment_titles ?? []);
   const adjustmentAttachTo = aliases.adjustment_attaches_to ?? null;
 
+  // Rollup buckets for configured series (盗掘王 分冊版 variants → one row).
+  const seriesAgg = new Map<string, { gt_title: string; incomeTaxIncl: number; raw_titles: Set<string>; months: Set<string> }>();
   function bucketFor(seriesKey: string, gt_title: string) {
     const entry = seriesAgg.get(seriesKey) ?? {
       gt_title,
@@ -86,6 +141,13 @@ export async function parseKadokawa({ buffer, filename }: { filename: string; bu
     seriesAgg.set(seriesKey, entry);
     return entry;
   }
+
+  const records: ParseResult["records"] = [];
+  let idx = 0;
+  const baseDates = {
+    sales_month: salesMonth,
+    settlement_month: isoPay ?? settlementMonth,
+  };
 
   for (const r of rows) {
     const title = (r["書名"] ?? "").trim();
@@ -109,45 +171,47 @@ export async function parseKadokawa({ buffer, filename }: { filename: string; bu
     }
 
     const matched = matchSeries(title);
-    if (!matched) {
-      errors.push(`unclassified title: ${title}`);
+    if (matched) {
+      const e = bucketFor(matched.series, matched.gt_title);
+      e.incomeTaxIncl += detailAmt;
+      e.raw_titles.add(title);
+      if (r["計上日付"]) e.months.add(r["計上日付"]);
       continue;
     }
-    const e = bucketFor(matched.series, matched.gt_title);
-    e.incomeTaxIncl += detailAmt;
-    e.raw_titles.add(title);
-    if (r["計上日付"]) e.months.add(r["計上日付"]);
-  }
 
-  // Determine settlement / sales month based on the CSV header cells.
-  const first = rows[0]!;
-  const payDate = (first["支払日"] ?? "").replace(/\//g, "-"); // e.g. "20260331"
-  const isoPay = payDate.length === 8
-    ? `${payDate.slice(0, 4)}-${payDate.slice(4, 6)}-${payDate.slice(6, 8)}`
-    : null;
-  const settlementMonth = isoPay ? `${isoPay.slice(0, 7)}-01` : null;
-  // The "representative" sales month is the newest 計上日付 across details
-  // (GT uses the end-of-window month, typically the final 計上日付).
-  let latestCal: string | null = null;
-  for (const r of rows) {
-    const c = (r["計上日付"] ?? "").trim();
-    if (!c) continue;
-    if (!latestCal || c > latestCal) latestCal = c;
-  }
-  const salesMonth = latestCal ? latestCal.slice(0, 7).replace(/\//g, "-") + "-01" : null;
-
-  const records: ParseResult["records"] = [];
-  let idx = 0;
-  for (const [, agg] of seriesAgg) {
-    idx++;
-    const beforeTaxIncome = agg.incomeTaxIncl;
-    const afterTaxIncome = Math.round(beforeTaxIncome / (1 + aliases.rules.tax_rate));
-    const consumptionTax = beforeTaxIncome - afterTaxIncome;
-
+    // Default path: one record per non-zero detail row.
+    const account = (r["勘定科目"] ?? "").trim();
+    const { after, tax } = splitAmount(detailAmt);
     records.push({
-      row_index: idx,
+      row_index: ++idx,
       data: {
-        sales_month: salesMonth,
+        ...baseDates,
+        client_code: aliases.client_code,
+        channel_code: aliases.channel_code,
+        type: accountTypeMap[account] ?? aliases.rules.type,
+        title_jp: title,
+        channel_title_jp: title,
+        raw_title: title,
+        account,
+        accounting_date: (r["計上日付"] ?? "").trim() || null,
+        before_tax_jpy: detailAmt,
+        after_tax_jpy: after,
+        before_tax_income_jpy: detailAmt,
+        after_tax_income_jpy: after,
+        consumption_tax_jpy: tax,
+        total_amount_jpy: detailAmt,
+        gross_jpy: detailAmt,
+      },
+    });
+  }
+
+  for (const [, agg] of seriesAgg) {
+    const beforeTaxIncome = agg.incomeTaxIncl;
+    const { after: afterTaxIncome, tax: consumptionTax } = splitAmount(beforeTaxIncome);
+    records.push({
+      row_index: ++idx,
+      data: {
+        ...baseDates,
         client_code: aliases.client_code,
         channel_code: aliases.channel_code,
         type: aliases.rules.type,

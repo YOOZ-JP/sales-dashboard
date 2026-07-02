@@ -11,6 +11,7 @@
  * Supabase query failure (500). `null` means the DB was queried successfully —
  * zero records is then a genuine "no data" case (404 at the route level).
  */
+import { dedupeCrossUploadDuplicates } from "@/features/settlement/lib/aggregation/strict-record-key";
 import {
   clientCodeToDisplay,
   loadInputV2TemplateLookups,
@@ -258,7 +259,19 @@ export async function loadInputV2Records(
         }
       }
     }
-    return { records: all, source: "supabase", loadError: null };
+
+    // Hide historical cross-upload duplicates (the same statement uploaded
+    // twice, e.g. as CSV and XLSX) without touching the DB: per strict
+    // logical key, keep one upload's rows and drop the re-uploaded copies.
+    // Legitimate variants (same title, different type/month/amount) have
+    // distinct keys and always survive.
+    const deduped = dedupeCrossUploadDuplicates(all);
+    if (deduped.removed > 0) {
+      console.warn(
+        `[input-v2] ${month}: suppressed ${deduped.removed} cross-upload duplicate rows`,
+      );
+    }
+    return { records: deduped.records, source: "supabase", loadError: null };
   } catch (err) {
     const message = formatSupabaseError(err);
     console.warn("[input-v2] Supabase fetch failed:", message);

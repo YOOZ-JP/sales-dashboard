@@ -19,6 +19,10 @@ import {
   type TransformContext,
   type LookupMaps,
 } from "@/features/settlement/lib/aggregation/to-sales-records";
+import {
+  STRICT_KEY_COLUMNS,
+  suppressExistingDuplicates,
+} from "@/features/settlement/lib/aggregation/strict-record-key";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -185,6 +189,7 @@ export async function POST(request: Request) {
 
     // 5. Transform → sales_records
     let salesWritten = 0;
+    let skippedDuplicates = 0;
     if (parsed.records.length > 0) {
       // resolveSettlementMonth guarantees a month whenever records exist;
       // this guard only keeps TypeScript honest and catches regressions.
@@ -195,16 +200,54 @@ export async function POST(request: Request) {
       }
       const ctx: TransformContext = {
         settlement_month: batch,
+        sales_month: parsed.sales_month || null,
         platform_code: parsed.platform_code,
         upload_id: uploadRow.id,
         raw_record_id_by_index: rawRecordIds,
         lookups,
       };
       const transformed = toSalesRecords(parsed.records, ctx);
-      if (transformed.inserts.length > 0) {
+      let inserts = transformed.inserts;
+      if (inserts.length > 0) {
+        // Skip rows whose strict logical key already exists in this batch —
+        // re-uploads and CSV+XLSX twins of the same statement. Legitimate
+        // variants (same title, different type/month/amount) key differently
+        // and are kept.
+        try {
+          const existing: Record<string, unknown>[] = [];
+          const PAGE = 1000;
+          for (let offset = 0; ; offset += PAGE) {
+            const { data, error } = await supabase
+              .from("sales_records")
+              .select(STRICT_KEY_COLUMNS)
+              .eq("settlement_batch", batch)
+              .range(offset, offset + PAGE - 1)
+              // STRICT_KEY_COLUMNS is a runtime string, so supabase-js cannot
+              // derive the row shape at the type level.
+              .returns<Record<string, unknown>[]>();
+            if (error) throw error;
+            if (!data || data.length === 0) break;
+            existing.push(...data);
+            if (data.length < PAGE) break;
+          }
+          if (existing.length > 0) {
+            const suppressed = suppressExistingDuplicates(inserts, existing);
+            inserts = suppressed.kept;
+            skippedDuplicates = suppressed.skipped;
+            if (skippedDuplicates > 0) {
+              console.warn(
+                `[upload] ${f.name}: skipped ${skippedDuplicates} duplicate sales rows already in ${batch}`,
+              );
+            }
+          }
+        } catch (e) {
+          console.warn("[upload] duplicate check failed, inserting all rows:", (e as Error).message);
+        }
+      }
+      if (inserts.length > 0) {
         const { error: salesErr, data: salesData } = await supabase
           .from("sales_records")
-          .insert(transformed.inserts)
+          .insert(inserts)
           .select("id");
         if (salesErr) {
           results.push({
@@ -231,6 +274,7 @@ export async function POST(request: Request) {
       confidence: parsed.detection_confidence,
       parsed_rows: parsed.records.length,
       sales_records_written: salesWritten,
+      sales_records_skipped_duplicates: skippedDuplicates,
       settlement_month: effectiveSettlement,
       sales_month: parsed.sales_month || null,
       archive_path: archivePath,

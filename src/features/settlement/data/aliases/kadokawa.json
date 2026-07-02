@@ -17,6 +17,12 @@
     "消費税端数差額調整"
   ],
   "adjustment_attaches_to": "盗掘王",
+  "account_type_map": {
+    "原稿料": "MF",
+    "出版印税": "PP",
+    "版権料": "PP",
+    "二次的利用印税": "EB"
+  },
   "rules": {
     "amount_is_tax_incl": true,
     "tax_rate": 0.10,

@@ -37,6 +37,12 @@ export interface LookupMaps {
 
 export interface TransformContext {
   settlement_month: string; // 'YYYY-MM-01'
+  /**
+   * File-level sales month parsed from the upload (ISO date), used as the
+   * fallback when a record carries no own sales_month. Prevents e.g. a renta
+   * 2026-04 statement settling in 2026-05 from being stamped 2026-05.
+   */
+  sales_month?: string | null;
   platform_code: string; // 'booklive', 'cmoa', ...
   upload_id?: string | null;
   raw_record_id_by_index?: Map<number, string>;
@@ -248,7 +254,10 @@ function fromSalesRecord(
       recoder: "SYSTEM",
       company: row.company ?? "RJ",
       launch_date: isoDateOrNull(row.launch_date),
-      sales_month: isoMonthFirstOrNull(row.sales_month) ?? ctx.settlement_month,
+      sales_month:
+        isoMonthFirstOrNull(row.sales_month) ??
+        isoMonthFirstOrNull(ctx.sales_month) ??
+        ctx.settlement_month,
       settlement_month:
         isoMonthFirstOrNull(row.settlement_month) ?? ctx.settlement_month,
       settlement_batch: ctx.settlement_month,
@@ -379,7 +388,10 @@ function fromGroundTruth(
       recoder: "SYSTEM",
       company: strOrNull(row.company) ?? "RJ",
       launch_date: isoDateOrNull(row.launch_date),
-      sales_month: isoMonthFirstOrNull(row.sales_month) ?? ctx.settlement_month,
+      sales_month:
+        isoMonthFirstOrNull(row.sales_month) ??
+        isoMonthFirstOrNull(ctx.sales_month) ??
+        ctx.settlement_month,
       settlement_month:
         isoMonthFirstOrNull(row.settlement_month) ?? ctx.settlement_month,
       settlement_batch: ctx.settlement_month,
@@ -486,11 +498,18 @@ function fromRawRecord(
       recoder: "SYSTEM",
       company: strOrNull(d.company) ?? "RJ",
       launch_date: isoDateOrNull(d.launch_date),
-      sales_month: isoMonthFirstOrNull(d.sales_month) ?? ctx.settlement_month,
+      // Parser rows may carry exact dates (piccoma end-of-month, KADOKAWA
+      // 支払日 / period-end) — preserve them instead of collapsing to the 1st.
+      // File-level ctx.sales_month beats ctx.settlement_month so a statement
+      // for month M settling in M+n keeps sales_month = M.
+      sales_month:
+        isoDateOrNull(d.sales_month) ??
+        isoDateOrNull(ctx.sales_month) ??
+        ctx.settlement_month,
       settlement_month:
-        isoMonthFirstOrNull(d.settlement_month) ?? ctx.settlement_month,
+        isoDateOrNull(d.settlement_month) ?? ctx.settlement_month,
       settlement_batch: ctx.settlement_month,
-      deposit_month: isoMonthFirstOrNull(d.deposit_month),
+      deposit_month: isoDateOrNull(d.deposit_month),
       country: strOrNull(d.country) ?? "JP",
       client_id: lookups.clientIds.get(resolvedClientCode) ?? null,
       channel_id: lookups.channelIds.get(String(channelCode).trim()) ?? null,
