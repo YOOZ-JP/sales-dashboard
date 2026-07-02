@@ -29,6 +29,28 @@ function fileKey(sf: SelectedFile) {
 // React/TS don't type the non-standard directory-picker attributes; the cast keeps them on the DOM input.
 const folderInputProps = { webkitdirectory: '', directory: '' } as unknown as InputHTMLAttributes<HTMLInputElement>;
 
+// Vercel rejects request bodies over ~4.5MB with 413 before the route runs,
+// so uploads are split into size- and count-capped batches.
+const BATCH_MAX_FILES = 10;
+const BATCH_MAX_BYTES = 3_500_000;
+
+function buildBatches(selected: SelectedFile[]): SelectedFile[][] {
+  const batches: SelectedFile[][] = [];
+  let current: SelectedFile[] = [];
+  let currentBytes = 0;
+  for (const sf of selected) {
+    if (current.length > 0 && (current.length >= BATCH_MAX_FILES || currentBytes + sf.file.size > BATCH_MAX_BYTES)) {
+      batches.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(sf);
+    currentBytes += sf.file.size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
 // Chrome returns at most 100 entries per readEntries() call; keep reading until it comes back empty.
 // A read error still resolves with the entries gathered so far, flagged so the caller can count it.
 function readAllDirectoryEntries(
@@ -209,7 +231,10 @@ export default function SettlementClient() {
   }
 
   async function upload() {
-    if (!validMonth || files.length === 0 || uploading) return;
+    if (!validMonth || uploading) return;
+    // Snapshot the latest list now so files added/removed mid-upload can't shift batches.
+    const selected = filesRef.current.slice();
+    if (selected.length === 0) return;
     setUploading(true);
     setMessage(null);
     setResults([]);
@@ -219,16 +244,100 @@ export default function SettlementClient() {
     setActiveSheet(null);
     setPreviewError(null);
     try {
-      const fd = new FormData();
-      for (const sf of files) fd.append('files', sf.file);
-      fd.append('activeMonth', activeMonth);
-      if (folderHint.trim()) fd.append('folder', folderHint.trim());
-      if (replaceMonth) fd.append('replaceMonth', '1');
-      const res = await fetch('/api/settlement/upload', { method: 'POST', body: fd });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-      setResults(Array.isArray(json.results) ? json.results : []);
-      setMessage(t('업로드 처리가 끝났습니다. 아래 결과를 확인해 주세요.', 'アップロード処理が完了しました。下の結果をご確認ください。'));
+      const batches = buildBatches(selected);
+      const totalBatches = batches.length;
+      const trimmedFolder = folderHint.trim();
+      // replaceMonth must clear the month exactly once. A 413 is rejected by the
+      // platform before the route runs, so the flag stays pending; any other
+      // response reached the server, so later requests must not send it again.
+      let replacePending = replaceMonth;
+      const aggregated: UploadResult[] = [];
+      let failedFiles = 0;
+
+      const send = async (chunk: SelectedFile[]) => {
+        const fd = new FormData();
+        for (const sf of chunk) fd.append('files', sf.file);
+        fd.append('activeMonth', activeMonth);
+        if (trimmedFolder) fd.append('folder', trimmedFolder);
+        const sentReplace = replacePending;
+        if (sentReplace) fd.append('replaceMonth', '1');
+        const res = await fetch('/api/settlement/upload', { method: 'POST', body: fd });
+        if (res.status !== 413) replacePending = false;
+        return { res, sentReplace };
+      };
+
+      const recordFailure = (chunk: SelectedFile[], error: string) => {
+        failedFiles += chunk.length;
+        for (const sf of chunk) aggregated.push({ file: sf.relativePath, error });
+      };
+
+      const handleResponse = async (res: Response, chunk: SelectedFile[]) => {
+        if (res.status === 413) {
+          recordFailure(chunk, t(
+            '파일이 Vercel 업로드 용량 제한(약 4.5MB)을 초과합니다. 이 파일은 추후 스토리지 직접 업로드 방식으로 처리해야 합니다.',
+            'ファイルがVercelのアップロード容量制限（約4.5MB）を超えています。このファイルは今後ストレージ直接アップロード方式での対応が必要です。',
+          ));
+          return;
+        }
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          recordFailure(chunk, json.error || `HTTP ${res.status}`);
+          return;
+        }
+        if (Array.isArray(json.results)) aggregated.push(...json.results);
+      };
+
+      let abortRemaining = false;
+      for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        setMessage(t(`업로드 중... 배치 ${i + 1}/${totalBatches}`, `アップロード中... バッチ ${i + 1}/${totalBatches}`));
+        try {
+          const { res, sentReplace } = await send(batch);
+          if (sentReplace && res.status !== 413 && !res.ok) {
+            // If the one-time clear-month request reached the server but failed,
+            // do not continue later batches in an uncleared/ambiguous month.
+            await handleResponse(res, batch);
+            abortRemaining = true;
+          } else if (res.status === 413 && batch.length > 1) {
+            // The batch as a whole is too large; retry once per file so only
+            // genuinely oversized files fail. No further retries after that.
+            setMessage(t(
+              `배치 ${i + 1}/${totalBatches}이 용량 제한(413)에 걸려 파일별로 재시도합니다...`,
+              `バッチ ${i + 1}/${totalBatches} が容量制限(413)のため、ファイルごとに再試行します...`,
+            ));
+            for (const sf of batch) {
+              try {
+                const single = await send([sf]);
+                if (single.sentReplace && single.res.status !== 413 && !single.res.ok) {
+                  await handleResponse(single.res, [sf]);
+                  abortRemaining = true;
+                  break;
+                }
+                await handleResponse(single.res, [sf]);
+              } catch (err) {
+                recordFailure([sf], (err as Error).message);
+              }
+            }
+          } else {
+            await handleResponse(res, batch);
+          }
+        } catch (err) {
+          recordFailure(batch, (err as Error).message);
+        }
+        setResults([...aggregated]);
+        if (abortRemaining) break;
+      }
+
+      setResults(aggregated);
+      if (failedFiles === selected.length) {
+        setMessage(t('업로드 실패: 모든 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.', 'アップロード失敗: すべてのファイル送信に失敗しました。下の結果をご確認ください。'));
+        return;
+      }
+      setMessage(
+        failedFiles === 0
+          ? t('업로드 처리가 끝났습니다. 아래 결과를 확인해 주세요.', 'アップロード処理が完了しました。下の結果をご確認ください。')
+          : t(`업로드 처리가 끝났습니다. ${failedFiles}개 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.`, `アップロード処理が完了しました。${failedFiles}件のファイル送信に失敗しました。下の結果をご確認ください。`),
+      );
       await loadPreview(month);
     } catch (err) {
       setMessage(`${t('업로드 실패', 'アップロード失敗')}: ${(err as Error).message}`);
