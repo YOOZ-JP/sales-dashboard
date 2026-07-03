@@ -3,9 +3,9 @@ import ExcelJS from "exceljs";
 /**
  * Browser-facing preview types.
  *
- * A preview is a bounded, read-only snapshot of the SAME workbook buffer produced by
- * `fillInputV2Template` (the download path). We deliberately cap rows/columns so the
- * JSON payload stays small; the downloaded `.xlsx` remains the complete authority.
+ * A preview is a read-only snapshot of the SAME workbook buffer produced by
+ * `fillInputV2Template` (the download path). It returns every generated row
+ * and column so the browser preview matches the downloaded `.xlsx` workbook.
  *
  * Basic workbook styling (solid fills, font bold/color, horizontal alignment,
  * column widths, row heights) is carried along so the browser table can mimic
@@ -54,23 +54,6 @@ export type WorkbookPreview = {
   generatedAt: string;
   sheets: WorkbookPreviewSheet[];
 };
-
-/** Default caps applied when a sheet has no more specific rule. */
-const DEFAULT_ROW_LIMIT = 150;
-const DEFAULT_COL_LIMIT = 70;
-
-/** Per-sheet-name-pattern preview bounds, matched in order. */
-const SHEET_LIMITS: Array<{ test: (name: string) => boolean; rows: number; cols: number }> = [
-  { test: (n) => /^input_電子_/.test(n), rows: 150, cols: 70 },
-  { test: (n) => n === "タイトル", rows: 120, cols: 25 },
-  { test: (n) => n === "고유번호", rows: 120, cols: 9 },
-  { test: (n) => n === "設定", rows: 120, cols: 16 },
-];
-
-function limitsFor(name: string): { rows: number; cols: number } {
-  const match = SHEET_LIMITS.find((l) => l.test(name));
-  return match ? { rows: match.rows, cols: match.cols } : { rows: DEFAULT_ROW_LIMIT, cols: DEFAULT_COL_LIMIT };
-}
 
 const BLANK_CELL: WorkbookPreviewCell = { value: null, type: "blank" };
 
@@ -162,8 +145,7 @@ function toPreviewCell(value: ExcelJS.CellValue): WorkbookPreviewCell {
 }
 
 /**
- * Load a generated workbook buffer and return bounded per-sheet cell JSON.
- * Includes the full `rowCount`/`columnCount` so the UI can note that only part is shown.
+ * Load a generated workbook buffer and return full per-sheet cell JSON.
  */
 export async function workbookBufferToPreview(
   buffer: Buffer,
@@ -182,9 +164,8 @@ export async function workbookBufferToPreview(
   const sheets: WorkbookPreviewSheet[] = wb.worksheets.map((ws) => {
     const totalRows = ws.rowCount;
     const totalCols = ws.columnCount;
-    const { rows: rowLimit, cols: colLimit } = limitsFor(ws.name);
-    const shownRows = Math.min(totalRows, rowLimit);
-    const shownCols = Math.min(totalCols, colLimit);
+    const shownRows = totalRows;
+    const shownCols = totalCols;
 
     const styles: WorkbookPreviewStyle[] = [];
     const styleIndexByKey = new Map<string, number>();

@@ -11,6 +11,8 @@ type UploadResult = {
   parsed_rows?: number;
   sales_records_written?: number;
   sales_records_skipped_duplicates?: number;
+  skipped?: boolean;
+  skip_reason?: string;
   settlement_month?: string | null;
   sales_month?: string | null;
   error?: string;
@@ -346,7 +348,8 @@ export default function SettlementClient() {
 
       setResults(aggregated);
       const failedRows = aggregated.filter((r) => r.error);
-      const successfulRows = aggregated.filter((r) => !r.error && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0));
+      const skippedRows = aggregated.filter((r) => r.skipped);
+      const successfulRows = aggregated.filter((r) => !r.error && !r.skipped && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0));
       const successCount = successfulRows.length;
       appendUploadRunLog({
         runId: uploadRunId,
@@ -363,17 +366,24 @@ export default function SettlementClient() {
       // saved, so the preview is generated whenever at least one succeeded.
       if (successCount === 0) {
         setMessage(t(
-          '업로드 실패: 모든 파일 처리에 실패했습니다. 아래 결과에서 파일별 원인을 확인해 주세요.',
-          'アップロード失敗: すべてのファイル処理に失敗しました。下の結果でファイルごとの原因をご確認ください。',
+          skippedRows.length > 0
+            ? '저장된 정산행이 없습니다. 보조자료/비정산 파일은 건너뛰었고, 아래 결과에서 파일별 상태를 확인해 주세요.'
+            : '업로드 실패: 모든 파일 처리에 실패했습니다. 아래 결과에서 파일별 원인을 확인해 주세요.',
+          skippedRows.length > 0
+            ? '保存された精算行はありません。補助資料・非精算ファイルはスキップしました。下の結果でファイルごとの状態をご確認ください。'
+            : 'アップロード失敗: すべてのファイル処理に失敗しました。下の結果でファイルごとの原因をご確認ください。',
         ));
         return;
       }
       const parts: string[] = [
         failedRows.length === 0
-          ? t(`업로드 완료: 파일 ${successCount}개가 ${targetLabel} 정산월로 저장되었습니다.`, `アップロード完了: ファイル${successCount}件が${targetLabel}の精算月に保存されました。`)
+          ? t(
+              `업로드 완료: 파일 ${successCount}개가 ${targetLabel} 정산월로 저장되었습니다.${skippedRows.length > 0 ? ` 보조/비정산 파일 ${skippedRows.length}개는 건너뛰었습니다.` : ''}`,
+              `アップロード完了: ファイル${successCount}件が${targetLabel}の精算月に保存されました。${skippedRows.length > 0 ? `補助・非精算ファイル${skippedRows.length}件はスキップしました。` : ''}`,
+            )
           : t(
-              `파일 ${successCount}개는 ${targetLabel} 정산월로 저장되어 미리보기를 생성했습니다. 실패한 ${failedRows.length}개 파일의 원인은 아래 결과에 표시됩니다.`,
-              `ファイル${successCount}件は${targetLabel}の精算月に保存され、プレビューを生成しました。失敗した${failedRows.length}件の原因は下の結果に表示されます。`,
+              `파일 ${successCount}개는 ${targetLabel} 정산월로 저장되어 미리보기를 생성했습니다. 실패 ${failedRows.length}개, 건너뜀 ${skippedRows.length}개는 아래 결과에 표시됩니다.`,
+              `ファイル${successCount}件は${targetLabel}の精算月に保存され、プレビューを生成しました。失敗${failedRows.length}件、スキップ${skippedRows.length}件は下の結果に表示されます。`,
             ),
       ];
       if (unreadable > 0) {
@@ -482,7 +492,8 @@ export default function SettlementClient() {
   }
 
   const failedResults = results.filter((r) => r.error);
-  const successfulResults = results.filter((r) => !r.error && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0));
+  const skippedResults = results.filter((r) => r.skipped);
+  const successfulResults = results.filter((r) => !r.error && !r.skipped && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0));
   const parsedRowsTotal = results.reduce((sum, r) => sum + (r.parsed_rows ?? 0), 0);
   const salesRowsTotal = results.reduce((sum, r) => sum + (r.sales_records_written ?? 0), 0);
   const progressPercent = progress ? Math.min(100, Math.round((progress.current / Math.max(progress.total, 1)) * 100)) : 0;
@@ -680,6 +691,9 @@ export default function SettlementClient() {
             <span className={`rounded-full px-2.5 py-1 ${failedResults.length > 0 ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>
               {t(`실패 ${failedResults.length}`, `失敗 ${failedResults.length}`)}
             </span>
+            <span className="rounded-full bg-amber-100 px-2.5 py-1 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+              {t(`건너뜀 ${skippedResults.length}`, `スキップ ${skippedResults.length}`)}
+            </span>
             <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
               {t(`파싱 행 ${parsedRowsTotal}`, `解析行 ${parsedRowsTotal}`)}
             </span>
@@ -743,18 +757,25 @@ export default function SettlementClient() {
               </thead>
               <tbody>
                 {results.map((r, idx) => {
-                  const ok = !r.error && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0);
+                  const ok = !r.error && !r.skipped && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0);
+                  const skipped = Boolean(r.skipped);
                   return (
                     <tr key={`${r.file ?? 'row'}-${idx}`} className="border-b border-slate-100 dark:border-slate-800">
                       <td className="py-2 pr-3">
-                        {ok ? <CheckCircle2 className="h-4 w-4 text-emerald-600" /> : <AlertCircle className="h-4 w-4 text-red-600" />}
+                        {ok ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                        ) : skipped ? (
+                          <AlertCircle className="h-4 w-4 text-amber-500" />
+                        ) : (
+                          <AlertCircle className="h-4 w-4 text-red-600" />
+                        )}
                       </td>
                       <td className="py-2 pr-3">{r.file ?? '-'}</td>
                       <td className="py-2 pr-3">{r.platform ?? '-'}</td>
                       <td className="py-2 pr-3">{r.parsed_rows ?? '-'}</td>
                       <td className="py-2 pr-3">{r.sales_records_written ?? '-'}</td>
                       <td className="py-2 pr-3">{typeof r.settlement_month === 'string' ? isoToYyyymm(r.settlement_month) : '-'}</td>
-                      <td className="py-2 pr-3 text-xs text-slate-500">{r.error ?? r.errors?.join('; ') ?? '-'}</td>
+                      <td className="py-2 pr-3 text-xs text-slate-500">{r.error ?? r.skip_reason ?? r.errors?.join('; ') ?? '-'}</td>
                     </tr>
                   );
                 })}

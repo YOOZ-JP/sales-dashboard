@@ -223,7 +223,12 @@ export async function POST(request: Request) {
         platform_code: parsed.platform_code,
         settlement_month: effectiveSettlement,
         sales_month: parsed.sales_month || null,
-        status: parsed.records.length > 0 ? "parsed" : "failed",
+        // Files with no settlement rows are not necessarily failures: monthly
+        // folders often include payment notices, detail PDFs, or companion
+        // workbooks that are useful for audit but do not create INPUT rows.
+        // Keep them out of the red failure bucket; true parser/DB errors use
+        // markUploadFailed() on their own paths.
+        status: "parsed",
         detection_confidence: parsed.detection_confidence,
         parse_error: parsed.errors.join("; ") || null,
         parsed_rows: parsed.records.length,
@@ -273,23 +278,16 @@ export async function POST(request: Request) {
     let salesWritten = 0;
     let skippedDuplicates = 0;
     if (parsed.records.length === 0) {
-      const msg = "파싱 가능한 정산 행이 없습니다. 지원하지 않는 양식이거나 빈 파일입니다.";
-      await markUploadFailed({
-        platform_code: parsed.platform_code,
-        settlement_month: effectiveSettlement,
-        sales_month: parsed.sales_month || null,
-        detection_confidence: parsed.detection_confidence,
-        parsed_rows: 0,
-        parse_error: msg,
-      });
+      const msg = "정산행 없음: 보조자료/비정산 파일로 보고 건너뛰었습니다.";
       results.push({
         file: f.name,
         platform: parsed.platform_code,
         parsed_rows: 0,
         sales_records_written: 0,
+        skipped: true,
+        skip_reason: msg,
         settlement_month: effectiveSettlement,
         sales_month: parsed.sales_month || null,
-        error: msg,
       });
       continue;
     }

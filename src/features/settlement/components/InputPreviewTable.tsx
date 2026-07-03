@@ -154,7 +154,6 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
 
   const shownRows = sheet.rows.length;
   const shownCols = sheet.rows[0]?.length ?? 0;
-  const truncated = shownRows < sheet.rowCount || shownCols < sheet.columnCount;
 
   // With workbook column widths available, lay the table out exactly like the
   // sheet (fixed layout + explicit pixel widths, long text clipped like Excel).
@@ -253,19 +252,10 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
         </table>
       </div>
 
-      {truncated && (
-        <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
-          {t(
-            `미리보기는 일부만 표시합니다. (표시 ${shownRows}행 × ${shownCols}열 / 전체 ${sheet.rowCount}행 × ${sheet.columnCount}열)`,
-            `プレビューは一部のみ表示します。（表示 ${shownRows}行 × ${shownCols}列 / 全体 ${sheet.rowCount}行 × ${sheet.columnCount}列）`,
-          )}
-        </p>
-      )}
-
       <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
         {t(
-          '미리보기는 생성되는 Excel 파일의 서식(배경색·글자색·정렬·열 너비 등)을 지원 범위 안에서 따릅니다. 수식을 포함한 최종본은 다운로드한 Excel 파일이 기준입니다.',
-          'プレビューは生成されるExcelファイルの書式（背景色・文字色・配置・列幅など）を対応範囲内で再現します。数式を含む最終版はダウンロードしたExcelファイルが基準です。',
+          '미리보기는 생성되는 Excel 파일 전체를 표시하며, 서식(배경색·글자색·정렬·열 너비·병합 셀 등)을 지원 범위 안에서 따릅니다. 수식을 포함한 최종본은 다운로드한 Excel 파일이 기준입니다.',
+          'プレビューは生成されるExcelファイル全体を表示し、書式（背景色・文字色・配置・列幅・結合セルなど）を対応範囲内で再現します。数式を含む最終版はダウンロードしたExcelファイルが基準です。',
         )}
       </p>
     </section>
