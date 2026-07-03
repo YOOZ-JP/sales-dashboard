@@ -84,14 +84,43 @@ function appendUploadRunLog(entry: {
   }
 }
 
-// Finds a YYYYMM month in folder or file names (e.g. "202605/...", "202605_mangabang").
-// The lookbehind/lookahead keep it from matching inside longer digit runs like timestamps.
+// Month tokens recognized in folder/file names, normalized to "YYYYMM":
+// compact "202605", separated "2026-05" / "2026_05" / "2026.05", and CJK
+// forms like "2026年05月" / "2026년05월". The digit-run guards keep them
+// from matching inside longer runs like timestamps ("20260512T09").
+const PATH_MONTH_PATTERNS = [
+  /(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)/g,
+  /(?<!\d)(20\d{2})[-_.](0?[1-9]|1[0-2])(?!\d)/g,
+  /(?<!\d)(20\d{2})\s*[年년]\s*(0?[1-9]|1[0-2])[月월]/g,
+];
+
+function extractMonthsFromPath(path: string): string[] {
+  const months: string[] = [];
+  for (const pattern of PATH_MONTH_PATTERNS) {
+    for (const m of path.matchAll(pattern)) months.push(`${m[1]}${m[2].padStart(2, '0')}`);
+  }
+  return months;
+}
+
+// First month found in the incoming paths — used to prefill the month field.
 function detectMonthFromPaths(incoming: SelectedFile[]): string | null {
   for (const sf of incoming) {
-    const m = sf.relativePath.match(/(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)/);
-    if (m) return `${m[1]}${m[2]}`;
+    const [first] = extractMonthsFromPath(sf.relativePath);
+    if (first) return first;
   }
   return null;
+}
+
+// Batch fallback month: defined only when every month hint across the
+// selected paths agrees on a single month. Mixed or hint-less selections
+// get none — a file without a content month must then still fail rather
+// than land in a guessed month.
+function detectBatchFallbackMonth(selected: SelectedFile[]): string | null {
+  const months = new Set<string>();
+  for (const sf of selected) {
+    for (const m of extractMonthsFromPath(sf.relativePath)) months.add(m);
+  }
+  return months.size === 1 ? Array.from(months)[0] : null;
 }
 
 // Chrome returns at most 100 entries per readEntries() call; keep reading until it comes back empty.
@@ -156,6 +185,9 @@ export default function SettlementClient() {
   const [selectionNote, setSelectionNote] = useState<string | null>(null);
   const [replaceMonth, setReplaceMonth] = useState(false);
   const [uploading, setUploading] = useState(false);
+  // Live upload gauge: files handed off so far (in-flight file included),
+  // out of the run's total, plus the name currently being processed.
+  const [progress, setProgress] = useState<{ current: number; total: number; currentFile: string } | null>(null);
   const [resetting, setResetting] = useState(false);
   const [results, setResults] = useState<UploadResult[]>([]);
   // The detailed per-file table is tall; keep it collapsed so the INPUT
@@ -310,8 +342,13 @@ export default function SettlementClient() {
     setPreviewError(null);
     try {
       const batches = buildBatches(selected);
-      const totalBatches = batches.length;
       const trimmedFolder = folderHint.trim();
+      // Single unambiguous month hint across the selected paths, if any.
+      // Sent with every request (uploads go one file per request) so a file
+      // whose content lacks a settlement month is bucketed with the rest of
+      // its batch instead of failing. Manual activeMonth and content-parsed
+      // months still win server-side; this is never the current date.
+      const batchFallbackMonth = detectBatchFallbackMonth(selected);
       // Correlation id for this run: shown in failed rows, kept in the
       // localStorage run log, and echoed by the server into Vercel function
       // logs — the only way to match a body-less failure (504) to a request.
@@ -333,6 +370,7 @@ export default function SettlementClient() {
         // Omitting activeMonth switches the server to content-based month
         // detection; sending it makes the manual month override file content.
         if (monthMode === 'manual') fd.append('activeMonth', activeMonth);
+        if (batchFallbackMonth) fd.append('fallbackMonth', toIsoMonth(batchFallbackMonth));
         if (trimmedFolder) fd.append('folder', trimmedFolder);
         const sentReplace = replacePending;
         if (sentReplace) fd.append('replaceMonth', '1');
@@ -383,12 +421,11 @@ export default function SettlementClient() {
       };
 
       let abortRemaining = false;
-      for (let i = 0; i < batches.length; i++) {
-        const batch = batches[i];
-        setMessage(t(
-          `업로드 중... 파일 ${i + 1}/${totalBatches}: ${batch[0].relativePath}`,
-          `アップロード中... ファイル ${i + 1}/${totalBatches}: ${batch[0].relativePath}`,
-        ));
+      // Batches are 1 file each today (BATCH_MAX_FILES=1), but the gauge
+      // counts files, not batches, so it stays correct if that changes.
+      let sentFiles = 0;
+      for (const batch of batches) {
+        setProgress({ current: sentFiles + batch.length, total: selected.length, currentFile: batch[0].relativePath });
         try {
           const { res, sentReplace } = await send(batch);
           await handleResponse(res, batch);
@@ -398,9 +435,12 @@ export default function SettlementClient() {
         } catch (err) {
           recordFailure(batch, (err as Error).message);
         }
+        sentFiles += batch.length;
         setResults([...aggregated]);
         if (abortRemaining) break;
       }
+      // Transfer is done; hide the gauge before the summary/preview phase.
+      setProgress(null);
 
       setResults(aggregated);
       const failedRows = aggregated.filter((r) => r.error);
@@ -459,6 +499,7 @@ export default function SettlementClient() {
     } catch (err) {
       setMessage(`${t('업로드 실패', 'アップロード失敗')}: ${(err as Error).message}`);
     } finally {
+      setProgress(null);
       setUploading(false);
     }
   }
@@ -497,6 +538,7 @@ export default function SettlementClient() {
   const failedResults = results.filter((r) => r.error);
   const parsedRowsTotal = results.reduce((sum, r) => sum + (r.parsed_rows ?? 0), 0);
   const salesRowsTotal = results.reduce((sum, r) => sum + (r.sales_records_written ?? 0), 0);
+  const progressPercent = progress ? Math.min(100, Math.round((progress.current / Math.max(progress.total, 1)) * 100)) : 0;
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
@@ -668,6 +710,22 @@ export default function SettlementClient() {
           )}
         </div>
       </section>
+
+      {progress && (
+        <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 shadow-sm dark:border-blue-900 dark:bg-blue-950/40">
+          <div className="flex items-center text-sm font-semibold text-blue-900 dark:text-blue-100">
+            <Loader2 className="mr-2 h-4 w-4 shrink-0 animate-spin" />
+            {t(
+              `처리중 ${progress.current}/${progress.total} · ${progressPercent}%`,
+              `処理中 ${progress.current}/${progress.total} · ${progressPercent}%`,
+            )}
+          </div>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-blue-100 dark:bg-blue-900/60">
+            <div className="h-full rounded-full bg-blue-600 transition-[width] duration-300" style={{ width: `${progressPercent}%` }} />
+          </div>
+          <p className="mt-2 break-all text-xs text-blue-800 dark:text-blue-200">{progress.currentFile}</p>
+        </div>
+      )}
 
       {message && (
         <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-700 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200">

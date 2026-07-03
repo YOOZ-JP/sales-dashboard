@@ -51,6 +51,11 @@ export async function POST(request: Request) {
   const folderHint = (form.get("folder") as string) || undefined;
   const activeMonthRaw = (form.get("activeMonth") as string) || "";
   const activeMonth = /^\d{4}-\d{2}-01$/.test(activeMonthRaw) ? activeMonthRaw : null;
+  // Batch-level month hint the client derived from the selected upload's
+  // folder/file names (only sent when every hint agrees on one month).
+  // Consulted only when a file's content yields no settlement month.
+  const fallbackMonthRaw = (form.get("fallbackMonth") as string) || "";
+  const fallbackMonth = /^\d{4}-\d{2}-01$/.test(fallbackMonthRaw) ? fallbackMonthRaw : null;
   // Test-scenario flag: when the UI passes replaceMonth=1 we wipe the
   // active month's sales_records before inserting, so the operator can
   // re-run a test upload without stacking duplicates on top of the
@@ -163,14 +168,16 @@ export async function POST(request: Request) {
     // Settlement-month resolution:
     //   · When the operator explicitly picked a month in the UI (manual
     //     mode), trust it — this is the "I'm processing May now" intent.
-    //   · Otherwise (auto mode) only the month parsed from the file
-    //     content counts. A file with records but no detectable month is
-    //     rejected here, before any DB write — never bucketed into the
-    //     current date.
+    //   · Otherwise (auto mode) the month parsed from the file content
+    //     counts; a file without one inherits the batch's unambiguous
+    //     folder/file-name month (fallbackMonth) when the client sent one.
+    //     A file with records but no resolvable month is rejected here,
+    //     before any DB write — never bucketed into the current date.
     const resolution = resolveSettlementMonth({
       activeMonth,
       parsedSettlementMonth: parsed.settlement_month,
       hasRecords: parsed.records.length > 0,
+      fallbackMonth,
     });
     if (!resolution.ok) {
       console.warn(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: ${resolution.error}`);
@@ -191,6 +198,13 @@ export async function POST(request: Request) {
       continue;
     }
     const effectiveSettlement = resolution.month;
+    // Inherited-month case: surface it as an informational note (never a
+    // failure). Pushed onto parsed.errors so it reaches both the response
+    // row and the raw_uploads.parse_error audit trail below.
+    if (resolution.note) {
+      console.log(`[upload]${runLabel} ${f.name}: settlement month inherited from batch hint ${effectiveSettlement}`);
+      parsed.errors.push(resolution.note);
+    }
 
     // 3. Archive the raw file into Supabase Storage (upload-debug bucket).
     let archivePath: string | null = null;
