@@ -2,10 +2,14 @@
  * POST /api/settlement/upload
  *
  * Accepts multipart form with one or more raw settlement files. Per file:
- *   1. Write to the on-disk archive (archive/YYYY-MM/<ts>_<name>)
+ *   1. Insert a raw_uploads row in status 'parsing' — done before any parsing
+ *      so a function timeout (504) still leaves durable evidence of which
+ *      file was in flight
  *   2. Detect platform + parse (server-side)
- *   3. Insert raw_uploads (metadata) + raw_records (line-items)
- *   4. Build sales_records rows via the shared transformer
+ *   3. Write to the archive (archive/YYYY-MM/<ts>_<name>) and update the
+ *      raw_uploads row with the parse outcome
+ *   4. Insert raw_records (line-items)
+ *   5. Build sales_records rows via the shared transformer
  *
  * Requires the same dashboard refresh-token cookie as protected pages.
  * The DB is touched only after the dashboard cookie guard passes, using the
@@ -14,7 +18,7 @@
 import { NextResponse } from "next/server";
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
 import { resolveSettlementMonth } from "@/features/settlement/lib/resolve-settlement-month";
-import type { Json } from "@/features/settlement/lib/supabase/types";
+import type { Json, RawUploadInsert } from "@/features/settlement/lib/supabase/types";
 import {
   type TransformContext,
   type LookupMaps,
@@ -52,9 +56,18 @@ export async function POST(request: Request) {
   // re-run a test upload without stacking duplicates on top of the
   // existing rows. raw_uploads / raw_records are kept for audit.
   const replaceMonth = form.get("replaceMonth") === "1";
+  // Client-generated correlation id (see SettlementClient). raw_uploads has no
+  // column for it, so it only goes to the function logs; sanitized because it
+  // is caller-supplied and printed there.
+  const rawRunId =
+    request.headers.get("x-settlement-upload-run-id") ||
+    (typeof form.get("uploadRunId") === "string" ? (form.get("uploadRunId") as string) : "");
+  const uploadRunId = rawRunId.replace(/[^\w.-]/g, "").slice(0, 64) || null;
+  const runLabel = uploadRunId ? ` run=${uploadRunId}` : "";
   if (files.length === 0) {
     return NextResponse.json({ error: "no files" }, { status: 400 });
   }
+  console.log(`[upload]${runLabel} received ${files.length} file(s)`);
 
   if (replaceMonth && activeMonth) {
     const { error: delErr } = await supabase
@@ -94,7 +107,44 @@ export async function POST(request: Request) {
   for (const f of files) {
     const buffer = Buffer.from(await f.arrayBuffer());
 
-    // 1. Parse first so we know which month bucket to archive under.
+    // 1. Create the raw_uploads row before parsing. If the function times out
+    //    or crashes mid-parse (504 → no JSON response reaches the browser),
+    //    this row stays in status 'parsing' — durable evidence of which file
+    //    it died on. All later steps update this same row; nothing re-inserts.
+    const { data: uploadRow, error: insertErr } = await supabase
+      .from("raw_uploads")
+      .insert({
+        filename: f.name,
+        storage_path: `(parsing) ${f.name}`,
+        size_bytes: buffer.byteLength,
+        content_type: f.type,
+        settlement_month: activeMonth,
+        status: "parsing",
+      })
+      .select("id")
+      .single();
+    if (insertErr || !uploadRow) {
+      const msg = insertErr?.message ?? "upload insert failed";
+      console.error(`[upload]${runLabel} ${f.name}: raw_uploads insert failed`);
+      results.push({ file: f.name, error: msg });
+      continue;
+    }
+    console.log(`[upload]${runLabel} parsing ${f.name} (${buffer.byteLength} bytes) upload_id=${uploadRow.id}`);
+
+    // Leaves the pre-created row in a terminal state on the failure paths
+    // below. An update error here is only logged — the file result already
+    // carries the original failure.
+    const markUploadFailed = async (fields: Partial<RawUploadInsert>) => {
+      const { error } = await supabase
+        .from("raw_uploads")
+        .update({ ...fields, status: "failed", parsed_at: new Date().toISOString() })
+        .eq("id", uploadRow.id);
+      if (error) {
+        console.error(`[upload]${runLabel} ${f.name}: raw_uploads failed-status update error`);
+      }
+    };
+
+    // 2. Parse so we know which month bucket to archive under.
     let parsed: Awaited<ReturnType<typeof parseFile>>;
     try {
       parsed = await parseFile({
@@ -103,7 +153,10 @@ export async function POST(request: Request) {
         folderName: folderHint,
       });
     } catch (e) {
-      results.push({ file: f.name, error: `parse failed: ${(e as Error).message}` });
+      const msg = `parse failed: ${(e as Error).message}`;
+      console.error(`[upload]${runLabel} ${f.name}: ${msg}`);
+      await markUploadFailed({ parse_error: msg });
+      results.push({ file: f.name, error: msg });
       continue;
     }
 
@@ -120,6 +173,14 @@ export async function POST(request: Request) {
       hasRecords: parsed.records.length > 0,
     });
     if (!resolution.ok) {
+      console.warn(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: ${resolution.error}`);
+      await markUploadFailed({
+        platform_code: parsed.platform_code,
+        sales_month: parsed.sales_month || null,
+        detection_confidence: parsed.detection_confidence,
+        parsed_rows: parsed.records.length,
+        parse_error: resolution.error,
+      });
       results.push({
         file: f.name,
         platform: parsed.platform_code,
@@ -131,23 +192,20 @@ export async function POST(request: Request) {
     }
     const effectiveSettlement = resolution.month;
 
-    // 2. Archive the raw file into Supabase Storage (upload-debug bucket).
+    // 3. Archive the raw file into Supabase Storage (upload-debug bucket).
     let archivePath: string | null = null;
     try {
       const archived = await writeToArchive(f.name, buffer, effectiveSettlement, supabase);
       archivePath = archived.path;
-    } catch (e) {
-      console.warn("[upload] archive write failed:", (e as Error).message);
+    } catch {
+      console.warn(`[upload]${runLabel} ${f.name}: archive write failed`);
     }
 
-    // 3. Insert raw_uploads
-    const { data: uploadRow, error: insertErr } = await supabase
+    // 4. Update the pre-created raw_uploads row with the parse outcome.
+    const { error: updateErr } = await supabase
       .from("raw_uploads")
-      .insert({
-        filename: f.name,
+      .update({
         storage_path: archivePath ?? `(not archived) ${f.name}`,
-        size_bytes: buffer.byteLength,
-        content_type: f.type,
         platform_code: parsed.platform_code,
         settlement_month: effectiveSettlement,
         sales_month: parsed.sales_month || null,
@@ -157,15 +215,15 @@ export async function POST(request: Request) {
         parsed_rows: parsed.records.length,
         parsed_at: new Date().toISOString(),
       })
-      .select("id")
-      .single();
+      .eq("id", uploadRow.id);
 
-    if (insertErr || !uploadRow) {
-      results.push({ file: f.name, error: insertErr?.message ?? "upload insert failed" });
+    if (updateErr) {
+      console.error(`[upload]${runLabel} ${f.name}: raw_uploads update failed`);
+      results.push({ file: f.name, error: updateErr.message });
       continue;
     }
 
-    // 4. Insert raw_records (JSONB line-items)
+    // 5. Insert raw_records (JSONB line-items)
     let rawRecordIds: Map<number, string> | undefined;
     if (parsed.records.length > 0) {
       const { data: insertedRaws, error: rawsErr } = await supabase
@@ -179,6 +237,16 @@ export async function POST(request: Request) {
         )
         .select("id, row_index");
       if (rawsErr) {
+        const msg = `raw_records insert: ${rawsErr.message}`;
+        console.error(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: raw_records insert failed`);
+        await markUploadFailed({
+          platform_code: parsed.platform_code,
+          settlement_month: effectiveSettlement,
+          sales_month: parsed.sales_month || null,
+          detection_confidence: parsed.detection_confidence,
+          parsed_rows: parsed.records.length,
+          parse_error: msg,
+        });
         results.push({ file: f.name, error: `raw_records insert: ${rawsErr.message}` });
         continue;
       }
@@ -187,7 +255,7 @@ export async function POST(request: Request) {
       }
     }
 
-    // 5. Transform → sales_records
+    // 6. Transform → sales_records
     let salesWritten = 0;
     let skippedDuplicates = 0;
     if (parsed.records.length > 0) {
@@ -236,12 +304,12 @@ export async function POST(request: Request) {
             skippedDuplicates = suppressed.skipped;
             if (skippedDuplicates > 0) {
               console.warn(
-                `[upload] ${f.name}: skipped ${skippedDuplicates} duplicate sales rows already in ${batch}`,
+                `[upload]${runLabel} ${f.name}: skipped ${skippedDuplicates} duplicate sales rows already in ${batch}`,
               );
             }
           }
-        } catch (e) {
-          console.warn("[upload] duplicate check failed, inserting all rows:", (e as Error).message);
+        } catch {
+          console.warn(`[upload]${runLabel} ${f.name}: duplicate check failed, inserting all rows`);
         }
       }
       if (inserts.length > 0) {
@@ -250,6 +318,16 @@ export async function POST(request: Request) {
           .insert(inserts)
           .select("id");
         if (salesErr) {
+          const msg = `sales_records insert: ${salesErr.message}`;
+          console.error(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: sales_records insert failed`);
+          await markUploadFailed({
+            platform_code: parsed.platform_code,
+            settlement_month: effectiveSettlement,
+            sales_month: parsed.sales_month || null,
+            detection_confidence: parsed.detection_confidence,
+            parsed_rows: parsed.records.length,
+            parse_error: msg,
+          });
           results.push({
             file: f.name,
             platform: parsed.platform_code,

@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
-import { AlertCircle, CheckCircle2, Download, FolderOpen, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Download, FolderOpen, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import InputPreviewTable, { type PreviewData } from './InputPreviewTable';
 
@@ -57,6 +57,31 @@ function buildBatches(selected: SelectedFile[]): SelectedFile[][] {
   }
   if (current.length > 0) batches.push(current);
   return batches;
+}
+
+type UploadRunFailure = { file: string; status: number | null; error: string };
+
+const UPLOAD_RUN_LOG_KEY = 'settlementUploadRuns';
+const UPLOAD_RUN_LOG_MAX = 5;
+
+// Keeps the last few upload run summaries in this browser (run id, counts,
+// failed file names/statuses/messages — never file contents or amounts) so
+// "what failed last time?" can still be answered after the page state is gone.
+function appendUploadRunLog(entry: {
+  runId: string;
+  at: string;
+  fileCount: number;
+  failCount: number;
+  failures: UploadRunFailure[];
+}) {
+  try {
+    const raw = window.localStorage.getItem(UPLOAD_RUN_LOG_KEY);
+    const prev: unknown = raw ? JSON.parse(raw) : [];
+    const list = Array.isArray(prev) ? prev : [];
+    window.localStorage.setItem(UPLOAD_RUN_LOG_KEY, JSON.stringify([...list, entry].slice(-UPLOAD_RUN_LOG_MAX)));
+  } catch {
+    // localStorage unavailable (private mode, quota) — the trace is best-effort.
+  }
 }
 
 // Finds a YYYYMM month in folder or file names (e.g. "202605/...", "202605_mangabang").
@@ -133,6 +158,9 @@ export default function SettlementClient() {
   const [uploading, setUploading] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [results, setResults] = useState<UploadResult[]>([]);
+  // The detailed per-file table is tall; keep it collapsed so the INPUT
+  // preview below stays the main content after an upload.
+  const [resultsExpanded, setResultsExpanded] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewData | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -274,6 +302,7 @@ export default function SettlementClient() {
     setUploading(true);
     setMessage(null);
     setResults([]);
+    setResultsExpanded(false);
     // The current preview predates this upload; drop it now so a failed upload
     // (before loadPreview runs) never leaves stale data on screen.
     setPreview(null);
@@ -283,6 +312,11 @@ export default function SettlementClient() {
       const batches = buildBatches(selected);
       const totalBatches = batches.length;
       const trimmedFolder = folderHint.trim();
+      // Correlation id for this run: shown in failed rows, kept in the
+      // localStorage run log, and echoed by the server into Vercel function
+      // logs — the only way to match a body-less failure (504) to a request.
+      const uploadRunId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const httpStatusByFile = new Map<string, number>();
       // replaceMonth must clear the month exactly once. A 413 is rejected by the
       // platform before the route runs, so the flag stays pending; any other
       // response reached the server, so later requests must not send it again.
@@ -294,6 +328,7 @@ export default function SettlementClient() {
 
       const send = async (chunk: SelectedFile[]) => {
         const fd = new FormData();
+        fd.append('uploadRunId', uploadRunId);
         for (const sf of chunk) fd.append('files', sf.file);
         // Omitting activeMonth switches the server to content-based month
         // detection; sending it makes the manual month override file content.
@@ -301,14 +336,34 @@ export default function SettlementClient() {
         if (trimmedFolder) fd.append('folder', trimmedFolder);
         const sentReplace = replacePending;
         if (sentReplace) fd.append('replaceMonth', '1');
-        const res = await fetch('/api/settlement/upload', { method: 'POST', body: fd });
+        const res = await fetch('/api/settlement/upload', {
+          method: 'POST',
+          body: fd,
+          headers: { 'X-Settlement-Upload-Run-Id': uploadRunId },
+        });
         if (res.status !== 413) replacePending = false;
         return { res, sentReplace };
       };
 
-      const recordFailure = (chunk: SelectedFile[], error: string) => {
+      const recordFailure = (chunk: SelectedFile[], error: string, status: number | null = null) => {
         failedFiles += chunk.length;
-        for (const sf of chunk) aggregated.push({ file: sf.relativePath, error });
+        const at = new Date().toISOString();
+        const suffix = [
+          `run ${uploadRunId}`,
+          ...(status !== null && !error.includes(`HTTP ${status}`) ? [`HTTP ${status}`] : []),
+          at,
+        ].join(' · ');
+        console.warn('[settlement-upload] batch failed', {
+          runId: uploadRunId,
+          at,
+          status,
+          files: chunk.map((sf) => sf.relativePath),
+          error,
+        });
+        for (const sf of chunk) {
+          if (status !== null) httpStatusByFile.set(sf.relativePath, status);
+          aggregated.push({ file: sf.relativePath, error: `${error} [${suffix}]` });
+        }
       };
 
       const handleResponse = async (res: Response, chunk: SelectedFile[]) => {
@@ -316,12 +371,12 @@ export default function SettlementClient() {
           recordFailure(chunk, t(
             '파일이 Vercel 업로드 용량 제한(약 4.5MB)을 초과합니다. 이 파일은 추후 스토리지 직접 업로드 방식으로 처리해야 합니다.',
             'ファイルがVercelのアップロード容量制限（約4.5MB）を超えています。このファイルは今後ストレージ直接アップロード方式での対応が必要です。',
-          ));
+          ), 413);
           return;
         }
         const json = await res.json().catch(() => ({}));
         if (!res.ok) {
-          recordFailure(chunk, json.error || `HTTP ${res.status}`);
+          recordFailure(chunk, json.error || `HTTP ${res.status}`, res.status);
           return;
         }
         if (Array.isArray(json.results)) aggregated.push(...json.results);
@@ -348,6 +403,18 @@ export default function SettlementClient() {
       }
 
       setResults(aggregated);
+      const failedRows = aggregated.filter((r) => r.error);
+      appendUploadRunLog({
+        runId: uploadRunId,
+        at: new Date().toISOString(),
+        fileCount: selected.length,
+        failCount: failedRows.length,
+        failures: failedRows.slice(0, 10).map((r) => ({
+          file: r.file ?? '(unknown)',
+          status: r.file ? httpStatusByFile.get(r.file) ?? null : null,
+          error: r.error ?? '',
+        })),
+      });
       if (failedFiles === selected.length) {
         setMessage(t('업로드 실패: 모든 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.', 'アップロード失敗: すべてのファイル送信に失敗しました。下の結果をご確認ください。'));
         return;
@@ -426,6 +493,10 @@ export default function SettlementClient() {
       setResetting(false);
     }
   }
+
+  const failedResults = results.filter((r) => r.error);
+  const parsedRowsTotal = results.reduce((sum, r) => sum + (r.parsed_rows ?? 0), 0);
+  const salesRowsTotal = results.reduce((sum, r) => sum + (r.sales_records_written ?? 0), 0);
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
@@ -606,7 +677,75 @@ export default function SettlementClient() {
 
       {results.length > 0 && (
         <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <h2 className="text-lg font-bold text-slate-950 dark:text-white">{t('처리 결과', '処理結果')}</h2>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold text-slate-950 dark:text-white">{t('처리 결과 요약', '処理結果サマリー')}</h2>
+            <button
+              type="button"
+              onClick={() => setResultsExpanded((v) => !v)}
+              className="inline-flex items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition hover:border-blue-500 dark:border-slate-700 dark:text-slate-100"
+            >
+              {resultsExpanded ? <ChevronUp className="mr-1.5 h-3.5 w-3.5" /> : <ChevronDown className="mr-1.5 h-3.5 w-3.5" />}
+              {resultsExpanded ? t('처리결과 상세 접기', '処理結果の詳細を閉じる') : t('처리결과 상세 펼치기', '処理結果の詳細を開く')}
+            </button>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2 text-xs font-semibold">
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+              {t(`파일 ${results.length}개`, `ファイル ${results.length}件`)}
+            </span>
+            <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+              {t(`성공 ${results.length - failedResults.length}`, `成功 ${results.length - failedResults.length}`)}
+            </span>
+            <span className={`rounded-full px-2.5 py-1 ${failedResults.length > 0 ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>
+              {t(`실패 ${failedResults.length}`, `失敗 ${failedResults.length}`)}
+            </span>
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+              {t(`파싱 행 ${parsedRowsTotal}`, `解析行 ${parsedRowsTotal}`)}
+            </span>
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+              {t(`정산 행 ${salesRowsTotal}`, `精算行 ${salesRowsTotal}`)}
+            </span>
+          </div>
+          {failedResults.length > 0 && (
+            <ul className="mt-3 space-y-1 text-xs text-red-700 dark:text-red-300">
+              {failedResults.slice(0, 3).map((r, idx) => (
+                <li key={`${r.file ?? 'fail'}-${idx}`} className="break-all">
+                  <AlertCircle className="mr-1 inline h-3.5 w-3.5 align-[-2px]" />
+                  {r.file ?? '-'}: {r.error}
+                </li>
+              ))}
+              {failedResults.length > 3 && (
+                <li className="text-slate-500 dark:text-slate-400">
+                  {t(`외 ${failedResults.length - 3}건은 '처리결과 상세 펼치기'에서 확인해 주세요.`, `他${failedResults.length - 3}件は「処理結果の詳細を開く」でご確認ください。`)}
+                </li>
+              )}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {previewError && !preview && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 shadow-sm dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          {previewError}
+        </div>
+      )}
+
+      {preview && activeSheet && (
+        <InputPreviewTable preview={preview} activeSheet={activeSheet} onSheetChange={setActiveSheet} />
+      )}
+
+      {resultsExpanded && results.length > 0 && (
+        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold text-slate-950 dark:text-white">{t('처리 결과 상세', '処理結果詳細')}</h2>
+            <button
+              type="button"
+              onClick={() => setResultsExpanded(false)}
+              className="inline-flex items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition hover:border-blue-500 dark:border-slate-700 dark:text-slate-100"
+            >
+              <ChevronUp className="mr-1.5 h-3.5 w-3.5" />
+              {t('처리결과 상세 접기', '処理結果の詳細を閉じる')}
+            </button>
+          </div>
           <div className="mt-4 overflow-x-auto">
             <table className="w-full min-w-[720px] text-left text-sm">
               <thead className="border-b border-slate-200 text-xs text-slate-500 dark:border-slate-800">
@@ -641,16 +780,6 @@ export default function SettlementClient() {
             </table>
           </div>
         </section>
-      )}
-
-      {previewError && !preview && (
-        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 shadow-sm dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-          {previewError}
-        </div>
-      )}
-
-      {preview && activeSheet && (
-        <InputPreviewTable preview={preview} activeSheet={activeSheet} onSheetChange={setActiveSheet} />
       )}
     </div>
   );
