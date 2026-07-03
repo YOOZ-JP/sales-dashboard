@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Download, FolderOpen, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
+import { useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FolderOpen, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import InputPreviewTable, { type PreviewData } from './InputPreviewTable';
 
@@ -10,6 +10,7 @@ type UploadResult = {
   platform?: string;
   parsed_rows?: number;
   sales_records_written?: number;
+  sales_records_skipped_duplicates?: number;
   settlement_month?: string | null;
   sales_month?: string | null;
   error?: string;
@@ -31,6 +32,14 @@ type SelectedFile = { file: File; relativePath: string };
 
 function fileKey(sf: SelectedFile) {
   return `${sf.relativePath}|${sf.file.size}|${sf.file.lastModified}`;
+}
+
+// Same file picked twice in one selection (or the same entry reached via two
+// directory branches) should upload once.
+function dedupeSelection(incoming: SelectedFile[]): SelectedFile[] {
+  const map = new Map<string, SelectedFile>();
+  for (const sf of incoming) map.set(fileKey(sf), sf);
+  return Array.from(map.values());
 }
 
 // React/TS don't type the non-standard directory-picker attributes; the cast keeps them on the DOM input.
@@ -84,45 +93,6 @@ function appendUploadRunLog(entry: {
   }
 }
 
-// Month tokens recognized in folder/file names, normalized to "YYYYMM":
-// compact "202605", separated "2026-05" / "2026_05" / "2026.05", and CJK
-// forms like "2026年05月" / "2026년05월". The digit-run guards keep them
-// from matching inside longer runs like timestamps ("20260512T09").
-const PATH_MONTH_PATTERNS = [
-  /(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)/g,
-  /(?<!\d)(20\d{2})[-_.](0?[1-9]|1[0-2])(?!\d)/g,
-  /(?<!\d)(20\d{2})\s*[年년]\s*(0?[1-9]|1[0-2])[月월]/g,
-];
-
-function extractMonthsFromPath(path: string): string[] {
-  const months: string[] = [];
-  for (const pattern of PATH_MONTH_PATTERNS) {
-    for (const m of path.matchAll(pattern)) months.push(`${m[1]}${m[2].padStart(2, '0')}`);
-  }
-  return months;
-}
-
-// First month found in the incoming paths — used to prefill the month field.
-function detectMonthFromPaths(incoming: SelectedFile[]): string | null {
-  for (const sf of incoming) {
-    const [first] = extractMonthsFromPath(sf.relativePath);
-    if (first) return first;
-  }
-  return null;
-}
-
-// Batch fallback month: defined only when every month hint across the
-// selected paths agrees on a single month. Mixed or hint-less selections
-// get none — a file without a content month must then still fail rather
-// than land in a guessed month.
-function detectBatchFallbackMonth(selected: SelectedFile[]): string | null {
-  const months = new Set<string>();
-  for (const sf of selected) {
-    for (const m of extractMonthsFromPath(sf.relativePath)) months.add(m);
-  }
-  return months.size === 1 ? Array.from(months)[0] : null;
-}
-
 // Chrome returns at most 100 entries per readEntries() call; keep reading until it comes back empty.
 // A read error still resolves with the entries gathered so far, flagged so the caller can count it.
 function readAllDirectoryEntries(
@@ -169,22 +139,23 @@ async function collectFilesFromEntry(entry: FileSystemEntry, collected: Selected
   return 1;
 }
 
+const YEAR_RANGE = 3;
+
 export default function SettlementClient() {
   const { t } = useApp();
   const now = new Date();
-  const defaultMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
-  // 'auto': the server reads the settlement month out of each file's content
-  // and the field below is display-only. 'manual': the operator's month is
-  // sent with the upload and overrides whatever the files say.
-  const [monthMode, setMonthMode] = useState<'auto' | 'manual'>('auto');
+  const currentYear = now.getFullYear();
+  const defaultMonth = `${currentYear}${String(now.getMonth() + 1).padStart(2, '0')}`;
+  // The single source of truth for "which settlement month is this upload":
+  // whatever the operator picked here is sent as activeMonth with every
+  // request and overrides any month found inside file contents or names.
   const [month, setMonth] = useState(defaultMonth);
-  const [files, setFiles] = useState<SelectedFile[]>([]);
-  const filesRef = useRef<SelectedFile[]>([]);
-  const [folderHint, setFolderHint] = useState('');
   const [dragActive, setDragActive] = useState(false);
-  const [selectionNote, setSelectionNote] = useState<string | null>(null);
-  const [replaceMonth, setReplaceMonth] = useState(false);
   const [uploading, setUploading] = useState(false);
+  // Synchronous guard against overlapping runs: a second drop while a folder
+  // traversal or upload is still running must be ignored, and `uploading`
+  // state alone updates too late for that.
+  const uploadingRef = useRef(false);
   // Live upload gauge: files handed off so far (in-flight file included),
   // out of the run's total, plus the name currently being processed.
   const [progress, setProgress] = useState<{ current: number; total: number; currentFile: string } | null>(null);
@@ -200,7 +171,13 @@ export default function SettlementClient() {
   const [activeSheet, setActiveSheet] = useState<string | null>(null);
 
   const validMonth = /^\d{6}$/.test(month);
-  const activeMonth = useMemo(() => (validMonth ? toIsoMonth(month) : ''), [month, validMonth]);
+  const selectedYear = Number(month.slice(0, 4));
+  const selectedMonthNum = Number(month.slice(4, 6));
+  const minYear = currentYear - YEAR_RANGE;
+  const maxYear = currentYear + YEAR_RANGE;
+
+  const monthLabel = (yyyymm: string) =>
+    t(`${Number(yyyymm.slice(0, 4))}년 ${Number(yyyymm.slice(4, 6))}월`, `${Number(yyyymm.slice(0, 4))}年${Number(yyyymm.slice(4, 6))}月`);
 
   function changeMonth(next: string) {
     if (next === month) return;
@@ -212,6 +189,11 @@ export default function SettlementClient() {
     }
     // An error message always refers to the previously selected month; never keep it.
     setPreviewError(null);
+  }
+
+  function changeYear(nextYear: number) {
+    if (nextYear < minYear || nextYear > maxYear) return;
+    changeMonth(`${nextYear}${month.slice(4, 6)}`);
   }
 
   async function loadPreview(targetMonth = month) {
@@ -241,97 +223,42 @@ export default function SettlementClient() {
     }
   }
 
-  function addFiles(incoming: SelectedFile[], unreadable: number) {
-    if (incoming.length === 0 && unreadable === 0) return;
-    const topFolder = incoming.find((sf) => sf.relativePath.includes('/'))?.relativePath.split('/')[0];
-    if (topFolder) setFolderHint((prev) => (prev.trim() ? prev : topFolder));
-
-    // Use a ref-backed latest snapshot so overlapping async folder traversals
-    // merge into the newest list without causing side effects inside a React updater.
-    const map = new Map(filesRef.current.map((sf) => [fileKey(sf), sf] as const));
-    const before = map.size;
-    for (const sf of incoming) map.set(fileKey(sf), sf);
-
-    const nextFiles = Array.from(map.values());
-    filesRef.current = nextFiles;
-    setFiles(nextFiles);
-
-    const added = map.size - before;
-    const duplicates = incoming.length - added;
-    const parts: string[] = [t(`${added}개 파일 추가됨`, `${added}件のファイルを追加しました`)];
-    // If the dropped folder/files name a settlement month, prefill the field.
-    // In auto mode this is only a preview hint — the month actually stored is
-    // read from each file's content on the server after upload.
-    const detected = detectMonthFromPaths(incoming);
-    if (detected && detected !== month) {
-      changeMonth(detected);
-      parts.push(
-        monthMode === 'auto'
-          ? t(`폴더 이름 기준 예상 정산월: ${detected} (업로드 후 파일 내용으로 확정)`, `フォルダ名からの推定精算月: ${detected}（アップロード後にファイル内容で確定）`)
-          : t(`정산월을 ${detected}로 자동 설정`, `精算月を${detected}に自動設定`),
-      );
-    }
-    if (duplicates > 0) parts.push(t(`중복 ${duplicates}개 제외`, `重複${duplicates}件を除外`));
-    if (unreadable > 0) parts.push(t(`읽지 못한 항목 ${unreadable}개 제외`, `読み込めなかった項目${unreadable}件を除外`));
-    setSelectionNote(parts.join(' · '));
-  }
-
-  function onFileInputChange(e: ChangeEvent<HTMLInputElement>) {
-    const picked = Array.from(e.target.files ?? []).map((file) => ({
-      file,
-      relativePath: file.webkitRelativePath || file.name,
-    }));
-    addFiles(picked, 0);
-    // Reset so selecting the same files/folder again still fires onChange.
-    e.target.value = '';
-  }
-
-  function onDragOver(e: DragEvent<HTMLDivElement>) {
-    e.preventDefault();
-    if (!dragActive) setDragActive(true);
-  }
-
-  function onDragLeave(e: DragEvent<HTMLDivElement>) {
-    // dragleave also fires when moving over children; only deactivate when actually leaving the zone.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setDragActive(false);
-  }
-
-  async function onDrop(e: DragEvent<HTMLDivElement>) {
-    e.preventDefault();
-    setDragActive(false);
-    // Entries and files must be captured synchronously: the DataTransfer item list
-    // is cleared as soon as the handler yields to an await.
-    const captured = Array.from(e.dataTransfer?.items ?? [])
-      .filter((item) => item.kind === 'file')
-      .map((item) => ({
-        entry: typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null,
-        file: item.getAsFile(),
-      }));
-    const collected: SelectedFile[] = [];
-    let unreadable = 0;
-    if (captured.length > 0) {
-      for (const { entry, file } of captured) {
-        if (entry) unreadable += await collectFilesFromEntry(entry, collected);
-        else if (file) collected.push({ file, relativePath: file.name });
-        else unreadable += 1;
+  // Selecting or dropping files IS the upload: no staging list, no upload
+  // button. Everything lands in the operator-picked settlement month.
+  async function startUpload(incoming: SelectedFile[], unreadable: number, lockAlreadyHeld = false) {
+    if (!lockAlreadyHeld) {
+      if (uploadingRef.current) {
+        setMessage(t('업로드가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.', 'アップロードが進行中です。完了後にもう一度お試しください。'));
+        return;
       }
-    } else {
-      for (const file of Array.from(e.dataTransfer?.files ?? [])) {
-        collected.push({ file, relativePath: file.name });
-      }
+      uploadingRef.current = true;
     }
-    addFiles(collected, unreadable);
-  }
-
-  async function upload() {
-    if (uploading) return;
-    // Auto mode needs no month up front — the server derives it per file.
-    if (monthMode === 'manual' && !validMonth) return;
-    // Snapshot the latest list now so files added/removed mid-upload can't shift batches.
-    const selected = filesRef.current.slice();
-    if (selected.length === 0) return;
     setUploading(true);
+    const releaseBusy = () => {
+      setUploading(false);
+      uploadingRef.current = false;
+    };
+    const selected = dedupeSelection(incoming);
+    if (selected.length === 0) {
+      if (unreadable > 0) {
+        setMessage(t(`읽을 수 있는 파일이 없습니다. (읽지 못한 항목 ${unreadable}개)`, `読み込めるファイルがありません。（読み込めなかった項目${unreadable}件）`));
+      }
+      releaseBusy();
+      return;
+    }
+    if (!validMonth) {
+      releaseBusy();
+      return;
+    }
+    // Snapshot the target month now: the picker is disabled during the run,
+    // but the snapshot keeps every request and the final preview consistent
+    // even if that ever changes.
+    const targetMonth = month;
+    const targetIso = toIsoMonth(targetMonth);
+    const targetLabel = monthLabel(targetMonth);
+    // Top-level folder name of the dropped selection, if any — platform
+    // detection aid only; never used for month decisions.
+    const folderHint = selected.find((sf) => sf.relativePath.includes('/'))?.relativePath.split('/')[0] ?? '';
     setMessage(null);
     setResults([]);
     setResultsExpanded(false);
@@ -342,49 +269,29 @@ export default function SettlementClient() {
     setPreviewError(null);
     try {
       const batches = buildBatches(selected);
-      const trimmedFolder = folderHint.trim();
-      // Single unambiguous month hint across the selected paths, if any.
-      // Sent with every request (uploads go one file per request) so a file
-      // whose content lacks a settlement month is bucketed with the rest of
-      // its batch instead of failing. Manual activeMonth and content-parsed
-      // months still win server-side; this is never the current date.
-      const batchFallbackMonth = detectBatchFallbackMonth(selected);
       // Correlation id for this run: shown in failed rows, kept in the
       // localStorage run log, and echoed by the server into Vercel function
       // logs — the only way to match a body-less failure (504) to a request.
       const uploadRunId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const httpStatusByFile = new Map<string, number>();
-      // replaceMonth must clear the month exactly once. A 413 is rejected by the
-      // platform before the route runs, so the flag stays pending; any other
-      // response reached the server, so later requests must not send it again.
-      // In auto mode there is no confirmed target month before upload, so a
-      // destructive clear is never sent (the checkbox is also disabled).
-      let replacePending = monthMode === 'manual' && replaceMonth;
       const aggregated: UploadResult[] = [];
-      let failedFiles = 0;
 
       const send = async (chunk: SelectedFile[]) => {
         const fd = new FormData();
         fd.append('uploadRunId', uploadRunId);
         for (const sf of chunk) fd.append('files', sf.file);
-        // Omitting activeMonth switches the server to content-based month
-        // detection; sending it makes the manual month override file content.
-        if (monthMode === 'manual') fd.append('activeMonth', activeMonth);
-        if (batchFallbackMonth) fd.append('fallbackMonth', toIsoMonth(batchFallbackMonth));
-        if (trimmedFolder) fd.append('folder', trimmedFolder);
-        const sentReplace = replacePending;
-        if (sentReplace) fd.append('replaceMonth', '1');
-        const res = await fetch('/api/settlement/upload', {
+        // The picked month is authoritative: the server stores every row under
+        // it, above any month parsed from file contents or names.
+        fd.append('activeMonth', targetIso);
+        if (folderHint) fd.append('folder', folderHint);
+        return fetch('/api/settlement/upload', {
           method: 'POST',
           body: fd,
           headers: { 'X-Settlement-Upload-Run-Id': uploadRunId },
         });
-        if (res.status !== 413) replacePending = false;
-        return { res, sentReplace };
       };
 
       const recordFailure = (chunk: SelectedFile[], error: string, status: number | null = null) => {
-        failedFiles += chunk.length;
         const at = new Date().toISOString();
         const suffix = [
           `run ${uploadRunId}`,
@@ -420,30 +327,27 @@ export default function SettlementClient() {
         if (Array.isArray(json.results)) aggregated.push(...json.results);
       };
 
-      let abortRemaining = false;
       // Batches are 1 file each today (BATCH_MAX_FILES=1), but the gauge
       // counts files, not batches, so it stays correct if that changes.
       let sentFiles = 0;
       for (const batch of batches) {
         setProgress({ current: sentFiles + batch.length, total: selected.length, currentFile: batch[0].relativePath });
         try {
-          const { res, sentReplace } = await send(batch);
+          const res = await send(batch);
           await handleResponse(res, batch);
-          // If the one-time clear-month request reached the server but failed,
-          // do not continue later files in an uncleared/ambiguous month.
-          if (sentReplace && res.status !== 413 && !res.ok) abortRemaining = true;
         } catch (err) {
           recordFailure(batch, (err as Error).message);
         }
         sentFiles += batch.length;
         setResults([...aggregated]);
-        if (abortRemaining) break;
       }
       // Transfer is done; hide the gauge before the summary/preview phase.
       setProgress(null);
 
       setResults(aggregated);
       const failedRows = aggregated.filter((r) => r.error);
+      const successfulRows = aggregated.filter((r) => !r.error && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0));
+      const successCount = successfulRows.length;
       appendUploadRunLog({
         runId: uploadRunId,
         at: new Date().toISOString(),
@@ -455,52 +359,94 @@ export default function SettlementClient() {
           error: r.error ?? '',
         })),
       });
-      if (failedFiles === selected.length) {
-        setMessage(t('업로드 실패: 모든 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.', 'アップロード失敗: すべてのファイル送信に失敗しました。下の結果をご確認ください。'));
+      // A partial failure never blocks the rest: successful files are already
+      // saved, so the preview is generated whenever at least one succeeded.
+      if (successCount === 0) {
+        setMessage(t(
+          '업로드 실패: 모든 파일 처리에 실패했습니다. 아래 결과에서 파일별 원인을 확인해 주세요.',
+          'アップロード失敗: すべてのファイル処理に失敗しました。下の結果でファイルごとの原因をご確認ください。',
+        ));
         return;
       }
       const parts: string[] = [
-        failedFiles === 0
-          ? t('업로드 처리가 끝났습니다. 아래 결과를 확인해 주세요.', 'アップロード処理が完了しました。下の結果をご確認ください。')
-          : t(`업로드 처리가 끝났습니다. ${failedFiles}개 파일 전송에 실패했습니다. 아래 결과를 확인해 주세요.`, `アップロード処理が完了しました。${failedFiles}件のファイル送信に失敗しました。下の結果をご確認ください。`),
+        failedRows.length === 0
+          ? t(`업로드 완료: 파일 ${successCount}개가 ${targetLabel} 정산월로 저장되었습니다.`, `アップロード完了: ファイル${successCount}件が${targetLabel}の精算月に保存されました。`)
+          : t(
+              `파일 ${successCount}개는 ${targetLabel} 정산월로 저장되어 미리보기를 생성했습니다. 실패한 ${failedRows.length}개 파일의 원인은 아래 결과에 표시됩니다.`,
+              `ファイル${successCount}件は${targetLabel}の精算月に保存され、プレビューを生成しました。失敗した${failedRows.length}件の原因は下の結果に表示されます。`,
+            ),
       ];
-
-      // Which month should the preview show? Manual mode: the operator's
-      // month. Auto mode: the month(s) the server actually stored the rows
-      // under — the file content is the final truth, not the folder-name
-      // prefill shown in the field before upload.
-      let previewMonth: string | null = monthMode === 'manual' ? month : null;
-      if (monthMode === 'auto') {
-        const uploadedMonths = Array.from(
-          new Set(
-            aggregated
-              .filter((r) => !r.error && (r.sales_records_written ?? 0) > 0 && typeof r.settlement_month === 'string')
-              .map((r) => isoToYyyymm(r.settlement_month as string)),
-          ),
-        ).sort();
-        if (uploadedMonths.length === 1) {
-          previewMonth = uploadedMonths[0];
-          changeMonth(previewMonth);
-          parts.push(t(`파일 내용에서 정산월 ${previewMonth}을(를) 확인했습니다.`, `ファイル内容から精算月 ${previewMonth} を確認しました。`));
-        } else if (uploadedMonths.length > 1) {
-          parts.push(t(
-            `서로 다른 정산월(${uploadedMonths.join(', ')})의 파일이 함께 저장되었습니다. '직접 입력'으로 바꿔 확인할 정산월을 입력한 뒤 '미리보기 새로고침'을 눌러 주세요.`,
-            `異なる精算月（${uploadedMonths.join(', ')}）のファイルがまとめて保存されました。「手動入力」に切り替えて確認したい精算月を入力してから「プレビュー更新」を押してください。`,
-          ));
-        } else {
-          parts.push(t(
-            '저장된 데이터에서 정산월을 확인하지 못했습니다. 아래 결과의 메시지를 확인해 주세요.',
-            '保存されたデータから精算月を確認できませんでした。下の結果のメッセージをご確認ください。',
-          ));
-        }
+      if (unreadable > 0) {
+        parts.push(t(`읽지 못한 항목 ${unreadable}개는 제외되었습니다.`, `読み込めなかった項目${unreadable}件は除外されました。`));
       }
       setMessage(parts.join(' '));
-      if (previewMonth) await loadPreview(previewMonth);
+      await loadPreview(targetMonth);
     } catch (err) {
       setMessage(`${t('업로드 실패', 'アップロード失敗')}: ${(err as Error).message}`);
     } finally {
       setProgress(null);
       setUploading(false);
+      uploadingRef.current = false;
+    }
+  }
+
+  function onFileInputChange(e: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(e.target.files ?? []).map((file) => ({
+      file,
+      relativePath: file.webkitRelativePath || file.name,
+    }));
+    // Reset so selecting the same files/folder again still fires onChange.
+    e.target.value = '';
+    void startUpload(picked, 0);
+  }
+
+  function onDragOver(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    if (!dragActive) setDragActive(true);
+  }
+
+  function onDragLeave(e: DragEvent<HTMLDivElement>) {
+    // dragleave also fires when moving over children; only deactivate when actually leaving the zone.
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragActive(false);
+  }
+
+  async function onDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDragActive(false);
+    if (uploadingRef.current) {
+      setMessage(t('업로드가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.', 'アップロードが進行中です。完了後にもう一度お試しください。'));
+      return;
+    }
+    uploadingRef.current = true;
+    setUploading(true);
+    try {
+      // Entries and files must be captured synchronously: the DataTransfer item list
+      // is cleared as soon as the handler yields to an await.
+      const captured = Array.from(e.dataTransfer?.items ?? [])
+        .filter((item) => item.kind === 'file')
+        .map((item) => ({
+          entry: typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null,
+          file: item.getAsFile(),
+        }));
+      const collected: SelectedFile[] = [];
+      let unreadable = 0;
+      if (captured.length > 0) {
+        for (const { entry, file } of captured) {
+          if (entry) unreadable += await collectFilesFromEntry(entry, collected);
+          else if (file) collected.push({ file, relativePath: file.name });
+          else unreadable += 1;
+        }
+      } else {
+        for (const file of Array.from(e.dataTransfer?.files ?? [])) {
+          collected.push({ file, relativePath: file.name });
+        }
+      }
+      await startUpload(collected, unreadable, true);
+    } catch (err) {
+      setMessage(`${t('업로드 실패', 'アップロード失敗')}: ${(err as Error).message}`);
+      setUploading(false);
+      uploadingRef.current = false;
     }
   }
 
@@ -536,9 +482,11 @@ export default function SettlementClient() {
   }
 
   const failedResults = results.filter((r) => r.error);
+  const successfulResults = results.filter((r) => !r.error && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0));
   const parsedRowsTotal = results.reduce((sum, r) => sum + (r.parsed_rows ?? 0), 0);
   const salesRowsTotal = results.reduce((sum, r) => sum + (r.sales_records_written ?? 0), 0);
   const progressPercent = progress ? Math.min(100, Math.round((progress.current / Math.max(progress.total, 1)) * 100)) : 0;
+  const pickerButtonBase = 'rounded-xl py-3 text-base font-bold transition disabled:cursor-not-allowed disabled:opacity-40';
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
@@ -547,133 +495,109 @@ export default function SettlementClient() {
         <h1 className="mt-2 text-2xl font-bold text-slate-950 dark:text-white">{t('정산 / INPUT Export', '精算 / INPUT Export')}</h1>
         <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
           {t(
-            '매출 현황 보드 안에 독립적으로 붙인 정산 기능입니다. 업로드 전에는 데이터가 비어 있어야 정상이며, 파일을 올린 뒤 해당 월의 INPUT v2 엑셀을 내려받아 테스트합니다.',
-            '売上現況ボードに独立して追加した精算機能です。アップロード前はデータが空の状態が正常です。ファイルをアップロードした後、該当月のINPUT v2 Excelをダウンロードしてテストします。',
+            '정산월을 고른 뒤 파일이나 폴더를 올리면 바로 파싱·저장되고, 해당 월의 INPUT v2 엑셀 미리보기와 다운로드가 준비됩니다.',
+            '精算月を選んでファイルやフォルダをアップロードすると、すぐに解析・保存され、該当月のINPUT v2 Excelのプレビューとダウンロードが利用できます。',
           )}
         </p>
       </header>
 
-      <section className="grid gap-4 lg:grid-cols-[320px_1fr]">
+      <section className="grid gap-4 lg:grid-cols-[340px_1fr]">
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <label className="block text-sm font-semibold text-slate-800 dark:text-slate-100">{t('정산월', '精算月')}</label>
-          <div className="mt-2 grid grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-950">
-            {(['auto', 'manual'] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                onClick={() => {
-                  setMonthMode(mode);
-                  // Auto mode never sends a destructive clear; drop the flag
-                  // so it can't silently carry over when switching back.
-                  if (mode === 'auto') setReplaceMonth(false);
-                }}
-                className={`rounded-md px-2 py-1.5 text-xs font-semibold transition ${monthMode === mode ? 'bg-white text-blue-700 shadow-sm dark:bg-slate-800 dark:text-blue-300' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}
-              >
-                {mode === 'auto' ? t('파일에서 자동 인식', 'ファイルから自動判定') : t('직접 입력', '手動入力')}
-              </button>
-            ))}
-          </div>
-          <input
-            value={month}
-            onChange={(e) => changeMonth(e.target.value.replace(/\D/g, '').slice(0, 6))}
-            placeholder="202605"
-            disabled={monthMode === 'auto'}
-            className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-950 outline-none focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white dark:disabled:bg-slate-900 dark:disabled:text-slate-400"
-          />
-          <p className="mt-2 text-xs text-slate-500">
-            {monthMode === 'auto'
-              ? t('업로드한 파일 내용에서 정산월을 자동으로 읽어옵니다. 업로드가 끝나면 확인된 월이 여기에 표시됩니다.', 'アップロードしたファイル内容から精算月を自動で読み取ります。アップロード完了後、確認された月がここに表示されます。')
-              : t('YYYYMM 형식입니다. 예: 202605', 'YYYYMM形式です。例: 202605')}
+          <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t('1. 정산월 선택', '1. 精算月を選択')}</h2>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {t('어느 달의 정산 데이터를 업로드하나요?', 'どの月の精算データをアップロードしますか？')}
           </p>
 
-          <label className="mt-5 block text-sm font-semibold text-slate-800 dark:text-slate-100">{t('폴더 힌트', 'フォルダヒント')}</label>
-          <input
-            value={folderHint}
-            onChange={(e) => setFolderHint(e.target.value)}
-            placeholder={t('예: 202605_BookLive', '例: 202605_BookLive')}
-            className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-950 outline-none focus:border-blue-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white"
-          />
-          <p className="mt-2 text-xs text-slate-500">{t('플랫폼 자동판별 보조값입니다. 모르면 비워두셔도 됩니다.', 'プラットフォーム自動判別の補助値です。不明な場合は空欄でも問題ありません。')}</p>
+          <div className="mt-4 flex items-center justify-between rounded-xl bg-slate-100 px-2 py-1.5 dark:bg-slate-950">
+            <button
+              type="button"
+              onClick={() => changeYear(selectedYear - 1)}
+              disabled={uploading || selectedYear <= minYear}
+              aria-label={t('이전 연도', '前の年')}
+              className="rounded-lg p-2 text-slate-600 transition hover:bg-white hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <ChevronLeft className="h-5 w-5" />
+            </button>
+            <span className="text-xl font-bold text-slate-950 dark:text-white">{t(`${selectedYear}년`, `${selectedYear}年`)}</span>
+            <button
+              type="button"
+              onClick={() => changeYear(selectedYear + 1)}
+              disabled={uploading || selectedYear >= maxYear}
+              aria-label={t('다음 연도', '次の年')}
+              className="rounded-lg p-2 text-slate-600 transition hover:bg-white hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <ChevronRight className="h-5 w-5" />
+            </button>
+          </div>
 
-          <label className={`mt-5 flex items-start gap-2 rounded-lg bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/40 dark:text-blue-100 ${monthMode === 'auto' ? 'opacity-60' : ''}`}>
-            <input
-              type="checkbox"
-              checked={replaceMonth}
-              onChange={(e) => setReplaceMonth(e.target.checked)}
-              disabled={monthMode === 'auto'}
-              className="mt-0.5"
-            />
-            <span>
-              {t('이번 업로드 전에 해당 월의 기존 정산 행을 비웁니다. 반복 테스트할 때만 켜 주세요.', '今回のアップロード前に該当月の既存精算行を削除します。繰り返しテストする場合のみオンにしてください。')}
-              {monthMode === 'auto' && (
-                <span className="mt-1 block text-blue-700 dark:text-blue-300">
-                  {t("자동 인식 모드에서는 지울 대상 월이 업로드 전에 정해지지 않아 사용할 수 없습니다. 필요하면 '직접 입력'으로 바꿔 주세요.", '自動判定モードでは削除対象の月がアップロード前に確定しないため使用できません。必要な場合は「手動入力」に切り替えてください。')}
-                </span>
-              )}
-            </span>
-          </label>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
+              const active = m === selectedMonthNum;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => changeMonth(`${selectedYear}${String(m).padStart(2, '0')}`)}
+                  disabled={uploading}
+                  className={`${pickerButtonBase} ${
+                    active
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700 hover:bg-blue-100 hover:text-blue-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  {t(`${m}월`, `${m}月`)}
+                </button>
+              );
+            })}
+          </div>
+
+          <p className="mt-4 rounded-lg bg-blue-50 p-3 text-xs leading-relaxed text-blue-900 dark:bg-blue-950/40 dark:text-blue-100">
+            {t(
+              `선택한 ${monthLabel(month)}이(가) 이번 업로드의 정산월이 됩니다. 파일 내용이나 폴더 이름에 다른 월이 적혀 있어도 항상 이 선택이 우선합니다.`,
+              `選択した${monthLabel(month)}が今回のアップロードの精算月になります。ファイル内容やフォルダ名に別の月が書かれていても、常にこの選択が優先されます。`,
+            )}
+          </p>
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t('2. 파일 올리기', '2. ファイルをアップロード')}</h2>
           <div
             onDragOver={onDragOver}
             onDragLeave={onDragLeave}
             onDrop={onDrop}
-            className={`flex min-h-44 flex-col items-center justify-center rounded-xl border-2 border-dashed p-8 text-center transition ${dragActive ? 'border-blue-500 bg-blue-50 dark:bg-blue-950/30' : 'border-slate-300 dark:border-slate-700'}`}
+            className={`mt-3 flex min-h-52 flex-col items-center justify-center rounded-xl border-2 border-dashed p-8 text-center transition ${dragActive ? 'border-blue-500 bg-blue-50 dark:bg-blue-950/30' : 'border-slate-300 dark:border-slate-700'}`}
           >
-            <UploadCloud className="mb-3 h-10 w-10 text-blue-600" />
+            {uploading ? (
+              <Loader2 className="mb-3 h-10 w-10 animate-spin text-blue-600" />
+            ) : (
+              <UploadCloud className="mb-3 h-10 w-10 text-blue-600" />
+            )}
             <span className="text-sm font-semibold text-slate-800 dark:text-slate-100">
-              {t('정산 원본 파일이나 폴더를 여기로 드래그하세요', '精算原本ファイルやフォルダをここにドラッグしてください')}
+              {uploading
+                ? t('업로드 진행 중입니다…', 'アップロード進行中です…')
+                : t('파일이나 폴더를 여기에 놓으면 바로 업로드가 시작됩니다', 'ファイルやフォルダをここにドロップすると、すぐにアップロードが始まります')}
             </span>
             <span className="mt-1 text-xs text-slate-500">
-              {t('폴더를 통째로 놓으면 하위 파일까지 모두 추가됩니다. 중복 파일은 자동으로 제외됩니다.', 'フォルダごとドロップすると配下のファイルもすべて追加されます。重複ファイルは自動的に除外されます。')}
+              {t(
+                `놓는 즉시 ${monthLabel(month)} 정산월로 파싱·저장됩니다. 별도의 업로드 버튼은 없으며, 일부 파일이 실패해도 나머지는 저장됩니다.`,
+                `ドロップすると、すぐに${monthLabel(month)}の精算月として解析・保存されます。別途アップロードボタンはなく、一部のファイルが失敗しても残りは保存されます。`,
+              )}
             </span>
             <div className="mt-4 flex flex-wrap justify-center gap-2">
-              <label className="inline-flex cursor-pointer items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition hover:border-blue-500 dark:border-slate-700 dark:text-slate-100">
+              <label className={`inline-flex items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition dark:border-slate-700 dark:text-slate-100 ${uploading ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:border-blue-500'}`}>
                 <UploadCloud className="mr-1.5 h-3.5 w-3.5" />
                 {t('파일 선택', 'ファイルを選択')}
-                <input type="file" multiple className="hidden" onChange={onFileInputChange} />
+                <input type="file" multiple className="hidden" onChange={onFileInputChange} disabled={uploading} />
               </label>
-              <label className="inline-flex cursor-pointer items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition hover:border-blue-500 dark:border-slate-700 dark:text-slate-100">
+              <label className={`inline-flex items-center rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 transition dark:border-slate-700 dark:text-slate-100 ${uploading ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:border-blue-500'}`}>
                 <FolderOpen className="mr-1.5 h-3.5 w-3.5" />
                 {t('폴더 선택', 'フォルダを選択')}
-                <input type="file" multiple className="hidden" onChange={onFileInputChange} {...folderInputProps} />
+                <input type="file" multiple className="hidden" onChange={onFileInputChange} disabled={uploading} {...folderInputProps} />
               </label>
             </div>
           </div>
 
-          {selectionNote && <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{selectionNote}</p>}
-
-          {files.length > 0 && (
-            <div className="mt-4 rounded-lg bg-slate-50 p-3 text-sm dark:bg-slate-950">
-              <div className="flex items-center justify-between gap-2">
-                <div className="font-semibold text-slate-800 dark:text-slate-100">{t(`선택된 파일 ${files.length}개`, `選択されたファイル ${files.length}件`)}</div>
-                <button
-                  onClick={() => {
-                    filesRef.current = [];
-                    setFiles([]);
-                    setSelectionNote(null);
-                  }}
-                  className="text-xs font-semibold text-red-600 hover:underline dark:text-red-400"
-                >
-                  {t('전체 해제', 'すべて解除')}
-                </button>
-              </div>
-              <ul className="mt-2 max-h-28 space-y-1 overflow-auto text-xs text-slate-600 dark:text-slate-300">
-                {files.map((sf) => <li key={fileKey(sf)}>{sf.relativePath}</li>)}
-              </ul>
-            </div>
-          )}
-
-          <div className="mt-5 flex flex-wrap gap-3">
-            <button
-              onClick={upload}
-              disabled={(monthMode === 'manual' && !validMonth) || files.length === 0 || uploading}
-              className="inline-flex items-center rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {uploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <UploadCloud className="mr-2 h-4 w-4" />}
-              {t('업로드 / 파싱 시작', 'アップロード / 解析開始')}
-            </button>
+          <div className="mt-4 flex flex-wrap gap-3">
             <a
               href={validMonth ? `/api/settlement/export-v2/${month}.xlsx` : undefined}
               download={validMonth ? `JP_INPUT_V2_${month}.xlsx` : undefined}
@@ -692,7 +616,7 @@ export default function SettlementClient() {
             </button>
             <button
               onClick={resetMonth}
-              disabled={!validMonth || resetting}
+              disabled={!validMonth || resetting || uploading}
               className="inline-flex items-center rounded-lg border border-red-300 px-4 py-2 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-900 dark:text-red-300"
             >
               {resetting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
@@ -751,7 +675,7 @@ export default function SettlementClient() {
               {t(`파일 ${results.length}개`, `ファイル ${results.length}件`)}
             </span>
             <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-              {t(`성공 ${results.length - failedResults.length}`, `成功 ${results.length - failedResults.length}`)}
+              {t(`성공 ${successfulResults.length}`, `成功 ${successfulResults.length}`)}
             </span>
             <span className={`rounded-full px-2.5 py-1 ${failedResults.length > 0 ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>
               {t(`실패 ${failedResults.length}`, `失敗 ${failedResults.length}`)}
@@ -819,7 +743,7 @@ export default function SettlementClient() {
               </thead>
               <tbody>
                 {results.map((r, idx) => {
-                  const ok = !r.error;
+                  const ok = !r.error && ((r.sales_records_written ?? 0) > 0 || (r.sales_records_skipped_duplicates ?? 0) > 0);
                   return (
                     <tr key={`${r.file ?? 'row'}-${idx}`} className="border-b border-slate-100 dark:border-slate-800">
                       <td className="py-2 pr-3">

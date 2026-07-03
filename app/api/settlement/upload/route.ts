@@ -272,6 +272,27 @@ export async function POST(request: Request) {
     // 6. Transform → sales_records
     let salesWritten = 0;
     let skippedDuplicates = 0;
+    if (parsed.records.length === 0) {
+      const msg = "파싱 가능한 정산 행이 없습니다. 지원하지 않는 양식이거나 빈 파일입니다.";
+      await markUploadFailed({
+        platform_code: parsed.platform_code,
+        settlement_month: effectiveSettlement,
+        sales_month: parsed.sales_month || null,
+        detection_confidence: parsed.detection_confidence,
+        parsed_rows: 0,
+        parse_error: msg,
+      });
+      results.push({
+        file: f.name,
+        platform: parsed.platform_code,
+        parsed_rows: 0,
+        sales_records_written: 0,
+        settlement_month: effectiveSettlement,
+        sales_month: parsed.sales_month || null,
+        error: msg,
+      });
+      continue;
+    }
     if (parsed.records.length > 0) {
       // resolveSettlementMonth guarantees a month whenever records exist;
       // this guard only keeps TypeScript honest and catches regressions.
@@ -282,6 +303,7 @@ export async function POST(request: Request) {
       }
       const ctx: TransformContext = {
         settlement_month: batch,
+        forceSettlementMonth: true,
         sales_month: parsed.sales_month || null,
         platform_code: parsed.platform_code,
         upload_id: uploadRow.id,
@@ -326,6 +348,29 @@ export async function POST(request: Request) {
           console.warn(`[upload]${runLabel} ${f.name}: duplicate check failed, inserting all rows`);
         }
       }
+      if (inserts.length === 0 && skippedDuplicates === 0) {
+        const msg = transformed.errors.length > 0
+          ? `정산 행으로 변환하지 못했습니다: ${transformed.errors.slice(0, 3).map((e) => `${e.field} ${e.message}`).join('; ')}`
+          : "정산 행으로 변환할 수 있는 데이터가 없습니다.";
+        await markUploadFailed({
+          platform_code: parsed.platform_code,
+          settlement_month: effectiveSettlement,
+          sales_month: parsed.sales_month || null,
+          detection_confidence: parsed.detection_confidence,
+          parsed_rows: parsed.records.length,
+          parse_error: msg,
+        });
+        results.push({
+          file: f.name,
+          platform: parsed.platform_code,
+          parsed_rows: parsed.records.length,
+          sales_records_written: 0,
+          settlement_month: effectiveSettlement,
+          sales_month: parsed.sales_month || null,
+          error: msg,
+        });
+        continue;
+      }
       if (inserts.length > 0) {
         const { error: salesErr, data: salesData } = await supabase
           .from("sales_records")
@@ -352,7 +397,7 @@ export async function POST(request: Request) {
         salesWritten = salesData?.length ?? 0;
       }
 
-      if (salesWritten > 0) {
+      if (salesWritten > 0 || skippedDuplicates > 0) {
         await supabase
           .from("raw_uploads")
           .update({ status: "aggregated" })

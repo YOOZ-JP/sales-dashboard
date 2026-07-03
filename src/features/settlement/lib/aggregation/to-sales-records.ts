@@ -38,6 +38,12 @@ export interface LookupMaps {
 export interface TransformContext {
   settlement_month: string; // 'YYYY-MM-01'
   /**
+   * When true, the caller-picked settlement month is authoritative and row
+   * contents must not override it. Live dashboard uploads use this because the
+   * operator explicitly chooses "this upload is YYYY-MM" before dropping files.
+   */
+  forceSettlementMonth?: boolean;
+  /**
    * File-level sales month parsed from the upload (ISO date), used as the
    * fallback when a record carries no own sales_month. Prevents e.g. a renta
    * 2026-04 statement settling in 2026-05 from being stamped 2026-05.
@@ -210,6 +216,18 @@ function isoMonthFirstOrNull(v: unknown): string | null {
   return d.slice(0, 7) + "-01";
 }
 
+function settlementMonthFor(ctx: TransformContext, rowValue: unknown): string {
+  return ctx.forceSettlementMonth
+    ? ctx.settlement_month
+    : isoMonthFirstOrNull(rowValue) ?? ctx.settlement_month;
+}
+
+function settlementDateFor(ctx: TransformContext, rowValue: unknown): string {
+  return ctx.forceSettlementMonth
+    ? ctx.settlement_month
+    : isoDateOrNull(rowValue) ?? ctx.settlement_month;
+}
+
 /** Canonical fold — same transforms the seeded aliases use (case + trim). */
 function foldAlias(v: unknown): string {
   return String(v ?? "")
@@ -258,8 +276,7 @@ function fromSalesRecord(
         isoMonthFirstOrNull(row.sales_month) ??
         isoMonthFirstOrNull(ctx.sales_month) ??
         ctx.settlement_month,
-      settlement_month:
-        isoMonthFirstOrNull(row.settlement_month) ?? ctx.settlement_month,
+      settlement_month: settlementMonthFor(ctx, row.settlement_month),
       settlement_batch: ctx.settlement_month,
       deposit_month: isoMonthFirstOrNull(row.deposit_month),
       country: row.country ?? "JP",
@@ -392,8 +409,7 @@ function fromGroundTruth(
         isoMonthFirstOrNull(row.sales_month) ??
         isoMonthFirstOrNull(ctx.sales_month) ??
         ctx.settlement_month,
-      settlement_month:
-        isoMonthFirstOrNull(row.settlement_month) ?? ctx.settlement_month,
+      settlement_month: settlementMonthFor(ctx, row.settlement_month),
       settlement_batch: ctx.settlement_month,
       deposit_month: isoMonthFirstOrNull(row.deposit_month),
       country: strOrNull(row.country) ?? "JP",
@@ -506,8 +522,7 @@ function fromRawRecord(
         isoDateOrNull(d.sales_month) ??
         isoDateOrNull(ctx.sales_month) ??
         ctx.settlement_month,
-      settlement_month:
-        isoDateOrNull(d.settlement_month) ?? ctx.settlement_month,
+      settlement_month: settlementDateFor(ctx, d.settlement_month),
       settlement_batch: ctx.settlement_month,
       deposit_month: isoDateOrNull(d.deposit_month),
       country: strOrNull(d.country) ?? "JP",

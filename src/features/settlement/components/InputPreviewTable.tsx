@@ -1,12 +1,20 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, type CSSProperties } from 'react';
 import { useApp } from '@/context/AppContext';
+
+export type PreviewStyle = {
+  bg?: string;
+  color?: string;
+  bold?: boolean;
+  align?: 'left' | 'center' | 'right';
+};
 
 export type PreviewCell = {
   value: string | number | boolean | null;
   formula?: string;
   type?: string;
+  s?: number;
 };
 
 export type PreviewSheet = {
@@ -14,6 +22,9 @@ export type PreviewSheet = {
   rowCount: number;
   columnCount: number;
   rows: PreviewCell[][];
+  styles?: PreviewStyle[];
+  columnWidths?: (number | null)[];
+  rowHeights?: (number | null)[];
 };
 
 export type PreviewData = {
@@ -58,6 +69,34 @@ function formatGeneratedAt(iso: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/** Server-produced colors are already "#RRGGBB", but only ever inject values that match. */
+const SAFE_HEX = /^#[0-9A-F]{6}$/i;
+
+const ROW_HEADER_WIDTH = 44;
+
+/** Excel column width (character units) → CSS px (Calibri-11 approximation; 8.43 chars ≈ 64px). */
+function columnWidthPx(width: number | null | undefined): number {
+  const chars = typeof width === 'number' && width > 0 ? width : 8.43;
+  return Math.max(28, Math.round(chars * 7 + 5));
+}
+
+/** Excel row height is in points; CSS px = pt × 4/3. */
+function rowHeightPx(height: number | null | undefined): number | undefined {
+  return typeof height === 'number' && height > 0 ? Math.round((height * 4) / 3) : undefined;
+}
+
+function cellCss(cell: PreviewCell, styles?: PreviewStyle[]): CSSProperties | undefined {
+  if (cell.s === undefined || !styles) return undefined;
+  const style = styles[cell.s];
+  if (!style) return undefined;
+  const css: CSSProperties = {};
+  if (style.bg && SAFE_HEX.test(style.bg)) css.backgroundColor = style.bg;
+  if (style.color && SAFE_HEX.test(style.color)) css.color = style.color;
+  if (style.bold) css.fontWeight = 700;
+  if (style.align === 'left' || style.align === 'center' || style.align === 'right') css.textAlign = style.align;
+  return Object.keys(css).length > 0 ? css : undefined;
+}
+
 export default function InputPreviewTable({ preview, activeSheet, onSheetChange }: InputPreviewTableProps) {
   const { t } = useApp();
 
@@ -73,6 +112,15 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
   const shownRows = sheet.rows.length;
   const shownCols = sheet.rows[0]?.length ?? 0;
   const truncated = shownRows < sheet.rowCount || shownCols < sheet.columnCount;
+
+  // With workbook column widths available, lay the table out exactly like the
+  // sheet (fixed layout + explicit pixel widths, long text clipped like Excel).
+  // Older payloads without widths keep the size-to-content behavior.
+  const hasWidths = Boolean(sheet.columnWidths?.some((w) => typeof w === 'number'));
+  const colPx = Array.from({ length: shownCols }, (_, i) => columnWidthPx(sheet.columnWidths?.[i]));
+  const tableStyle: CSSProperties | undefined = hasWidths
+    ? { tableLayout: 'fixed', width: ROW_HEADER_WIDTH + colPx.reduce((a, b) => a + b, 0) }
+    : undefined;
 
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
@@ -105,15 +153,25 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
         })}
       </div>
 
-      <div className="mt-4 max-h-[620px] overflow-auto rounded-lg border border-slate-200 dark:border-slate-800">
-        <table className="border-collapse text-xs">
+      {/* The grid keeps a light spreadsheet surface in both themes so cell
+          fills/font colors from the workbook read the same as in Excel. */}
+      <div className="mt-4 max-h-[620px] overflow-auto rounded-lg border border-slate-200 bg-white dark:border-slate-800">
+        <table className="border-collapse text-xs" style={tableStyle}>
+          {hasWidths && (
+            <colgroup>
+              <col style={{ width: ROW_HEADER_WIDTH }} />
+              {colPx.map((w, i) => (
+                <col key={i} style={{ width: w }} />
+              ))}
+            </colgroup>
+          )}
           <thead>
             <tr>
-              <th className="sticky left-0 top-0 z-30 border border-slate-200 bg-slate-100 px-2 py-1 text-slate-500 dark:border-slate-700 dark:bg-slate-800" />
+              <th className="sticky left-0 top-0 z-30 border border-slate-200 bg-slate-100 px-2 py-1 text-slate-500" />
               {Array.from({ length: shownCols }, (_, i) => (
                 <th
                   key={i}
-                  className="sticky top-0 z-20 min-w-[80px] border border-slate-200 bg-slate-100 px-2 py-1 font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                  className={`sticky top-0 z-20 border border-slate-200 bg-slate-100 px-2 py-1 font-semibold text-slate-600 ${hasWidths ? 'overflow-hidden' : 'min-w-[80px]'}`}
                 >
                   {columnLetter(i + 1)}
                 </th>
@@ -122,15 +180,16 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
           </thead>
           <tbody>
             {sheet.rows.map((row, rIdx) => (
-              <tr key={rIdx}>
-                <th className="sticky left-0 z-10 border border-slate-200 bg-slate-100 px-2 py-1 text-right font-normal text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400">
+              <tr key={rIdx} style={{ height: rowHeightPx(sheet.rowHeights?.[rIdx]) }}>
+                <th className="sticky left-0 z-10 border border-slate-200 bg-slate-100 px-2 py-1 text-right font-normal text-slate-500">
                   {rIdx + 1}
                 </th>
                 {row.map((cell, cIdx) => (
                   <td
                     key={cIdx}
                     title={cell.formula ? `=${cell.formula}` : undefined}
-                    className={`whitespace-nowrap border border-slate-200 px-2 py-1 text-slate-800 dark:border-slate-800 dark:text-slate-200 ${
+                    style={cellCss(cell, sheet.styles)}
+                    className={`overflow-hidden whitespace-nowrap border border-slate-200 px-2 py-1 text-slate-800 ${
                       typeof cell.value === 'number' ? 'text-right tabular-nums' : ''
                     }`}
                   >
@@ -154,8 +213,8 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
 
       <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
         {t(
-          '웹 미리보기는 빠른 확인용입니다. 수식/서식까지 포함한 최종본은 다운로드 파일을 기준으로 확인해 주세요.',
-          'Webプレビューは簡易確認用です。数式・書式を含む最終版はダウンロードファイルをご確認ください。',
+          '미리보기는 생성되는 Excel 파일의 서식(배경색·글자색·정렬·열 너비 등)을 지원 범위 안에서 따릅니다. 수식을 포함한 최종본은 다운로드한 Excel 파일이 기준입니다.',
+          'プレビューは生成されるExcelファイルの書式（背景色・文字色・配置・列幅など）を対応範囲内で再現します。数式を含む最終版はダウンロードしたExcelファイルが基準です。',
         )}
       </p>
     </section>

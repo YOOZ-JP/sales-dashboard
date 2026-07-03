@@ -6,11 +6,27 @@ import ExcelJS from "exceljs";
  * A preview is a bounded, read-only snapshot of the SAME workbook buffer produced by
  * `fillInputV2Template` (the download path). We deliberately cap rows/columns so the
  * JSON payload stays small; the downloaded `.xlsx` remains the complete authority.
+ *
+ * Basic workbook styling (solid fills, font bold/color, horizontal alignment,
+ * column widths, row heights) is carried along so the browser table can mimic
+ * the generated Excel file. Styles are deduplicated into a per-sheet table and
+ * cells reference them by index, keeping the JSON bounded.
  */
+export type WorkbookPreviewStyle = {
+  /** Solid-fill background color as "#RRGGBB". */
+  bg?: string;
+  /** Font color as "#RRGGBB". */
+  color?: string;
+  bold?: boolean;
+  align?: "left" | "center" | "right";
+};
+
 export type WorkbookPreviewCell = {
   value: string | number | boolean | null;
   formula?: string;
   type?: "string" | "number" | "boolean" | "date" | "formula" | "blank";
+  /** Index into the sheet's deduplicated `styles` table. */
+  s?: number;
 };
 
 export type WorkbookPreviewSheet = {
@@ -21,6 +37,12 @@ export type WorkbookPreviewSheet = {
   columnCount: number;
   rows: WorkbookPreviewCell[][];
   merges?: string[];
+  /** Deduplicated cell styles referenced by `WorkbookPreviewCell.s`. */
+  styles?: WorkbookPreviewStyle[];
+  /** Excel column widths (character units) for the previewed columns; null = sheet default. */
+  columnWidths?: (number | null)[];
+  /** Row heights in points for the previewed rows; null = sheet default. */
+  rowHeights?: (number | null)[];
 };
 
 export type WorkbookPreview = {
@@ -51,6 +73,46 @@ function limitsFor(name: string): { rows: number; cols: number } {
 }
 
 const BLANK_CELL: WorkbookPreviewCell = { value: null, type: "blank" };
+
+/** Runaway guard: a sheet with more distinct styles than this stops collecting new ones. */
+const MAX_STYLES_PER_SHEET = 256;
+
+/** ExcelJS color ({ argb: "FFRRGGBB" }) → "#RRGGBB". Theme-indexed colors have no argb and are skipped. */
+function argbToHex(color: unknown): string | undefined {
+  const argb = (color as { argb?: unknown } | undefined)?.argb;
+  if (typeof argb !== "string") return undefined;
+  if (/^[0-9A-Fa-f]{8}$/.test(argb)) {
+    if (argb.slice(0, 2).toUpperCase() === "00") return undefined; // fully transparent
+    return `#${argb.slice(2).toUpperCase()}`;
+  }
+  if (/^[0-9A-Fa-f]{6}$/.test(argb)) return `#${argb.toUpperCase()}`;
+  return undefined;
+}
+
+/** Extract the subset of a cell's style the preview can render; null when there is nothing to carry. */
+function toPreviewStyle(cell: ExcelJS.Cell): WorkbookPreviewStyle | null {
+  const style: WorkbookPreviewStyle = {};
+  const fill = cell.fill;
+  if (fill && fill.type === "pattern" && fill.pattern === "solid") {
+    const bg = argbToHex(fill.fgColor);
+    if (bg) style.bg = bg;
+  }
+  const font = cell.font;
+  if (font) {
+    if (font.bold) style.bold = true;
+    const color = argbToHex(font.color);
+    if (color) style.color = color;
+  }
+  const horizontal = cell.alignment?.horizontal;
+  if (horizontal === "left" || horizontal === "center" || horizontal === "right") {
+    style.align = horizontal;
+  }
+  return Object.keys(style).length > 0 ? style : null;
+}
+
+function styleKey(style: WorkbookPreviewStyle): string {
+  return `${style.bg ?? ""}|${style.color ?? ""}|${style.bold ? 1 : 0}|${style.align ?? ""}`;
+}
 
 /** Convert a single ExcelJS cell value into a compact, JSON-safe preview cell. */
 function toPreviewCell(value: ExcelJS.CellValue): WorkbookPreviewCell {
@@ -124,14 +186,45 @@ export async function workbookBufferToPreview(
     const shownRows = Math.min(totalRows, rowLimit);
     const shownCols = Math.min(totalCols, colLimit);
 
+    const styles: WorkbookPreviewStyle[] = [];
+    const styleIndexByKey = new Map<string, number>();
+    const rowHeights: (number | null)[] = [];
+    let hasRowHeight = false;
+
     const rows: WorkbookPreviewCell[][] = [];
     for (let r = 1; r <= shownRows; r += 1) {
       const row = ws.getRow(r);
+      const height = typeof row.height === "number" && row.height > 0 ? Math.round(row.height * 100) / 100 : null;
+      if (height !== null) hasRowHeight = true;
+      rowHeights.push(height);
       const cells: WorkbookPreviewCell[] = [];
       for (let c = 1; c <= shownCols; c += 1) {
-        cells.push(toPreviewCell(row.getCell(c).value));
+        const cell = row.getCell(c);
+        const previewCell = toPreviewCell(cell.value);
+        const style = toPreviewStyle(cell);
+        if (style) {
+          const key = styleKey(style);
+          let idx = styleIndexByKey.get(key);
+          if (idx === undefined && styles.length < MAX_STYLES_PER_SHEET) {
+            idx = styles.length;
+            styles.push(style);
+            styleIndexByKey.set(key, idx);
+          }
+          cells.push(idx === undefined ? previewCell : { ...previewCell, s: idx });
+        } else {
+          cells.push(previewCell);
+        }
       }
       rows.push(cells);
+    }
+
+    const columnWidths: (number | null)[] = [];
+    let hasColumnWidth = false;
+    for (let c = 1; c <= shownCols; c += 1) {
+      const width = ws.getColumn(c).width;
+      const rounded = typeof width === "number" && width > 0 ? Math.round(width * 100) / 100 : null;
+      if (rounded !== null) hasColumnWidth = true;
+      columnWidths.push(rounded);
     }
 
     return {
@@ -139,6 +232,9 @@ export async function workbookBufferToPreview(
       rowCount: totalRows,
       columnCount: totalCols,
       rows,
+      ...(styles.length > 0 ? { styles } : {}),
+      ...(hasColumnWidth ? { columnWidths } : {}),
+      ...(hasRowHeight ? { rowHeights } : {}),
     };
   });
 
