@@ -205,6 +205,7 @@ export async function POST(request: Request) {
       console.log(`[upload]${runLabel} ${f.name}: settlement month inherited from batch hint ${effectiveSettlement}`);
       parsed.errors.push(resolution.note);
     }
+    const zeroRowFailure = isZeroRowParseFailure(parsed.platform_code, parsed.records.length, parsed.errors);
 
     // 3. Archive the raw file into Supabase Storage (upload-debug bucket).
     let archivePath: string | null = null;
@@ -226,9 +227,10 @@ export async function POST(request: Request) {
         // Files with no settlement rows are not necessarily failures: monthly
         // folders often include payment notices, detail PDFs, or companion
         // workbooks that are useful for audit but do not create INPUT rows.
-        // Keep them out of the red failure bucket; true parser/DB errors use
-        // markUploadFailed() on their own paths.
-        status: "parsed",
+        // But if the platform is unknown/no-parser or a tabular parser reports
+        // "no data rows", keep it in the red bucket so real sales files do not
+        // get hidden as harmless skips.
+        status: zeroRowFailure ? "failed" : "parsed",
         detection_confidence: parsed.detection_confidence,
         parse_error: parsed.errors.join("; ") || null,
         parsed_rows: parsed.records.length,
@@ -278,6 +280,19 @@ export async function POST(request: Request) {
     let salesWritten = 0;
     let skippedDuplicates = 0;
     if (parsed.records.length === 0) {
+      if (zeroRowFailure) {
+        const msg = parsed.errors.join("; ") || "정산행 0건: 파일 형식 분석 실패/파서 미지원입니다.";
+        results.push({
+          file: f.name,
+          platform: parsed.platform_code,
+          parsed_rows: 0,
+          sales_records_written: 0,
+          error: msg,
+          settlement_month: effectiveSettlement,
+          sales_month: parsed.sales_month || null,
+        });
+        continue;
+      }
       const msg = "정산행 없음: 보조자료/비정산 파일로 보고 건너뛰었습니다.";
       results.push({
         file: f.name,
@@ -418,4 +433,15 @@ export async function POST(request: Request) {
   }
 
   return NextResponse.json({ results });
+}
+
+function isZeroRowParseFailure(platformCode: string, parsedRows: number, errors: string[]): boolean {
+  if (parsedRows > 0) return false;
+  const joined = errors.join("; ").toLowerCase();
+  if (platformCode === "unknown") return true;
+  return (
+    joined.includes("no parser for platform") ||
+    joined.includes("no data rows parsed") ||
+    joined.includes("unsupported")
+  );
 }
