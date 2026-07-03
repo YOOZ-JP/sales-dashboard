@@ -79,7 +79,7 @@ export const SIGNATURES: PlatformSignature[] = [
   },
   {
     code: "dmm",
-    filenamePatterns: [/\d+_株式会社RIVERSE_支払通知書/, /DMM/i],
+    filenamePatterns: [/\d+_株式会社RIVERSE_支払通知書/, /DMM/i, /ポイント上乗せ施策/],
     weight: 10,
   },
   {
@@ -127,7 +127,7 @@ export const SIGNATURES: PlatformSignature[] = [
   },
   {
     code: "mechacomic",
-    filenamePatterns: [/^RIVERSE_\d{6}\.xlsx$/],
+    filenamePatterns: [/^RIVERSE_\d{6}\.xlsx$/, /【請求書】.*めちゃコミック/],
     weight: 10,
   },
   {
@@ -138,7 +138,7 @@ export const SIGNATURES: PlatformSignature[] = [
   },
   {
     code: "kadokawa",
-    filenamePatterns: [/\d+_R\d+_\d+\.pdf$/, /支払通知書_\d{8}_\d+\.csv/],
+    filenamePatterns: [/\d+_R\d+_\d+\.pdf$/, /支払通知書_\d{8}_\d+\.csv/, /【請求書】KADOKAWA様/],
     weight: 10,
   },
   {

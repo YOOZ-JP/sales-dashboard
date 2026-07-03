@@ -501,6 +501,12 @@ function fromRawRecord(
 
   const resolvedClientCode =
     lookups.clientAliasesToCode?.get(foldAlias(clientCode)) ?? String(clientCode);
+  const isSummary = d.is_summary === true;
+  const sourceFileKind = strOrNull(d.source_file_kind);
+  const summaryNote = isSummary
+    ? ["SUMMARY_NON_AGGREGATED", sourceFileKind].filter(Boolean).join(":")
+    : null;
+  const note2 = [strOrNull(d.note2), summaryNote].filter(Boolean).join(" / ") || null;
 
   return {
     insert: {
@@ -532,18 +538,18 @@ function fromRawRecord(
       distribution_strategy: strOrNull(d.distribution_strategy) ?? "non-ex",
       settlement_currency: strOrNull(d.settlement_currency) ?? "JPY",
       vehicle_currency: strOrNull(d.vehicle_currency) ?? "KRW",
-      total_amount_jpy: numOrNull(d.total_amount_jpy ?? d.gross_jpy),
-      fee_jpy: numOr0(d.fee_jpy),
-      before_tax_jpy: numOrNull(d.before_tax_jpy),
-      after_tax_jpy: numOrNull(d.after_tax_jpy),
+      total_amount_jpy: isSummary ? null : numOrNull(d.total_amount_jpy ?? d.gross_jpy),
+      fee_jpy: isSummary ? 0 : numOr0(d.fee_jpy),
+      before_tax_jpy: isSummary ? null : numOrNull(d.before_tax_jpy),
+      after_tax_jpy: isSummary ? null : numOrNull(d.after_tax_jpy),
       rs_label: strOrNull(d.rs_label),
-      rs_rate: numOrNull(d.rs_rate ?? d.rs_rate_hint),
-      before_tax_income_jpy: numOrNull(d.before_tax_income_jpy),
-      withholding_tax_jpy: numOr0(d.withholding_tax_jpy),
-      consumption_tax_jpy: numOr0(d.consumption_tax_jpy),
-      after_tax_income_jpy: numOrNull(d.after_tax_income_jpy),
+      rs_rate: isSummary ? null : numOrNull(d.rs_rate ?? d.rs_rate_hint),
+      before_tax_income_jpy: isSummary ? null : numOrNull(d.before_tax_income_jpy),
+      withholding_tax_jpy: isSummary ? 0 : numOr0(d.withholding_tax_jpy),
+      consumption_tax_jpy: isSummary ? 0 : numOr0(d.consumption_tax_jpy),
+      after_tax_income_jpy: isSummary ? null : numOrNull(d.after_tax_income_jpy),
       note1: strOrNull(d.note1),
-      note2: strOrNull(d.note2),
+      note2,
     },
     errors,
   };

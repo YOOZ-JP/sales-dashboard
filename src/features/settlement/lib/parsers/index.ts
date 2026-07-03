@@ -11,6 +11,7 @@
 import type { ParseResult } from "@/features/settlement/lib/schema/sales";
 import { detectPlatform } from "./registry";
 import { readWorkbook } from "./common";
+import { parseGenericSummaryFallback } from "./generic-summary-fallback";
 
 // Lightweight parsers — safe to eager-import.
 import { parseCmoa } from "./cmoa";
@@ -103,7 +104,21 @@ export async function parseFile(opts: {
     buffer: opts.buffer,
     folderName: opts.folderName,
   });
+  if (result.records.length === 0 && shouldUseGenericSummaryFallback(opts.filename, code)) {
+    const fallback = await parseGenericSummaryFallback({
+      filename: opts.filename,
+      buffer: opts.buffer,
+      platformCode: code,
+      previousErrors: result.errors,
+    });
+    return { ...fallback, detection_confidence: detection.confidence };
+  }
   return { ...result, detection_confidence: detection.confidence };
+}
+
+function shouldUseGenericSummaryFallback(filename: string, platformCode: string): boolean {
+  if (platformCode === "unknown") return false;
+  return /\.(pdf|xlsx|xls|csv|tsv)$/i.test(filename);
 }
 
 function safeSheetNames(filename: string, buffer: Buffer): string[] {

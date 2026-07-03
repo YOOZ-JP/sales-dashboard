@@ -38,6 +38,9 @@ import iconv from "iconv-lite";
 import Papa from "papaparse";
 import type { ParseResult } from "@/features/settlement/lib/schema/sales";
 import aliases from "../../data/aliases/kadokawa.json" with { type: "json" };
+import { parseInvoiceXlsx, parseInvoicePdf } from "./invoice-common";
+import { extractPdfText, findMonth } from "./pdf-text";
+import { buildSummaryRecord } from "./summary-record";
 
 type Row = Record<string, string>;
 
@@ -83,10 +86,80 @@ function parseIsoDateLike(v: string | undefined): string | null {
   return null;
 }
 
+/**
+ * 支払通知書 PDF (01_*.pdf). Text stream groups the header labels then the
+ * numbers, so we take the first figures after the 合計金額（消費税込）label
+ * block: 合計金額, 所得税等, 送金手数料, 差引支払金額.
+ */
+async function parseKadokawaNoticePdf(filename: string, buffer: Buffer): Promise<ParseResult> {
+  const text = await extractPdfText(buffer, { maxPages: 2 });
+  const numsAfterLabel = text.match(
+    /合計金額（消費税込）[^0-9]{0,120}([\d,]+)\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)/,
+  );
+  if (!text.trim() || !numsAfterLabel) {
+    return {
+      platform_code: "kadokawa",
+      sales_month: null,
+      settlement_month: null,
+      records: [],
+      errors: [`kadokawa: could not extract totals from 支払通知書 PDF (${filename})`],
+    };
+  }
+  const totalIncl = Number(numsAfterLabel[1].replace(/,/g, ""));
+  const withholding = Number(numsAfterLabel[2].replace(/,/g, ""));
+  const payMonth = findMonth(text, [/支払日\s*(\d{4})年(\d{1,2})月/]);
+  const payDay = text.match(/支払日\s*(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  const payIso = payDay
+    ? `${payDay[1]}-${payDay[2].padStart(2, "0")}-${payDay[3].padStart(2, "0")}`
+    : null;
+  const salesMonth = payIso ? periodEndBefore(payIso) : null;
+
+  return {
+    platform_code: "kadokawa",
+    sales_month: salesMonth,
+    settlement_month: payMonth,
+    records: [
+      buildSummaryRecord({
+        platform_code: "kadokawa",
+        raw_title: `KADOKAWA 支払通知書 ${payMonth ?? ""}`.trim(),
+        source_file_kind: "payment_notice_pdf",
+        client_code: aliases.client_code,
+        channel_code: aliases.channel_code,
+        sales_month: salesMonth,
+        settlement_month: payIso ?? payMonth,
+        amounts: { tax_incl: totalIncl },
+        withholding_tax_jpy: withholding,
+        note1: "kadokawa: 支払通知書 PDF summary — line items come from the CSV twin",
+      }),
+    ],
+    errors: [],
+  };
+}
+
 export async function parseKadokawa({ buffer, filename }: { filename: string; buffer: Buffer }): Promise<ParseResult> {
   const errors: string[] = [];
 
-  // Only the CSV is a line-item source. PDF has the same data but harder.
+  // RIVERSE-issued MG / 定価差額 invoices (PDF + XLSX twins).
+  if (/【請求書】/.test(filename)) {
+    const ctx = {
+      platform_code: "kadokawa",
+      client_code: aliases.client_code,
+      channel_code: aliases.channel_code,
+      type: "OTHER",
+      note: "kadokawa: RIVERSE→KADOKAWA invoice (MG/定価差額)",
+    };
+    return /\.pdf$/i.test(filename)
+      ? parseInvoicePdf(filename, buffer, ctx)
+      : parseInvoiceXlsx(filename, buffer, ctx);
+  }
+
+  // 支払通知書 PDF — same statement as the CSV; emit a file-level summary
+  // record so the file is represented (the CSV stays the line-item source).
+  if (/\.pdf$/i.test(filename)) {
+    return parseKadokawaNoticePdf(filename, buffer);
+  }
+
+  // Only the CSV is a line-item source.
   const isCsv = /\.csv$/i.test(filename);
   if (!isCsv) {
     return {
