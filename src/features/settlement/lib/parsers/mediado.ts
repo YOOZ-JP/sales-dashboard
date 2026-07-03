@@ -37,6 +37,7 @@
  */
 import type { ParseResult, RawRecord } from "@/features/settlement/lib/schema/sales";
 import { readWorkbook, sheetToMatrix } from "./common";
+import iconv from "iconv-lite";
 
 interface TsvRow {
   販売月: string;
@@ -81,7 +82,7 @@ export async function parseMediado({
   const kind = detectKind(folderName, filename);
   const rows = /\.xlsx$/i.test(filename)
     ? parseWorkbookRows(buffer)
-    : parseTsv(buffer.toString("utf-8").replace(/^\uFEFF/, ""));
+    : parseTsv(decodeTsv(buffer));
   if (rows.length === 0) {
     errors.push("no data rows parsed from TSV");
   }
@@ -212,6 +213,12 @@ function parseTsv(text: string): TsvRow[] {
     out.push(row as unknown as TsvRow);
   }
   return out;
+}
+
+function decodeTsv(buffer: Buffer): string {
+  const utf8 = buffer.toString("utf-8").replace(/^\uFEFF/, "");
+  if (!utf8.includes("�") && utf8.includes("販売月")) return utf8;
+  return iconv.decode(buffer, "shift_jis").replace(/^\uFEFF/, "");
 }
 
 function parseWorkbookRows(buffer: Buffer): TsvRow[] {

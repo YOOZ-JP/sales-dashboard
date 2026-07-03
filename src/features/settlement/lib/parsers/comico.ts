@@ -251,8 +251,8 @@ export async function parseComico({ filename, buffer }: { filename: string; buff
 
   // Use filename yyyymm for settlement month (the settlement is one month
   // after the sales month of the platform-sales rows).
-  const m = filename.match(/(\d{4})(\d{2})/);
-  const settlementFromFilename = m ? `${m[1]}-${String(Number(m[2]) + 1).padStart(2, "0")}-01` : null;
+  const m = filename.match(/(20\d{2})(0[1-9]|1[0-2])/);
+  const settlementFromFilename = m ? `${m[1]}-${m[2]}-01` : null;
 
   // "sales_month" at parse level is a hint only — per-record sales_month lives
   // inside `data`. We report the newest observed platform month here.

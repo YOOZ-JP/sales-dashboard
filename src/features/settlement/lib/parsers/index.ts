@@ -10,6 +10,7 @@
  */
 import type { ParseResult } from "@/features/settlement/lib/schema/sales";
 import { detectPlatform } from "./registry";
+import { readWorkbook } from "./common";
 
 // Lightweight parsers — safe to eager-import.
 import { parseCmoa } from "./cmoa";
@@ -78,7 +79,8 @@ export async function parseFile(opts: {
   headerSample?: string[];
   sheetNames?: string[];
 }): Promise<ParseResult & { detection_confidence: number }> {
-  const detection = detectPlatform(opts);
+  const sheetNames = opts.sheetNames ?? safeSheetNames(opts.filename, opts.buffer);
+  const detection = detectPlatform({ ...opts, sheetNames });
   const code = detection.platform_code;
 
   const eager = EAGER[code];
@@ -102,6 +104,15 @@ export async function parseFile(opts: {
     folderName: opts.folderName,
   });
   return { ...result, detection_confidence: detection.confidence };
+}
+
+function safeSheetNames(filename: string, buffer: Buffer): string[] {
+  if (!/\.(xlsx|xls)$/i.test(filename)) return [];
+  try {
+    return readWorkbook(buffer).SheetNames;
+  } catch {
+    return [];
+  }
 }
 
 // Re-export for callers that still look at the registry / detection directly.

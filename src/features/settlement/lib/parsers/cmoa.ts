@@ -117,6 +117,7 @@ interface N1100Row {
 interface N1399Row {
   "タイトルID": string;
   "タイトル名": string;
+  "作者名": string;
   "話巻区分": string;
   "メニュー区分": string;
   "単価": string;
@@ -160,6 +161,9 @@ export async function parseCmoa({ filename, buffer }: { filename: string; buffer
   }
 
   if (isN1399) {
+    if (/_dl_/i.test(filename)) {
+      return parseN1399DetailAsRecords(filename, buffer, salesMonth);
+    }
     // Detail file — produce no records (to avoid double counting against N1100).
     // Expose errors describing this so the verification harness can see it.
     return {
@@ -167,7 +171,7 @@ export async function parseCmoa({ filename, buffer }: { filename: string; buffer
       sales_month: salesMonth,
       settlement_month: salesMonth,
       records: [],
-      errors: ["cmoa: N1399 detail file is a cross-check for N1100 and emits no rows"],
+      errors: ["cmoa: N1399 meisai detail file is a cross-check for N1100 and emits no rows"],
     };
   }
 
@@ -190,17 +194,18 @@ function extractSalesMonth(filename: string): string | null {
  * to computing after_tax_jpy from N1100 alone (which contains only 支払額, so
  * after_tax_jpy will be null/0 — the GT value is then unavailable).
  */
-export function aggregateN1399Detail(rows: N1399Row[]): Map<string, { after_tax_jpy: number; units: number; rs_rate: number }> {
-  const out = new Map<string, { after_tax_jpy: number; units: number; rs_rate: number }>();
+export function aggregateN1399Detail(rows: N1399Row[]): Map<string, { after_tax_jpy: number; units: number; rs_rate: number; payment_jpy: number }> {
+  const out = new Map<string, { after_tax_jpy: number; units: number; rs_rate: number; payment_jpy: number }>();
   for (const r of rows) {
     const t = normalizeCmoaTitle((r["タイトル名"] ?? "").trim());
     if (!t) continue;
     const price = toNumber(r["単価"]);
     const count = toNumber(r["件数"]);
     const rate = toNumber(r["料率"]);
-    const prev = out.get(t) ?? { after_tax_jpy: 0, units: 0, rs_rate: 0 };
+    const prev = out.get(t) ?? { after_tax_jpy: 0, units: 0, rs_rate: 0, payment_jpy: 0 };
     prev.after_tax_jpy += price * count;
     prev.units += count;
+    prev.payment_jpy += toNumber(r["支払額"]);
     // 料率 is a whole number like "40.0" — the cmoa effective RS rate.
     if (rate > 0) prev.rs_rate = rate / 100;
     out.set(t, prev);
@@ -208,7 +213,7 @@ export function aggregateN1399Detail(rows: N1399Row[]): Map<string, { after_tax_
   return out;
 }
 
-function tryLoadDetail(n1100Filename: string): Map<string, { after_tax_jpy: number; units: number; rs_rate: number }> | null {
+function tryLoadDetail(n1100Filename: string): Map<string, { after_tax_jpy: number; units: number; rs_rate: number; payment_jpy: number }> | null {
   // Sibling file: replace N1100…meisai_ALL with N1399…meisai_M_Basic-ALL_contents.
   // We try the RAW folder based on the filename month.
   const monthMatch = n1100Filename.match(/_N1100_(\d{6})_/);
@@ -236,11 +241,74 @@ function tryLoadDetail(n1100Filename: string): Map<string, { after_tax_jpy: numb
   return null;
 }
 
+function parseN1399DetailAsRecords(
+  _filename: string,
+  buffer: Buffer,
+  salesMonth: string | null,
+): ParseResult {
+  const text = decodeShiftJis(buffer);
+  const parsed = Papa.parse<N1399Row>(text, { header: true, delimiter: "\t", skipEmptyLines: true });
+  const byTitle = aggregateN1399Detail(parsed.data);
+  const rowsByTitle = new Map<string, N1399Row>();
+  for (const row of parsed.data) {
+    const title = normalizeCmoaTitle((row["タイトル名"] ?? "").trim());
+    if (title && !rowsByTitle.has(title)) rowsByTitle.set(title, row);
+  }
+
+  const records: ParseResult["records"] = [];
+  let rowIdx = 0;
+  for (const [channelTitle, agg] of byTitle.entries()) {
+    const sample = rowsByTitle.get(channelTitle);
+    if (!sample || agg.after_tax_jpy === 0 && agg.units === 0) continue;
+    const type = classifyCmoaType(channelTitle);
+    const after_tax_jpy = Math.round(agg.after_tax_jpy);
+    const rs_rate = agg.rs_rate || DEFAULT_RS;
+    const before_tax_income_jpy = Math.floor(agg.payment_jpy || after_tax_jpy * rs_rate);
+    const total_amount_jpy = Math.round(after_tax_jpy * TAX_MULT);
+    const before_tax_jpy = total_amount_jpy;
+    const consumption_tax_jpy = Math.round(before_tax_income_jpy * 0.10);
+    const after_tax_income_jpy = before_tax_income_jpy;
+    records.push({
+      row_index: rowIdx++,
+      data: {
+        sales_month: salesMonth,
+        channel_title_jp: channelTitle,
+        title_jp: channelTitle,
+        author: (sample["作者名"] ?? "").trim() || null,
+        type,
+        distribution_strategy: "non-ex",
+        channel_code: "cmoa",
+        client_code: "nttsolmare",
+        rs_rate,
+        total_amount_jpy,
+        fee_jpy: 0,
+        before_tax_jpy,
+        after_tax_jpy,
+        before_tax_income_jpy,
+        withholding_tax_jpy: 0,
+        consumption_tax_jpy,
+        after_tax_income_jpy,
+        raw_units: agg.units,
+        raw_title: channelTitle,
+        source_file_kind: "N1399_dl",
+      },
+    });
+  }
+
+  return {
+    platform_code: "cmoa",
+    sales_month: salesMonth,
+    settlement_month: salesMonth,
+    records,
+    errors: [],
+  };
+}
+
 function parseN1100(
   _filename: string,
   buffer: Buffer,
   salesMonth: string | null,
-  detail: Map<string, { after_tax_jpy: number; units: number; rs_rate: number }> | null,
+  detail: Map<string, { after_tax_jpy: number; units: number; rs_rate: number; payment_jpy: number }> | null,
 ): ParseResult {
   const text = decodeShiftJis(buffer);
   const parsed = Papa.parse<N1100Row>(text, { header: true, delimiter: "\t", skipEmptyLines: true });

@@ -18,7 +18,7 @@ export interface PlatformSignature {
 export const SIGNATURES: PlatformSignature[] = [
   {
     code: "cmoa",
-    filenamePatterns: [/CD\d+_N\d+_\d+_.*(支払案内書|meisai)/i, /cmoa/i],
+    filenamePatterns: [/CD\d+_N\d+_\d{6}_.*(支払案内書|meisai|dl)/i, /cmoa/i],
     headerKeywords: ["作品ID", "サービス区分"],
     weight: 10,
   },
@@ -26,6 +26,7 @@ export const SIGNATURES: PlatformSignature[] = [
     code: "mbj",
     filenamePatterns: [
       /Apple Books/i,
+      /yodobashi\.com/i,
       /アニメイトブックストア/,
       /PF_\d+_RIVERSE_\d+_支払通知書/i,
     ],
@@ -72,7 +73,8 @@ export const SIGNATURES: PlatformSignature[] = [
   },
   {
     code: "comico",
-    filenamePatterns: [/^2026\d{2}\.xlsx$/, /comico/i],
+    filenamePatterns: [/^2026\d{2}\.xlsx$/, /comico/i, /^statement_\d+\.xlsx$/i],
+    sheetPatterns: [/プラットフォーム売上現況/, /精算書\(JP\)/],
     weight: 5,
   },
   {
@@ -152,7 +154,7 @@ export function detectPlatform(opts: {
   headerSample?: string[];
   sheetNames?: string[];
 }): PlatformDetection {
-  const { filename, folderName, headerSample = [] } = opts;
+  const { filename, folderName, headerSample = [], sheetNames = [] } = opts;
   const signals: string[] = [];
   const scores: Record<string, { score: number; reasons: string[] }> = {};
 
@@ -180,6 +182,16 @@ export function detectPlatform(opts: {
         if (headerSample.some(h => h && String(h).includes(kw))) {
           score += 2;
           reasons.push(`header~${kw}`);
+        }
+      }
+    }
+
+    // Sheet name match for workbook packages whose filenames are generic.
+    if (sig.sheetPatterns) {
+      for (const pat of sig.sheetPatterns) {
+        if (sheetNames.some((name) => pat.test(name))) {
+          score += (sig.weight ?? 1) * 5;
+          reasons.push(`sheet~${pat.source}`);
         }
       }
     }
