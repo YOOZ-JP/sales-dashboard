@@ -233,6 +233,7 @@ export async function workbookBufferToPreview(
       columnCount: totalCols,
       rows,
       ...(styles.length > 0 ? { styles } : {}),
+      merges: ((ws.model as { merges?: string[] }).merges ?? []).filter((range) => typeof range === "string"),
       ...(hasColumnWidth ? { columnWidths } : {}),
       ...(hasRowHeight ? { rowHeights } : {}),
     };

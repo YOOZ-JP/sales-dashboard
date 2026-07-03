@@ -22,6 +22,7 @@ export type PreviewSheet = {
   rowCount: number;
   columnCount: number;
   rows: PreviewCell[][];
+  merges?: string[];
   styles?: PreviewStyle[];
   columnWidths?: (number | null)[];
   rowHeights?: (number | null)[];
@@ -53,6 +54,48 @@ function columnLetter(index: number): string {
     n = Math.floor((n - 1) / 26);
   }
   return label;
+}
+
+function columnIndex(label: string): number {
+  let n = 0;
+  for (const ch of label.toUpperCase()) {
+    const code = ch.charCodeAt(0);
+    if (code < 65 || code > 90) return 0;
+    n = n * 26 + (code - 64);
+  }
+  return n;
+}
+
+function parseCellRef(ref: string): { row: number; col: number } | null {
+  const m = ref.match(/^([A-Z]+)(\d+)$/i);
+  if (!m) return null;
+  const col = columnIndex(m[1]);
+  const row = Number(m[2]);
+  return row > 0 && col > 0 ? { row: row - 1, col: col - 1 } : null;
+}
+
+function buildMergeMaps(merges: string[] | undefined, shownRows: number, shownCols: number) {
+  const masters = new Map<string, { rowSpan: number; colSpan: number }>();
+  const covered = new Set<string>();
+  for (const range of merges ?? []) {
+    const [fromRaw, toRaw] = range.split(':');
+    if (!fromRaw || !toRaw) continue;
+    const from = parseCellRef(fromRaw);
+    const to = parseCellRef(toRaw);
+    if (!from || !to) continue;
+    const r1 = Math.min(from.row, to.row);
+    const r2 = Math.min(Math.max(from.row, to.row), shownRows - 1);
+    const c1 = Math.min(from.col, to.col);
+    const c2 = Math.min(Math.max(from.col, to.col), shownCols - 1);
+    if (r1 >= shownRows || c1 >= shownCols || r2 < r1 || c2 < c1) continue;
+    masters.set(`${r1}:${c1}`, { rowSpan: r2 - r1 + 1, colSpan: c2 - c1 + 1 });
+    for (let r = r1; r <= r2; r += 1) {
+      for (let c = c1; c <= c2; c += 1) {
+        if (r !== r1 || c !== c1) covered.add(`${r}:${c}`);
+      }
+    }
+  }
+  return { masters, covered };
 }
 
 function formatCell(cell: PreviewCell): string {
@@ -121,6 +164,7 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
   const tableStyle: CSSProperties | undefined = hasWidths
     ? { tableLayout: 'fixed', width: ROW_HEADER_WIDTH + colPx.reduce((a, b) => a + b, 0) }
     : undefined;
+  const mergeMaps = buildMergeMaps(sheet.merges, shownRows, shownCols);
 
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
@@ -184,18 +228,25 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
                 <th className="sticky left-0 z-10 border border-slate-200 bg-slate-100 px-2 py-1 text-right font-normal text-slate-500">
                   {rIdx + 1}
                 </th>
-                {row.map((cell, cIdx) => (
-                  <td
-                    key={cIdx}
-                    title={cell.formula ? `=${cell.formula}` : undefined}
-                    style={cellCss(cell, sheet.styles)}
-                    className={`overflow-hidden whitespace-nowrap border border-slate-200 px-2 py-1 text-slate-800 ${
-                      typeof cell.value === 'number' ? 'text-right tabular-nums' : ''
-                    }`}
-                  >
-                    {formatCell(cell)}
-                  </td>
-                ))}
+                {row.map((cell, cIdx) => {
+                  const key = `${rIdx}:${cIdx}`;
+                  if (mergeMaps.covered.has(key)) return null;
+                  const merge = mergeMaps.masters.get(key);
+                  return (
+                    <td
+                      key={cIdx}
+                      rowSpan={merge?.rowSpan}
+                      colSpan={merge?.colSpan}
+                      title={cell.formula ? `=${cell.formula}` : undefined}
+                      style={cellCss(cell, sheet.styles)}
+                      className={`overflow-hidden whitespace-nowrap border border-slate-200 px-2 py-1 text-slate-800 ${
+                        typeof cell.value === 'number' ? 'text-right tabular-nums' : ''
+                      }`}
+                    >
+                      {formatCell(cell)}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
