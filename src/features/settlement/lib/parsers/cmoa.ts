@@ -162,7 +162,13 @@ export async function parseCmoa({ filename, buffer }: { filename: string; buffer
 
   if (isN1399) {
     if (/_dl_/i.test(filename)) {
-      return parseN1399DetailAsRecords(filename, buffer, salesMonth);
+      return {
+        platform_code: "cmoa",
+        sales_month: salesMonth,
+        settlement_month: salesMonth,
+        records: [],
+        errors: ["cmoa: N1399 download detail file is a supporting detail and emits no INPUT rows"],
+      };
     }
     // Detail file — produce no records (to avoid double counting against N1100).
     // Expose errors describing this so the verification harness can see it.
@@ -239,69 +245,6 @@ function tryLoadDetail(n1100Filename: string): Map<string, { after_tax_jpy: numb
     }
   }
   return null;
-}
-
-function parseN1399DetailAsRecords(
-  _filename: string,
-  buffer: Buffer,
-  salesMonth: string | null,
-): ParseResult {
-  const text = decodeShiftJis(buffer);
-  const parsed = Papa.parse<N1399Row>(text, { header: true, delimiter: "\t", skipEmptyLines: true });
-  const byTitle = aggregateN1399Detail(parsed.data);
-  const rowsByTitle = new Map<string, N1399Row>();
-  for (const row of parsed.data) {
-    const title = normalizeCmoaTitle((row["タイトル名"] ?? "").trim());
-    if (title && !rowsByTitle.has(title)) rowsByTitle.set(title, row);
-  }
-
-  const records: ParseResult["records"] = [];
-  let rowIdx = 0;
-  for (const [channelTitle, agg] of byTitle.entries()) {
-    const sample = rowsByTitle.get(channelTitle);
-    if (!sample || agg.after_tax_jpy === 0 && agg.units === 0) continue;
-    const type = classifyCmoaType(channelTitle);
-    const after_tax_jpy = Math.round(agg.after_tax_jpy);
-    const rs_rate = agg.rs_rate || DEFAULT_RS;
-    const before_tax_income_jpy = Math.floor(agg.payment_jpy || after_tax_jpy * rs_rate);
-    const total_amount_jpy = Math.round(after_tax_jpy * TAX_MULT);
-    const before_tax_jpy = total_amount_jpy;
-    const consumption_tax_jpy = Math.round(before_tax_income_jpy * 0.10);
-    const after_tax_income_jpy = before_tax_income_jpy;
-    records.push({
-      row_index: rowIdx++,
-      data: {
-        sales_month: salesMonth,
-        channel_title_jp: channelTitle,
-        title_jp: channelTitle,
-        author: (sample["作者名"] ?? "").trim() || null,
-        type,
-        distribution_strategy: "non-ex",
-        channel_code: "cmoa",
-        client_code: "nttsolmare",
-        rs_rate,
-        total_amount_jpy,
-        fee_jpy: 0,
-        before_tax_jpy,
-        after_tax_jpy,
-        before_tax_income_jpy,
-        withholding_tax_jpy: 0,
-        consumption_tax_jpy,
-        after_tax_income_jpy,
-        raw_units: agg.units,
-        raw_title: channelTitle,
-        source_file_kind: "N1399_dl",
-      },
-    });
-  }
-
-  return {
-    platform_code: "cmoa",
-    sales_month: salesMonth,
-    settlement_month: salesMonth,
-    records,
-    errors: [],
-  };
 }
 
 function parseN1100(

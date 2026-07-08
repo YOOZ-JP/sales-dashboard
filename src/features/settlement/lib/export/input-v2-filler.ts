@@ -169,6 +169,14 @@ function cloneStyle(style: Partial<ExcelJS.Style> | undefined): Partial<ExcelJS.
   return style ? JSON.parse(JSON.stringify(style)) as Partial<ExcelJS.Style> : undefined;
 }
 
+function collapseArrayFormulaRanges(formula: string, rowIdx: number): string {
+  // ExcelJS exposes some template array formulas as a single-cell formula with
+  // vertical ranges (e.g. T6:T2023). Writing that back as a normal cell formula
+  // makes desktop Excel repair/remove formulas. Convert only those vertical
+  // same-column array ranges to the current row's scalar cell reference.
+  return formula.replace(/(\$?[A-Z]{1,3})\$?\d+:\1\$?\d+/g, (_m, col) => `${col}${rowIdx}`);
+}
+
 function captureTemplate(ws: ExcelJS.Worksheet, maxCol: number) {
   const row = ws.getRow(FIRST_DATA_ROW);
   const styles: Array<Partial<ExcelJS.Style> | undefined> = [];
@@ -177,9 +185,14 @@ function captureTemplate(ws: ExcelJS.Worksheet, maxCol: number) {
     const cell = row.getCell(c);
     styles[c] = cloneStyle(cell.style);
     const val = cell.value;
-    formulas[c] = val && typeof val === "object" && "formula" in val
-      ? (val as ExcelJS.CellFormulaValue).formula ?? null
-      : null;
+    if (val && typeof val === "object" && "formula" in val) {
+      const formula = (val as ExcelJS.CellFormulaValue).formula ?? null;
+      formulas[c] = formula && "shareType" in val && val.shareType === "array"
+        ? collapseArrayFormulaRanges(formula, FIRST_DATA_ROW)
+        : formula;
+    } else {
+      formulas[c] = null;
+    }
   }
   return { styles, formulas };
 }
@@ -209,9 +222,11 @@ function writeRecord(
 ) {
   const values: Record<number, Prim> = {
     [col.unique_identifier]: str(rec, "unique_identifier", "unique_id"),
-    [col.channel_title_jp]: str(rec, "channel_title_jp"),
-    [col.title_kr]: str(rec, "title_kr"),
-    [col.title_jp]: str(rec, "title_jp"),
+    [col.channel_title_jp]: str(rec, "channel_title_jp", "title_jp"),
+    // Keep preview/export readable when the title master does not yet have a
+    // Korean mapping for a newly seen Japanese title; never leave title cells blank.
+    [col.title_kr]: str(rec, "title_kr", "title_jp", "channel_title_jp"),
+    [col.title_jp]: str(rec, "title_jp", "channel_title_jp"),
     [col.updated]: toDate(pick(rec, "updated_at", "updated")),
     [col.recoder]: str(rec, "recoder"),
     [col.company]: str(rec, "company") ?? "RJ",

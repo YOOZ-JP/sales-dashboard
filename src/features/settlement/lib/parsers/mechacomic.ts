@@ -28,7 +28,7 @@
  *     alias override — captured in data/aliases/mechacomic.json.
  */
 import type { ParseResult, RawRecord } from "@/features/settlement/lib/schema/sales";
-import { readWorkbook, sheetToMatrix } from "./common";
+import ExcelJS from "exceljs";
 
 // Static alias overrides for the handful of ambiguous 巻 (volume) rows where
 // the default EP/EB heuristic can't tell. Keyed by `${series}|${kind}`.
@@ -60,16 +60,16 @@ export async function parseMechacomic({
   filename: string;
   buffer: Buffer;
 }): Promise<ParseResult> {
-  const wb = readWorkbook(buffer);
   const errors: string[] = [];
   const groups = new Map<string, Group>();
+  const matrices = await readDetailMatrices(buffer);
 
   for (const sheetName of DETAIL_SHEETS) {
-    if (!wb.Sheets[sheetName]) {
+    const matrix = matrices.get(sheetName);
+    if (!matrix) {
       errors.push(`missing sheet: ${sheetName}`);
       continue;
     }
-    const matrix = sheetToMatrix(wb, sheetName);
     const headerIdx = findHeaderRow(matrix);
     if (headerIdx < 0) {
       errors.push(`${sheetName}: could not find header row`);
@@ -180,6 +180,49 @@ export async function parseMechacomic({
     records,
     errors,
   };
+}
+
+async function readDetailMatrices(buffer: Buffer): Promise<Map<string, unknown[][]>> {
+  // The 202606 めちゃコミック workbook has very large sheet XML parts.
+  // SheetJS can try to materialize an over-sized string for that file and throw
+  // ERR_STRING_TOO_LONG before parsing starts. ExcelJS streams the workbook
+  // object model without that string expansion, while preserving the same cell
+  // values we need for the two detail sheets.
+  const wb = new ExcelJS.Workbook();
+  const arrayBuffer = buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength,
+  ) as ArrayBuffer;
+  await wb.xlsx.load(arrayBuffer);
+  const matrices = new Map<string, unknown[][]>();
+  for (const sheetName of DETAIL_SHEETS) {
+    const ws = wb.getWorksheet(sheetName);
+    if (!ws) continue;
+    const matrix: unknown[][] = [];
+    ws.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+      const values = Array.isArray(row.values) ? row.values.slice(1) : [];
+      matrix[rowNumber - 1] = values.map((cell) => normalizeExcelJsCell(cell));
+    });
+    matrices.set(sheetName, matrix);
+  }
+  return matrices;
+}
+
+function normalizeExcelJsCell(cell: unknown): unknown {
+  if (cell == null) return null;
+  if (cell instanceof Date) return cell;
+  if (typeof cell !== "object") return cell;
+  const c = cell as {
+    result?: unknown;
+    text?: string;
+    richText?: Array<{ text?: string }>;
+    formula?: string;
+    hyperlink?: string;
+  };
+  if (c.result != null) return c.result;
+  if (c.text != null) return c.text;
+  if (Array.isArray(c.richText)) return c.richText.map((part) => part.text ?? "").join("");
+  return String(cell);
 }
 
 /**

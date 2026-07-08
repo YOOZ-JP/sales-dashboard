@@ -149,6 +149,9 @@ export async function parseMbj({
   const records: RawRecord[] = [];
   let idx = 0;
   for (const g of groups.values()) {
+    const series = g.type === "EP" && !g.series.includes("【分冊版】")
+      ? `${g.series}【分冊版】`
+      : g.series;
     const total = Math.round(g.sales * 1.10);
     const beforeTaxIncome = Math.floor(g.pay * 1.10);
     const consumptionTax = beforeTaxIncome - g.pay;
@@ -167,8 +170,8 @@ export async function parseMbj({
     records.push({
       row_index: idx++,
       data: {
-        title_jp: g.series,
-        channel_title_jp: g.series,
+        title_jp: series,
+        channel_title_jp: series,
         type: g.type,
         total_amount_jpy: total,
         before_tax_jpy: total,
@@ -238,7 +241,7 @@ function findHeaderRow(matrix: unknown[][]): number {
 function normalizeSeries(title: string): string {
   let t = title.trim();
   // Remove trailing 第N話 or 第N.M話 etc. Can have full/half-width digits.
-  t = t.replace(/第[０-９\d]+(?:[．.][０-９\d]+)?話\s*$/u, "").trim();
+  t = t.replace(/第[０-９\d]+(?:[．.][０-９\d]+)?話(?:外伝[０-９\d]+)?\s*$/u, "").trim();
   // Remove trailing volume marker like （１）, （10）, （１～３）.
   t = t.replace(/（[０-９\d]+(?:[～〜-][０-９\d]+)?）\s*$/u, "").trim();
   return t;
@@ -250,8 +253,9 @@ function normalizeSeries(title: string): string {
  */
 function resolveType(d: DetailRow): string {
   const fmt = (d.format || "").toLowerCase();
-  if (fmt.includes("webtoon")) return "WT";
   if (d.title.includes("【分冊版】")) return "EP";
+  if (/第[０-９\d]+(?:[．.][０-９\d]+)?話/u.test(d.title)) return "EP";
+  if (fmt.includes("webtoon")) return "WT";
   // Volume suffix detection
   if (/（[０-９\d]+(?:[～〜-][０-９\d]+)?）/.test(d.title)) return "EB";
   // Full-edition / special edition markers without a volume suffix still ship

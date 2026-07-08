@@ -14,6 +14,7 @@
 import { z } from "zod";
 import type { ParseResult } from "@/features/settlement/lib/schema/sales";
 import { extractPdfWithAI } from "./ai-pdf";
+import { parseInvoicePdf, parseInvoiceXlsx } from "./invoice-common";
 
 const TAX_RATE = 0.10;
 
@@ -62,11 +63,30 @@ Only return what is clearly printed.`;
 const METADATA_TITLE = /配信分|電子書籍[/／]|小計|合計|\bGA\b/;
 
 export async function parseSbCreative({
+  filename,
   buffer,
 }: {
   filename: string;
   buffer: Buffer;
 }): Promise<ParseResult> {
+  if (/【請求書】SBクリエイティブ様/.test(filename)) {
+    const ctx = {
+      platform_code: "sb_creative",
+      client_code: "sb_creative",
+      channel_code: "sb_creative",
+      type: "OTHER",
+      note: "sb_creative invoice summary — non-aggregated evidence row",
+    };
+    const result = await (/\.pdf$/i.test(filename)
+      ? parseInvoicePdf(filename, buffer, ctx)
+      : parseInvoiceXlsx(filename, buffer, ctx));
+    for (const record of result.records) {
+      record.data.is_summary = true;
+      record.data.source_file_kind = record.data.source_file_kind ?? "sb_creative_invoice";
+    }
+    return result;
+  }
+
   const errors: string[] = [];
   let data: z.infer<typeof SB_SCHEMA>;
   try {

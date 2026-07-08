@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useApp } from '@/context/AppContext';
 
 export type PreviewStyle = {
@@ -116,6 +116,8 @@ function formatGeneratedAt(iso: string): string {
 const SAFE_HEX = /^#[0-9A-F]{6}$/i;
 
 const ROW_HEADER_WIDTH = 44;
+const VIRTUAL_ROW_HEIGHT = 25;
+const VIRTUAL_OVERSCAN_ROWS = 24;
 
 /** Excel column width (character units) → CSS px (Calibri-11 approximation; 8.43 chars ≈ 64px). */
 function columnWidthPx(width: number | null | undefined): number {
@@ -126,6 +128,17 @@ function columnWidthPx(width: number | null | undefined): number {
 /** Excel row height is in points; CSS px = pt × 4/3. */
 function rowHeightPx(height: number | null | undefined): number | undefined {
   return typeof height === 'number' && height > 0 ? Math.round((height * 4) / 3) : undefined;
+}
+
+function findRowForOffset(prefixHeights: number[], offset: number): number {
+  let lo = 0;
+  let hi = Math.max(0, prefixHeights.length - 1);
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    if (prefixHeights[mid] <= offset) lo = mid;
+    else hi = mid - 1;
+  }
+  return Math.min(lo, Math.max(0, prefixHeights.length - 2));
 }
 
 function cellCss(cell: PreviewCell, styles?: PreviewStyle[]): CSSProperties | undefined {
@@ -142,18 +155,52 @@ function cellCss(cell: PreviewCell, styles?: PreviewStyle[]): CSSProperties | un
 
 export default function InputPreviewTable({ preview, activeSheet, onSheetChange }: InputPreviewTableProps) {
   const { t } = useApp();
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(720);
 
   const sheet = useMemo(
-    () => preview.sheets.find((s) => s.name === activeSheet) ?? preview.sheets[0],
+    () => preview.sheets.find((s) => s.name === activeSheet) ?? preview.sheets[0] ?? null,
     [preview.sheets, activeSheet],
   );
+  const sheetName = sheet?.name ?? '';
+  const shownRows = sheet?.rows.length ?? 0;
+  const shownCols = sheet?.rows[0]?.length ?? 0;
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    scroller.scrollTop = 0;
+    const frame = window.requestAnimationFrame(() => setScrollTop(0));
+    return () => window.cancelAnimationFrame(frame);
+  }, [sheetName]);
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const update = () => setViewportHeight(scroller.clientHeight || 720);
+    update();
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(update) : null;
+    ro?.observe(scroller);
+    window.addEventListener('resize', update);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', update);
+    };
+  }, []);
+
+  const rowMetrics = useMemo(() => {
+    const heights = Array.from({ length: shownRows }, (_, i) => rowHeightPx(sheet?.rowHeights?.[i]) ?? VIRTUAL_ROW_HEIGHT);
+    const offsets = [0];
+    for (const height of heights) {
+      offsets.push(offsets[offsets.length - 1] + height);
+    }
+    return { heights, offsets };
+  }, [sheet?.rowHeights, shownRows]);
 
   if (!sheet) {
     return null;
   }
-
-  const shownRows = sheet.rows.length;
-  const shownCols = sheet.rows[0]?.length ?? 0;
 
   // With workbook column widths available, lay the table out exactly like the
   // sheet (fixed layout + explicit pixel widths, long text clipped like Excel).
@@ -164,10 +211,19 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
     ? { tableLayout: 'fixed', width: ROW_HEADER_WIDTH + colPx.reduce((a, b) => a + b, 0) }
     : undefined;
   const mergeMaps = buildMergeMaps(sheet.merges, shownRows, shownCols);
+  const anchorRow = findRowForOffset(rowMetrics.offsets, scrollTop);
+  const visibleStart = Math.max(0, anchorRow - VIRTUAL_OVERSCAN_ROWS);
+  const visibleEnd = Math.min(
+    shownRows,
+    findRowForOffset(rowMetrics.offsets, scrollTop + viewportHeight) + VIRTUAL_OVERSCAN_ROWS + 1,
+  );
+  const visibleRows = sheet.rows.slice(visibleStart, visibleEnd);
+  const topSpacerHeight = rowMetrics.offsets[visibleStart] ?? 0;
+  const bottomSpacerHeight = Math.max(0, (rowMetrics.offsets[shownRows] ?? 0) - (rowMetrics.offsets[visibleEnd] ?? 0));
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
+    <section className="flex min-h-0 flex-1 flex-col rounded-xl border border-slate-200 bg-white p-3 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <div className="flex shrink-0 flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-lg font-bold text-slate-950 dark:text-white">{t('INPUT 미리보기', 'INPUT プレビュー')}</h2>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
           <span>{t('생성', '生成')}: {formatGeneratedAt(preview.generatedAt)}</span>
@@ -177,7 +233,7 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
         </div>
       </div>
 
-      <div className="mt-4 flex flex-wrap gap-2">
+      <div className="mt-3 flex shrink-0 flex-wrap gap-2">
         {preview.sheets.map((s) => {
           const active = s.name === sheet.name;
           return (
@@ -198,7 +254,11 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
 
       {/* The grid keeps a light spreadsheet surface in both themes so cell
           fills/font colors from the workbook read the same as in Excel. */}
-      <div className="mt-4 max-h-[620px] overflow-auto rounded-lg border border-slate-200 bg-white dark:border-slate-800">
+      <div
+        ref={scrollerRef}
+        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+        className="mt-3 min-h-0 flex-1 overflow-auto rounded-lg border border-slate-200 bg-white dark:border-slate-800"
+      >
         <table className="border-collapse text-xs" style={tableStyle}>
           {hasWidths && (
             <colgroup>
@@ -222,37 +282,50 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
             </tr>
           </thead>
           <tbody>
-            {sheet.rows.map((row, rIdx) => (
-              <tr key={rIdx} style={{ height: rowHeightPx(sheet.rowHeights?.[rIdx]) }}>
-                <th className="sticky left-0 z-10 border border-slate-200 bg-slate-100 px-2 py-1 text-right font-normal text-slate-500">
-                  {rIdx + 1}
-                </th>
-                {row.map((cell, cIdx) => {
-                  const key = `${rIdx}:${cIdx}`;
-                  if (mergeMaps.covered.has(key)) return null;
-                  const merge = mergeMaps.masters.get(key);
-                  return (
-                    <td
-                      key={cIdx}
-                      rowSpan={merge?.rowSpan}
-                      colSpan={merge?.colSpan}
-                      title={cell.formula ? `=${cell.formula}` : undefined}
-                      style={cellCss(cell, sheet.styles)}
-                      className={`overflow-hidden whitespace-nowrap border border-slate-200 px-2 py-1 text-slate-800 ${
-                        typeof cell.value === 'number' ? 'text-right tabular-nums' : ''
-                      }`}
-                    >
-                      {formatCell(cell)}
-                    </td>
-                  );
-                })}
+            {topSpacerHeight > 0 && (
+              <tr aria-hidden="true">
+                <td colSpan={shownCols + 1} style={{ height: topSpacerHeight, padding: 0, border: 0 }} />
               </tr>
-            ))}
+            )}
+            {visibleRows.map((row, localIdx) => {
+              const rIdx = visibleStart + localIdx;
+              return (
+                <tr key={rIdx} style={{ height: rowHeightPx(sheet.rowHeights?.[rIdx]) ?? VIRTUAL_ROW_HEIGHT }}>
+                  <th className="sticky left-0 z-10 border border-slate-200 bg-slate-100 px-2 py-1 text-right font-normal text-slate-500">
+                    {rIdx + 1}
+                  </th>
+                  {row.map((cell, cIdx) => {
+                    const key = `${rIdx}:${cIdx}`;
+                    if (mergeMaps.covered.has(key)) return null;
+                    const merge = mergeMaps.masters.get(key);
+                    return (
+                      <td
+                        key={cIdx}
+                        rowSpan={merge?.rowSpan}
+                        colSpan={merge?.colSpan}
+                        title={cell.formula ? `=${cell.formula}` : undefined}
+                        style={cellCss(cell, sheet.styles)}
+                        className={`overflow-hidden whitespace-nowrap border border-slate-200 px-2 py-1 text-slate-800 ${
+                          typeof cell.value === 'number' ? 'text-right tabular-nums' : ''
+                        }`}
+                      >
+                        {formatCell(cell)}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+            {bottomSpacerHeight > 0 && (
+              <tr aria-hidden="true">
+                <td colSpan={shownCols + 1} style={{ height: bottomSpacerHeight, padding: 0, border: 0 }} />
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
 
-      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+      <p className="mt-1 shrink-0 text-xs text-slate-500 dark:text-slate-400">
         {t(
           '미리보기는 생성되는 Excel 파일 전체를 표시하며, 서식(배경색·글자색·정렬·열 너비·병합 셀 등)을 지원 범위 안에서 따릅니다. 수식을 포함한 최종본은 다운로드한 Excel 파일이 기준입니다.',
           'プレビューは生成されるExcelファイル全体を表示し、書式（背景色・文字色・配置・列幅・結合セルなど）を対応範囲内で再現します。数式を含む最終版はダウンロードしたExcelファイルが基準です。',
@@ -261,3 +334,4 @@ export default function InputPreviewTable({ preview, activeSheet, onSheetChange 
     </section>
   );
 }
+

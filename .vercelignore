@@ -1,0 +1,7 @@
+.scratch
+.scratch/**
+.hermes
+.hermes/**
+tmp
+tmp/**
+*.log

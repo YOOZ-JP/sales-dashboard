@@ -60,6 +60,11 @@ function rawToChannelTitle(raw: string): string {
   return canonicalTitle(stripMarkers(raw));
 }
 
+/** Golden INPUT keeps full-width Japanese brackets in emitted titles. */
+function displayTitle(title: string): string {
+  return title.replace(/\[/g, "［").replace(/\]/g, "］");
+}
+
 /** Base key ignoring 完全版 / 改訂版 decorations — used for 完全版-sibling detection. */
 function baseKey(channelTitle: string): string {
   return channelTitle
@@ -173,6 +178,7 @@ export async function parseRenta({ filename, buffer }: { filename: string; buffe
   const records: ParseResult["records"] = [];
   let i = 0;
   for (const a of agg.values()) {
+    const title = displayTitle(a.title_jp);
     const total_amount_jpy = roundHalfUp(a.raw_sales * (1 + TAX_RATE));
     const consumption_tax_jpy = floor(a.raw_pay * TAX_RATE);
     const before_tax_income_jpy = a.raw_pay + consumption_tax_jpy; // = floor(raw_pay * 1.10)
@@ -184,8 +190,8 @@ export async function parseRenta({ filename, buffer }: { filename: string; buffe
         client_code: aliases.client_code,
         channel_code: aliases.channel_code,
         type: a.type,
-        title_jp: a.title_jp,
-        channel_title_jp: a.title_jp,
+        title_jp: title,
+        channel_title_jp: title,
         raw_title: a.title_jp,
         units: a.units,
         units_upgrade: a.units_upgrade,

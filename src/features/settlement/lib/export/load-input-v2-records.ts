@@ -90,6 +90,14 @@ export async function loadInputV2Records(
     }
 
     if (all.length > 0) {
+      // Summary/audit rows preserve evidence from payment notices, invoices,
+      // and generic support-file fallbacks in the DB, but they are not ordinary
+      // INPUT line items and must not be written to the NAKATANI workbook.
+      for (let i = all.length - 1; i >= 0; i -= 1) {
+        const note2 = String(all[i]?.note2 ?? "");
+        if (note2.includes("SUMMARY_NON_AGGREGATED")) all.splice(i, 1);
+      }
+
       const [clientsRes, channelsRes, titlesRes] = await Promise.all([
         supabase.from("clients").select("id, code, display_name"),
         supabase.from("channels").select("id, code"),

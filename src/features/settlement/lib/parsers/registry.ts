@@ -28,6 +28,7 @@ export const SIGNATURES: PlatformSignature[] = [
       /Apple Books/i,
       /yodobashi\.com/i,
       /アニメイトブックストア/,
+      /[ほぼ]るコミ/,
       /PF_\d+_RIVERSE_\d+_支払通知書/i,
     ],
     weight: 10,
@@ -99,7 +100,10 @@ export const SIGNATURES: PlatformSignature[] = [
   },
   {
     code: "sb_creative_m",
-    filenamePatterns: [/\d+_株式会社RIVERSE様【\d+年\d+月】前払印税報告書/],
+    filenamePatterns: [
+      /\d+_株式会社RIVERSE様【\d+年\d+月】前払印税報告書/,
+      /【請求書】SBクリエイティブ様/,
+    ],
     weight: 10,
   },
   {
@@ -132,7 +136,7 @@ export const SIGNATURES: PlatformSignature[] = [
   },
   {
     code: "ichijinsha",
-    filenamePatterns: [/支払通知書\.pdf$/, /詳細別送の内訳/],
+    filenamePatterns: [/支払通知書\.pdf$/, /詳細別送の内訳/, /【請求書】一迅社様/],
     // Folder-based signal is the tiebreaker: `20260331_ICHIJINSHA/`
     weight: 5,
   },

@@ -1,9 +1,8 @@
 'use client';
 
-import { useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FolderOpen, Loader2, RefreshCw, UploadCloud, Trash2 } from 'lucide-react';
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FolderOpen, Loader2, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
-import InputPreviewTable, { type PreviewData } from './InputPreviewTable';
 
 type UploadResult = {
   file?: string;
@@ -25,6 +24,9 @@ function isoToYyyymm(iso: string) {
 }
 
 type ResetResult = Record<string, unknown> & { ok?: boolean; error?: string };
+
+// One platform that already has settlement rows in a month — names only, no amounts/counts.
+type MonthPlatform = { code: string | null; name: string | null };
 
 function toIsoMonth(yyyymm: string) {
   return `${yyyymm.slice(0, 4)}-${yyyymm.slice(4, 6)}-01`;
@@ -163,14 +165,16 @@ export default function SettlementClient() {
   const [progress, setProgress] = useState<{ current: number; total: number; currentFile: string } | null>(null);
   const [resetting, setResetting] = useState(false);
   const [results, setResults] = useState<UploadResult[]>([]);
-  // The detailed per-file table is tall; keep it collapsed so the INPUT
-  // preview below stays the main content after an upload.
+  // The detailed per-file table is tall; keep it collapsed so the summary
+  // stays the main content after an upload.
   const [resultsExpanded, setResultsExpanded] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const [preview, setPreview] = useState<PreviewData | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [activeSheet, setActiveSheet] = useState<string | null>(null);
+  // Which platforms already hold settlement rows, per YYYYMM of the shown
+  // year. null = fetch failed/unavailable; bumping the version refetches
+  // after an upload or reset changed the data.
+  const [monthPlatforms, setMonthPlatforms] = useState<Record<string, MonthPlatform[]> | null>(null);
+  const [monthPlatformsLoading, setMonthPlatformsLoading] = useState(false);
+  const [monthPlatformsVersion, setMonthPlatformsVersion] = useState(0);
 
   const validMonth = /^\d{6}$/.test(month);
   const selectedYear = Number(month.slice(0, 4));
@@ -178,19 +182,31 @@ export default function SettlementClient() {
   const minYear = currentYear - YEAR_RANGE;
   const maxYear = currentYear + YEAR_RANGE;
 
+  useEffect(() => {
+    let cancelled = false;
+    setMonthPlatformsLoading(true);
+    fetch(`/api/settlement/month-platforms?year=${selectedYear}`)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+      .then((json) => {
+        if (!cancelled) setMonthPlatforms((json.months ?? {}) as Record<string, MonthPlatform[]>);
+      })
+      .catch(() => {
+        if (!cancelled) setMonthPlatforms(null);
+      })
+      .finally(() => {
+        if (!cancelled) setMonthPlatformsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedYear, monthPlatformsVersion]);
+
   const monthLabel = (yyyymm: string) =>
     t(`${Number(yyyymm.slice(0, 4))}년 ${Number(yyyymm.slice(4, 6))}월`, `${Number(yyyymm.slice(0, 4))}年${Number(yyyymm.slice(4, 6))}月`);
 
   function changeMonth(next: string) {
     if (next === month) return;
     setMonth(next);
-    // Drop a preview that no longer matches the selected month so nothing stale is shown.
-    if (preview && preview.month !== next) {
-      setPreview(null);
-      setActiveSheet(null);
-    }
-    // An error message always refers to the previously selected month; never keep it.
-    setPreviewError(null);
   }
 
   function changeYear(nextYear: number) {
@@ -198,31 +214,12 @@ export default function SettlementClient() {
     changeMonth(`${nextYear}${month.slice(4, 6)}`);
   }
 
-  async function loadPreview(targetMonth = month) {
-    if (!/^\d{6}$/.test(targetMonth) || previewLoading) return;
-    setPreviewLoading(true);
-    setPreviewError(null);
-    try {
-      const res = await fetch(`/api/settlement/preview-v2/${targetMonth}`);
-      const json = await res.json().catch(() => ({}));
-      if (res.status === 404) {
-        setPreview(null);
-        setActiveSheet(null);
-        setPreviewError(t('업로드 후 미리보기가 생성됩니다.', 'アップロード後にプレビューが生成されます。'));
-        return;
-      }
-      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-      const data = json as PreviewData;
-      setPreview(data);
-      const firstInput = data.sheets.find((s) => s.name.startsWith('input_'));
-      setActiveSheet(firstInput?.name ?? data.sheets[0]?.name ?? null);
-    } catch (err) {
-      setPreview(null);
-      setActiveSheet(null);
-      setPreviewError(`${t('미리보기 실패', 'プレビュー失敗')}: ${(err as Error).message}`);
-    } finally {
-      setPreviewLoading(false);
-    }
+  function openPreviewWindow() {
+    if (!validMonth) return;
+    const url = `/settlement-preview/${month}`;
+    const width = Math.min(1600, window.screen.availWidth || 1600);
+    const height = Math.min(1000, window.screen.availHeight || 1000);
+    window.open(url, `settlement-preview-${month}`, `popup=yes,width=${width},height=${height},left=40,top=40,noopener,noreferrer`);
   }
 
   // Selecting or dropping files IS the upload: no staging list, no upload
@@ -264,11 +261,6 @@ export default function SettlementClient() {
     setMessage(null);
     setResults([]);
     setResultsExpanded(false);
-    // The current preview predates this upload; drop it now so a failed upload
-    // (before loadPreview runs) never leaves stale data on screen.
-    setPreview(null);
-    setActiveSheet(null);
-    setPreviewError(null);
     try {
       const batches = buildBatches(selected);
       // Correlation id for this run: shown in failed rows, kept in the
@@ -375,6 +367,8 @@ export default function SettlementClient() {
         ));
         return;
       }
+      // Rows were written — refresh the month/platform availability panel.
+      setMonthPlatformsVersion((v) => v + 1);
       const parts: string[] = [
         failedRows.length === 0
           ? t(
@@ -390,7 +384,6 @@ export default function SettlementClient() {
         parts.push(t(`읽지 못한 항목 ${unreadable}개는 제외되었습니다.`, `読み込めなかった項目${unreadable}件は除外されました。`));
       }
       setMessage(parts.join(' '));
-      await loadPreview(targetMonth);
     } catch (err) {
       setMessage(`${t('업로드 실패', 'アップロード失敗')}: ${(err as Error).message}`);
     } finally {
@@ -481,9 +474,7 @@ export default function SettlementClient() {
       if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
       setMessage(`${t('초기화 완료', '初期化完了')}: sales_records ${String(json.sales_records_deleted ?? 0)}${t('건 삭제', '件を削除')}`);
       setResults([]);
-      setPreview(null);
-      setActiveSheet(null);
-      setPreviewError(null);
+      setMonthPlatformsVersion((v) => v + 1);
     } catch (err) {
       setMessage(`${t('초기화 실패', '初期化失敗')}: ${(err as Error).message}`);
     } finally {
@@ -543,23 +534,66 @@ export default function SettlementClient() {
 
           <div className="mt-3 grid grid-cols-3 gap-2">
             {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
+              const yyyymm = `${selectedYear}${String(m).padStart(2, '0')}`;
               const active = m === selectedMonthNum;
+              const hasData = (monthPlatforms?.[yyyymm]?.length ?? 0) > 0;
               return (
                 <button
                   key={m}
                   type="button"
-                  onClick={() => changeMonth(`${selectedYear}${String(m).padStart(2, '0')}`)}
+                  onClick={() => changeMonth(yyyymm)}
                   disabled={uploading}
                   className={`${pickerButtonBase} ${
-                    active
-                      ? 'bg-blue-600 text-white shadow-sm'
-                      : 'bg-slate-100 text-slate-700 hover:bg-blue-100 hover:text-blue-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800'
+                    active && hasData
+                      ? 'bg-emerald-600 text-white shadow-sm ring-2 ring-emerald-300 dark:ring-emerald-500'
+                      : active
+                        ? 'bg-blue-600 text-white shadow-sm'
+                        : hasData
+                          ? 'bg-emerald-50 text-emerald-800 ring-1 ring-inset ring-emerald-300 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-200 dark:ring-emerald-800 dark:hover:bg-emerald-950/70'
+                          : 'bg-slate-100 text-slate-700 hover:bg-blue-100 hover:text-blue-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800'
                   }`}
                 >
                   {t(`${m}월`, `${m}月`)}
+                  {hasData && <span aria-hidden className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-current align-middle" />}
                 </button>
               );
             })}
+          </div>
+
+          <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
+              {t(`${monthLabel(month)} 저장된 플랫폼`, `${monthLabel(month)} 保存済みプラットフォーム`)}
+            </p>
+            {monthPlatformsLoading ? (
+              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                <Loader2 className="mr-1 inline h-3 w-3 animate-spin align-[-2px]" />
+                {t('플랫폼 현황을 불러오는 중…', 'プラットフォーム状況を読み込み中…')}
+              </p>
+            ) : monthPlatforms === null ? (
+              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                {t('플랫폼 현황을 불러오지 못했습니다.', 'プラットフォーム状況を読み込めませんでした。')}
+              </p>
+            ) : (monthPlatforms[month]?.length ?? 0) === 0 ? (
+              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                {t('이 달에는 저장된 정산 데이터가 없습니다.', 'この月には保存された精算データはありません。')}
+              </p>
+            ) : (
+              <>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {monthPlatforms[month].map((p, idx) => (
+                    <span
+                      key={`${p.code ?? 'unknown'}-${idx}`}
+                      className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-semibold text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+                    >
+                      {p.name ?? p.code ?? t('미분류', '未分類')}
+                    </span>
+                  ))}
+                </div>
+                <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                  {t('초록색 월은 이미 정산 데이터가 저장된 달입니다.', '緑色の月はすでに精算データが保存されている月です。')}
+                </p>
+              </>
+            )}
           </div>
 
           <p className="mt-4 rounded-lg bg-blue-50 p-3 text-xs leading-relaxed text-blue-900 dark:bg-blue-950/40 dark:text-blue-100">
@@ -618,12 +652,13 @@ export default function SettlementClient() {
               {t('최종 INPUT Excel 다운로드', '最終 INPUT Excel ダウンロード')}
             </a>
             <button
-              onClick={() => loadPreview(month)}
-              disabled={!validMonth || previewLoading}
-              className="inline-flex items-center rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-100"
+              type="button"
+              onClick={openPreviewWindow}
+              disabled={!validMonth}
+              className="inline-flex items-center rounded-lg border border-blue-300 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-800 transition hover:border-blue-500 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200 dark:hover:bg-blue-950"
             >
-              {previewLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-              {t('미리보기 새로고침', 'プレビュー更新')}
+              <ExternalLink className="mr-2 h-4 w-4" />
+              {t('INPUT Excel 미리보기 열기', 'INPUT Excel プレビューを開く')}
             </button>
             <button
               onClick={resetMonth}
@@ -635,14 +670,12 @@ export default function SettlementClient() {
             </button>
           </div>
 
-          {!preview && (
-            <p className="mt-4 text-xs text-slate-500 dark:text-slate-400">
-              {t(
-                '파일을 업로드하면 아래에 생성될 INPUT Excel 미리보기가 표시됩니다.',
-                'ファイルをアップロードすると、下に生成される INPUT Excel プレビューが表示されます。',
-              )}
-            </p>
-          )}
+          <p className="mt-4 text-xs text-slate-500 dark:text-slate-400">
+            {t(
+              '미리보기는 아래에 붙지 않고 별도 창에서 Excel 파일처럼 열립니다.',
+              'プレビューは下に表示せず、別ウィンドウでExcelファイルのように開きます。',
+            )}
+          </p>
         </div>
       </section>
 
@@ -717,16 +750,6 @@ export default function SettlementClient() {
             </ul>
           )}
         </section>
-      )}
-
-      {previewError && !preview && (
-        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 shadow-sm dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-          {previewError}
-        </div>
-      )}
-
-      {preview && activeSheet && (
-        <InputPreviewTable preview={preview} activeSheet={activeSheet} onSheetChange={setActiveSheet} />
       )}
 
       {resultsExpanded && results.length > 0 && (

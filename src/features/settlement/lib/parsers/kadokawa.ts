@@ -148,9 +148,14 @@ export async function parseKadokawa({ buffer, filename }: { filename: string; bu
       type: "OTHER",
       note: "kadokawa: RIVERSE→KADOKAWA invoice (MG/定価差額)",
     };
-    return /\.pdf$/i.test(filename)
+    const result = await (/\.pdf$/i.test(filename)
       ? parseInvoicePdf(filename, buffer, ctx)
-      : parseInvoiceXlsx(filename, buffer, ctx);
+      : parseInvoiceXlsx(filename, buffer, ctx));
+    for (const record of result.records) {
+      record.data.is_summary = true;
+      record.data.source_file_kind = record.data.source_file_kind ?? "kadokawa_invoice";
+    }
+    return result;
   }
 
   // 支払通知書 PDF — same statement as the CSV; emit a file-level summary
@@ -265,6 +270,8 @@ export async function parseKadokawa({ buffer, filename }: { filename: string; bu
         title_jp: title,
         channel_title_jp: title,
         raw_title: title,
+        source_file_kind: "payment_notice_csv",
+        is_summary: true,
         account,
         accounting_date: (r["計上日付"] ?? "").trim() || null,
         before_tax_jpy: detailAmt,
@@ -291,6 +298,8 @@ export async function parseKadokawa({ buffer, filename }: { filename: string; bu
         title_jp: agg.gt_title,
         channel_title_jp: agg.gt_title,
         raw_titles: [...agg.raw_titles],
+        source_file_kind: "payment_notice_csv",
+        is_summary: true,
         months_covered: [...agg.months].sort(),
         before_tax_jpy: beforeTaxIncome,
         after_tax_jpy: afterTaxIncome,

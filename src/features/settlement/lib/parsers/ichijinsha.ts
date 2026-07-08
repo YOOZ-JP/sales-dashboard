@@ -17,6 +17,7 @@
 import { z } from "zod";
 import type { ParseResult } from "@/features/settlement/lib/schema/sales";
 import { extractPdfWithAI } from "./ai-pdf";
+import { parseInvoicePdf, parseInvoiceXlsx } from "./invoice-common";
 import aliases from "../../data/aliases/ichijinsha.json" with { type: "json" };
 
 const TAX_RATE: number = aliases.rules.tax_rate;
@@ -77,6 +78,24 @@ export async function parseIchijinsha({
   buffer: Buffer;
 }): Promise<ParseResult> {
   const errors: string[] = [];
+
+  if (/【請求書】一迅社様/.test(filename)) {
+    const ctx = {
+      platform_code: "ichijinsha",
+      client_code: "ichijinsha",
+      channel_code: "ichijinsha",
+      type: filename.includes("20周年記念") ? "MD" : "EB",
+      note: "ichijinsha invoice summary — non-aggregated evidence row",
+    };
+    const result = await (/\.pdf$/i.test(filename)
+      ? parseInvoicePdf(filename, buffer, ctx)
+      : parseInvoiceXlsx(filename, buffer, ctx));
+    for (const record of result.records) {
+      record.data.is_summary = true;
+      record.data.source_file_kind = record.data.source_file_kind ?? "ichijinsha_invoice";
+    }
+    return result;
+  }
 
   // Cover letter carries no rows — bail early for it.
   if (/支払通知書\.pdf$/i.test(filename) && !/詳細/.test(filename)) {
