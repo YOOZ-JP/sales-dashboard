@@ -1,9 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const REFRESH_COOKIE = "X-REFRESH-TOKEN";
+const CANONICAL_HOST = "rvjp-dashboard.vercel.app";
+const LEGACY_HOSTS = new Set(["rvjp-nextjs.vercel.app"]);
 
 export default async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
+  const host = req.headers.get("host")?.split(":")[0];
+
+  if (host && LEGACY_HOSTS.has(host)) {
+    const canonicalUrl = req.nextUrl.clone();
+    canonicalUrl.protocol = "https";
+    canonicalUrl.hostname = CANONICAL_HOST;
+    canonicalUrl.port = "";
+    return NextResponse.redirect(canonicalUrl, 308);
+  }
+
   const hasRefreshCookie = Boolean(req.cookies.get(REFRESH_COOKIE)?.value);
 
   if (pathname === "/") {
