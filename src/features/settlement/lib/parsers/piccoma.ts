@@ -69,6 +69,10 @@ function excelRound(x: number): number {
   return Math.floor(x + 0.5);
 }
 
+function normalizeRsRate(v: number): number {
+  return v > 1 ? v / 100 : v;
+}
+
 type TypeOverride = "WT" | "WR" | "WN" | "EB" | "EP";
 
 interface PiccomaAliases {
@@ -108,8 +112,16 @@ function classifyKanaType(title: string, column: "話" | "巻"): TypeOverride {
 interface DetailSums {
   /** 話売 per-title sum of 売上(税別) from <話売>精算対象使用件数 */
   sales話: Map<string, number>;
+  /** 話売 per-title sum of 精算金額(税別) from <話売>精算対象使用件数 */
+  settle話: Map<string, number>;
+  /** 話売 per-title average/observed R/S from <話売>精算対象使用件数 */
+  rs話: Map<string, number>;
   /** 巻売 per-title sum of 売上(税別) from <巻売>精算対象使用件数 */
   sales巻: Map<string, number>;
+  /** 巻売 per-title sum of 精算金額(税別) from <巻売>精算対象使用件数 */
+  settle巻: Map<string, number>;
+  /** 巻売 per-title average/observed R/S from <巻売>精算対象使用件数 */
+  rs巻: Map<string, number>;
 }
 
 /** Load the sibling 出版社report detail file if it exists nearby. */
@@ -145,37 +157,125 @@ export function parseDetailBuffer(buffer: Buffer): DetailSums {
   const wb = readWorkbook(buffer);
   const out: DetailSums = {
     sales話: new Map<string, number>(),
+    settle話: new Map<string, number>(),
+    rs話: new Map<string, number>(),
     sales巻: new Map<string, number>(),
+    settle巻: new Map<string, number>(),
+    rs巻: new Map<string, number>(),
   };
+
+  const rsTotals話 = new Map<string, { sum: number; count: number }>();
+  const rsTotals巻 = new Map<string, { sum: number; count: number }>();
 
   const chapSheetName = wb.SheetNames.find(n => /<?話売>?.*精算対象使用件数/.test(n));
   const volSheetName = wb.SheetNames.find(n => /<?巻売>?.*精算対象使用件数/.test(n));
 
   if (chapSheetName) {
     const matrix = sheetToMatrix(wb, chapSheetName);
-    // header row 0; cols: [2] 作品名, [14] 売上(税別)
+    // header row 0; cols: [2] 作品名, [14] 売上(税別), [15] R/S, [16] 精算金額(税別)
     for (let i = 1; i < matrix.length; i++) {
       const r = matrix[i] ?? [];
       const title = r[2];
       if (!title || typeof title !== "string") continue;
       const sales = toNumber(r[14]);
+      const rs = normalizeRsRate(toNumber(r[15]));
+      const settle = toNumber(r[16]);
       out.sales話.set(title, (out.sales話.get(title) ?? 0) + sales);
+      out.settle話.set(title, (out.settle話.get(title) ?? 0) + settle);
+      if (rs > 0) {
+        const prev = rsTotals話.get(title) ?? { sum: 0, count: 0 };
+        rsTotals話.set(title, { sum: prev.sum + rs, count: prev.count + 1 });
+      }
     }
   }
 
   if (volSheetName) {
     const matrix = sheetToMatrix(wb, volSheetName);
-    // header row 0; cols: [2] 作品名, [12] 売上(税別)
+    // header row 0; cols: [2] 作品名, [12] 売上(税別), [13] R/S, [14] 精算金額(税別)
     for (let i = 1; i < matrix.length; i++) {
       const r = matrix[i] ?? [];
       const title = r[2];
       if (!title || typeof title !== "string") continue;
       const sales = toNumber(r[12]);
+      const rs = normalizeRsRate(toNumber(r[13]));
+      const settle = toNumber(r[14]);
       out.sales巻.set(title, (out.sales巻.get(title) ?? 0) + sales);
+      out.settle巻.set(title, (out.settle巻.get(title) ?? 0) + settle);
+      if (rs > 0) {
+        const prev = rsTotals巻.get(title) ?? { sum: 0, count: 0 };
+        rsTotals巻.set(title, { sum: prev.sum + rs, count: prev.count + 1 });
+      }
     }
   }
 
+  for (const [title, v] of rsTotals話) out.rs話.set(title, v.count > 0 ? v.sum / v.count : 0);
+  for (const [title, v] of rsTotals巻) out.rs巻.set(title, v.count > 0 ? v.sum / v.count : 0);
+
   return out;
+}
+
+function inferMonthFromPiccomaFilename(filename: string): string | null {
+  const m = filename.match(/株式会社RIVERSE_(\d{6})\d{2}/);
+  if (!m) return null;
+  return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-01`;
+}
+
+function previousMonth(isoMonth: string): string {
+  const [y, m] = isoMonth.split("-").map(Number);
+  const prev = new Date(Date.UTC(y, m - 2, 1));
+  return `${prev.getUTCFullYear()}-${String(prev.getUTCMonth() + 1).padStart(2, "0")}-01`;
+}
+
+function recordsFromDetailOnly(filename: string, buffer: Buffer): { records: RawRecord[]; salesMonth: string | null; settlementMonth: string | null } {
+  const detail = parseDetailBuffer(buffer);
+  const settlementMonth = inferMonthFromPiccomaFilename(filename);
+  // Piccoma regular reports usually settle the previous month's sales. The
+  // upload UI still forces the operator-selected settlement month for the DB
+  // batch, so this only fills the workbook's sales-month column when available.
+  const salesMonth = settlementMonth ? previousMonth(settlementMonth) : null;
+  const depositMonth = settlementMonth ? addMonth(settlementMonth) : null;
+  const records: RawRecord[] = [];
+  let rowIdx = 0;
+
+  for (const [title, rawSales] of detail.sales話) {
+    const rawSettle = detail.settle話.get(title) ?? 0;
+    if (rawSales === 0 && rawSettle === 0) continue;
+    const rsRate = detail.rs話.get(title) ?? (rawSales > 0 ? rawSettle / rawSales : 0);
+    records.push(buildRecord({
+      rowIdx: rowIdx++,
+      title,
+      type: classifyKanaType(title, "話"),
+      rsRate,
+      rawSales,
+      rawSettle,
+      salesMonth,
+      settlementMonth,
+      depositMonth,
+      mg: 0,
+      col: "話",
+    }));
+  }
+
+  for (const [title, rawSales] of detail.sales巻) {
+    const rawSettle = detail.settle巻.get(title) ?? 0;
+    if (rawSales === 0 && rawSettle === 0) continue;
+    const rsRate = detail.rs巻.get(title) ?? (rawSales > 0 ? rawSettle / rawSales : 0);
+    records.push(buildRecord({
+      rowIdx: rowIdx++,
+      title,
+      type: classifyKanaType(title, "巻"),
+      rsRate,
+      rawSales,
+      rawSettle,
+      salesMonth,
+      settlementMonth,
+      depositMonth,
+      mg: 0,
+      col: "巻",
+    }));
+  }
+
+  return { records, salesMonth, settlementMonth };
 }
 
 interface SummaryRow {
@@ -270,13 +370,15 @@ export async function parsePiccoma({
   const isDetail = /^出版社report_株式会社RIVERSE_/.test(filename);
 
   if (isDetail) {
-    // Detail file on its own emits no rows (to avoid double counting).
+    const detailOnly = recordsFromDetailOnly(filename, buffer);
     return {
       platform_code: "piccoma",
-      sales_month: null,
-      settlement_month: null,
-      records: [],
-      errors: ["piccoma: 出版社report is a cross-check for 取次report and emits no rows"],
+      sales_month: detailOnly.salesMonth,
+      settlement_month: detailOnly.settlementMonth,
+      records: detailOnly.records,
+      errors: detailOnly.records.length > 0
+        ? ["piccoma: 出版社report detail-only upload parsed directly; 取次report was not uploaded"]
+        : ["piccoma: 出版社report detail-only upload contained no parseable detail rows"],
     };
   }
 

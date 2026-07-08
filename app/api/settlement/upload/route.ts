@@ -209,11 +209,13 @@ export async function POST(request: Request) {
 
     // 3. Archive the raw file into Supabase Storage (upload-debug bucket).
     let archivePath: string | null = null;
+    let archiveError: string | null = null;
     try {
       const archived = await writeToArchive(f.name, buffer, effectiveSettlement, supabase);
       archivePath = archived.path;
-    } catch {
-      console.warn(`[upload]${runLabel} ${f.name}: archive write failed`);
+    } catch (e) {
+      archiveError = (e as Error).message || "archive write failed";
+      console.warn(`[upload]${runLabel} ${f.name}: archive write failed: ${archiveError}`);
     }
 
     // 4. Update the pre-created raw_uploads row with the parse outcome.
@@ -232,7 +234,9 @@ export async function POST(request: Request) {
         // get hidden as harmless skips.
         status: zeroRowFailure ? "failed" : "parsed",
         detection_confidence: parsed.detection_confidence,
-        parse_error: parsed.errors.join("; ") || null,
+        parse_error: [...parsed.errors, archiveError ? `archive: ${archiveError}` : null]
+          .filter(Boolean)
+          .join("; ") || null,
         parsed_rows: parsed.records.length,
         parsed_at: new Date().toISOString(),
       })
@@ -279,6 +283,7 @@ export async function POST(request: Request) {
     // 6. Transform → sales_records
     let salesWritten = 0;
     let skippedDuplicates = 0;
+    let transformWarnings: unknown[] | undefined;
     if (parsed.records.length === 0) {
       if (zeroRowFailure) {
         const msg = parsed.errors.join("; ") || "정산행 0건: 파일 형식 분석 실패/파서 미지원입니다.";
@@ -301,9 +306,10 @@ export async function POST(request: Request) {
         sales_records_written: 0,
         skipped: true,
         skip_reason: msg,
+        archive_error: archiveError,
         settlement_month: effectiveSettlement,
         sales_month: parsed.sales_month || null,
-      });
+        });
       continue;
     }
     if (parsed.records.length > 0) {
@@ -324,7 +330,31 @@ export async function POST(request: Request) {
         lookups,
       };
       const transformed = toSalesRecords(parsed.records, ctx);
+      transformWarnings = transformed.errors.length > 0 ? transformed.errors : undefined;
       let inserts = transformed.inserts;
+      if (parsed.platform_code === "piccoma" && inserts.length > 0) {
+        const piccomaChannelIds = [...new Set(inserts.map((r) => r.channel_id).filter(Boolean))];
+        if (piccomaChannelIds.length > 0) {
+          const { count, error } = await supabase
+            .from("sales_records")
+            .select("id", { count: "exact", head: true })
+            .eq("settlement_batch", batch)
+            .in("channel_id", piccomaChannelIds);
+          if (!error && (count ?? 0) > 0) {
+            skippedDuplicates += inserts.length;
+            inserts = [];
+            transformWarnings = [
+              ...(transformWarnings ?? []),
+              {
+                row_index: -1,
+                platform_code: parsed.platform_code,
+                field: "piccoma",
+                message: "same settlement batch already has Piccoma rows; skipped to prevent double counting",
+              },
+            ];
+          }
+        }
+      }
       if (inserts.length > 0) {
         // Skip rows whose strict logical key already exists in this batch —
         // re-uploads and CSV+XLSX twins of the same statement. Legitimate
@@ -425,9 +455,12 @@ export async function POST(request: Request) {
       parsed_rows: parsed.records.length,
       sales_records_written: salesWritten,
       sales_records_skipped_duplicates: skippedDuplicates,
+      skipped_duplicates: skippedDuplicates,
+      archive_error: archiveError,
       settlement_month: effectiveSettlement,
       sales_month: parsed.sales_month || null,
       archive_path: archivePath,
+      warnings: transformWarnings,
       errors: parsed.errors,
     });
   }
