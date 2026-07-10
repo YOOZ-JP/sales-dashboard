@@ -7,9 +7,11 @@
  *
  * Business rule: the accountant's master sheet records SB Creative as
  * a SINGLE monthly line regardless of how many works or volumes are
- * listed on the PDF (see GT: title_jp=null, one row per month). This
- * parser therefore sums every detail row (less MG offsets and section-
- * header noise) into one aggregated figure before × 1.10.
+ * listed on the PDF (one row per month). This parser therefore sums
+ * every detail row (less MG offsets and section-header noise) into one
+ * aggregated figure before × 1.10. The row's title is derived from the
+ * extracted detail titles (single title, or "〈title〉 他N作品") so the
+ * INPUT sheet never carries a blank title column.
  */
 import { z } from "zod";
 import type { ParseResult } from "@/features/settlement/lib/schema/sales";
@@ -61,6 +63,26 @@ Only return what is clearly printed.`;
  * single monthly row.
  */
 const METADATA_TITLE = /配信分|電子書籍[/／]|小計|合計|\bGA\b/;
+
+/**
+ * Derive the aggregated row's display title from the detail-row titles.
+ * Metadata/section-header rows are dropped (same rule as the amount
+ * roll-up above); the remainder is trimmed, deduped, and codepoint-
+ * sorted so the result is deterministic for a given extraction.
+ * Returns the sole title, "〈first〉 他N作品" for several works, or the
+ * caller-provided source filename when no real work title survives filtering.
+ */
+export function deriveAggregateTitle(titles: string[], sourceFilename?: string): string | null {
+  const unique = [...new Set(titles.map((t) => t.trim()))]
+    .filter((t) => t && !METADATA_TITLE.test(t))
+    .sort();
+  if (unique.length === 0) {
+    const sourceLabel = sourceFilename?.replace(/\.[^.]+$/, "").trim();
+    return sourceLabel || null;
+  }
+  if (unique.length === 1) return unique[0];
+  return `${unique[0]} 他${unique.length - 1}作品`;
+}
 
 export async function parseSbCreative({
   filename,
@@ -120,12 +142,15 @@ export async function parseSbCreative({
   if (taxExcl > 0) {
     const beforeTaxIncome = Math.round(taxExcl * (1 + TAX_RATE));
     const afterTaxIncome = taxExcl;
+    const aggregateTitle = deriveAggregateTitle(
+      data.detail_rows.map((r) => r.title),
+      filename,
+    );
     records.push({
       row_index: 0,
       data: {
-        // Left blank to mirror the GT's single-row format for SB Creative.
-        title_jp: null,
-        channel_title_jp: null,
+        title_jp: aggregateTitle,
+        channel_title_jp: aggregateTitle,
         type: "EB",
         channel_code: "sb_creative",
         client_code: "sb_creative",
