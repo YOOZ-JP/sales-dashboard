@@ -15,12 +15,14 @@ import {
 async function main() {
   const lookups = await loadInputV2TemplateLookups();
 
-  const clientOf = (channel: string) => lookups.channelByCode.get(channel)?.clients;
-  assert.equal(clientOf("cmoa"), "NTTsolmare", "cmoa clients");
-  assert.equal(clientOf("piccoma"), "Piccoma", "piccoma clients");
-  assert.equal(clientOf("line_ads"), "Line Digital Frontier", "line_ads clients");
-  assert.equal(clientOf("booklive"), "Booklive", "booklive clients");
-  assert.equal(clientOf("renta"), "PAPYLESS", "renta clients");
+  // Transactional rows are intentionally stripped from the sanitized v3
+  // workbook, so channel modal attributes must not be recovered from a golden
+  // settlement file. Known channels remain available and their client fallback
+  // is null; DB/raw client codes are authoritative.
+  for (const channel of ["cmoa", "piccoma", "line_ads", "booklive", "renta"]) {
+    assert.ok(lookups.channelByCode.has(channel), `${channel} channel master exists`);
+    assert.equal(lookups.channelByCode.get(channel)?.clients, null, `${channel} has no transactional client fallback`);
+  }
 
   assert.equal(platformCodeToChannel("line_ad"), "line_ads", "line_ad alias");
   assert.equal(platformCodeToChannel("mediado"), "mediado_sales", "mediado alias");
@@ -56,12 +58,11 @@ async function main() {
       info.clients,
     ]),
   );
-  assert.equal(channelClients.get("bookcomi"), "Booklive", "bookcomi clients");
-  assert.equal(channelClients.get("dmm_fanza"), "DMM", "dmm_fanza clients");
-  assert.equal(channelClients.get("line"), "Line Digital Frontier", "line clients");
-  assert.equal(channelClients.get("ebj_webtoon"), "Line Digital Frontier", "ebj_webtoon clients");
-  assert.equal(channelClients.get("jumptoon"), "shueisha", "Jumptoon clients");
-  assert.equal(channelClients.get("manga mee"), "shueisha", "manga mee clients");
+  // Sanitized template channel entries carry no client modal values.
+  for (const channel of ["bookcomi", "dmm_fanza", "line", "ebj_webtoon", "jumptoon", "manga mee"]) {
+    assert.ok(channelClients.has(channel), `${channel} channel master exists`);
+    assert.equal(channelClients.get(channel), null, `${channel} client fallback stays null`);
+  }
 
   assert.ok(lookups.channelByCode.size > 0, "channel lookup is non-empty");
   assert.ok(lookups.titleByChannelTitle.size > 0, "title lookup is non-empty");

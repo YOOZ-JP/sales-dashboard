@@ -56,6 +56,8 @@ const REQUIRED_HEADERS = [
 
 interface DetailRow {
   title: string;
+  category: string;
+  kubun: string;
   format: string;
   rate: number;
   sales: number;
@@ -119,14 +121,16 @@ export async function parseMbj({
 
     const detail: DetailRow = {
       title,
+      category: strOr(row[col["カテゴリ"]]),
+      kubun: strOr(row[col["区分"]]),
       format,
       rate: numOr0(row[col["分配料率"]]),
       sales: numOr0(row[col["売上金額"]]),
       pay: numOr0(row[col["支払金額"]]),
     };
 
-    const series = normalizeSeries(detail.title);
     const type = resolveType(detail);
+    const series = normalizeSeries(detail.title, type);
     const key = `${series}|${type}`;
     let g = groups.get(key);
     if (!g) {
@@ -152,9 +156,6 @@ export async function parseMbj({
     const series = g.type === "EP" && !g.series.includes("【分冊版】")
       ? `${g.series}【分冊版】`
       : g.series;
-    const total = Math.round(g.sales * 1.10);
-    const beforeTaxIncome = Math.floor(g.pay * 1.10);
-    const consumptionTax = beforeTaxIncome - g.pay;
     const afterTaxIncome = g.pay;
     const afterTax = g.sales;
 
@@ -173,12 +174,12 @@ export async function parseMbj({
         title_jp: series,
         channel_title_jp: series,
         type: g.type,
-        total_amount_jpy: total,
-        before_tax_jpy: total,
+        total_amount_jpy: null,
+        before_tax_jpy: null,
         after_tax_jpy: afterTax,
-        before_tax_income_jpy: beforeTaxIncome,
+        before_tax_income_jpy: null,
         after_tax_income_jpy: afterTaxIncome,
-        consumption_tax_jpy: consumptionTax,
+        consumption_tax_jpy: null,
         withholding_tax_jpy: 0,
         // raw (audit)
         raw_sales_jpy: g.sales,
@@ -202,11 +203,13 @@ export async function parseMbj({
     ? `${salesMatch[1].slice(0, 4)}-${salesMatch[1].slice(4)}-01`
     : null;
   const settlementMatch = filename.match(/-(\d{6})-/);
-  const settlementMonth = settlementMatch
-    ? lastDayOfMonthIso(
-        `${settlementMatch[1].slice(0, 4)}-${settlementMatch[1].slice(4)}-01`
-      )
+  const batchIso = settlementMatch
+    ? `${settlementMatch[1].slice(0, 4)}-${settlementMatch[1].slice(4)}-01`
     : null;
+  const settlementMonth = batchIso ? lastDayOfMonthIso(batchIso) : null;
+  // MBJ pays out at the end of the month after the settlement batch month.
+  const depositMonth = batchIso ? addMonthsEndOfMonth(batchIso, 1) : null;
+  for (const record of records) record.data.deposit_month = depositMonth;
 
   return {
     platform_code: "mbj",
@@ -238,10 +241,20 @@ function findHeaderRow(matrix: unknown[][]): number {
  *
  * Uses both full-width and half-width digits. Called per detail row.
  */
-function normalizeSeries(title: string): string {
+function normalizeSeries(title: string, type?: string): string {
   let t = title.trim();
-  // Remove trailing 第N話 or 第N.M話 etc. Can have full/half-width digits.
-  t = t.replace(/第[０-９\d]+(?:[．.][０-９\d]+)?話(?:外伝[０-９\d]+)?\s*$/u, "").trim();
+  // Webtoon source rows frequently append a subtitle/part label after 第N話.
+  // Once the row is authoritatively classified WT, everything from the episode
+  // marker onward is a distribution-unit suffix, not part of the work title.
+  if (type === "WT") {
+    t = t.replace(/\s*第[０-９\d]+(?:[．.][０-９\d]+)?話.*$/u, "").trim();
+    // Revision/edition tags on webtoon rows are distribution-unit markers,
+    // not part of the work title — strip them so siblings share one key.
+    t = t.replace(/[\u005B［【]改訂版[\]］】]/gu, "").trim();
+  } else {
+    // Remove trailing 第N話 or 第N.M話 etc. Can have full/half-width digits.
+    t = t.replace(/第[０-９\d]+(?:[．.][０-９\d]+)?話(?:外伝[０-９\d]+)?\s*$/u, "").trim();
+  }
   // Remove trailing volume marker like （１）, （10）, （１～３）.
   t = t.replace(/（[０-９\d]+(?:[～〜-][０-９\d]+)?）\s*$/u, "").trim();
   return t;
@@ -253,15 +266,24 @@ function normalizeSeries(title: string): string {
  */
 function resolveType(d: DetailRow): string {
   const fmt = (d.format || "").toLowerCase();
+  const markers = [d.format, d.category, d.kubun, d.title].join(" ");
+  // The source format is authoritative and outranks title markers: a webtoon
+  // row stays WT even when its title carries a WR/revision or 第N話 marker —
+  // those are distribution-unit labels, not a different contract type.
+  if (fmt.includes("webtoon")) return "WT";
+  if (hasWrMarker(markers)) return "WR";
   if (d.title.includes("【分冊版】")) return "EP";
   if (/第[０-９\d]+(?:[．.][０-９\d]+)?話/u.test(d.title)) return "EP";
-  if (fmt.includes("webtoon")) return "WT";
   // Volume suffix detection
   if (/（[０-９\d]+(?:[～〜-][０-９\d]+)?）/.test(d.title)) return "EB";
   // Full-edition / special edition markers without a volume suffix still ship
   // as 巻-style EB.
   if (d.title.includes("［完全版］") || d.title.includes("【特装版】")) return "EB";
   return "EB";
+}
+
+function hasWrMarker(value: string): boolean {
+  return /(?:^|[^A-Za-z])WR(?:[^A-Za-z]|$)|改訂版|revised|revision/i.test(value);
 }
 
 function roundRate(r: number): number {
@@ -273,6 +295,12 @@ function lastDayOfMonthIso(iso: string): string {
   const [y, m] = iso.split("-").map(Number);
   const d = new Date(Date.UTC(y, m, 0));
   return d.toISOString().slice(0, 10);
+}
+
+function addMonthsEndOfMonth(iso: string, months: number): string {
+  const [year, month] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(year, (month ?? 1) - 1 + months + 1, 0));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }
 
 function strOr(v: unknown): string {

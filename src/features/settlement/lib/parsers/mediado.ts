@@ -53,16 +53,20 @@ interface TsvRow {
 
 interface TitleAgg {
   title: string;
-  kind: "COMIC" | "TATE";
+  fallbackKind: SourceKind;
+  sourceKinds: Set<SourceKind>;
   salesTaxExcl: number;   // Σ (販売価格 × DL数)  — raw tax-exclusive sales
   payment: number;        // Σ 税抜き金額          — raw tax-exclusive royalty
   rates: Set<number>;
+  rateLabels: Set<string>;
   stores: Set<string>;
   rowCount: number;
 }
 
 const COMIC_MARKER = "コミック";
 const TATE_MARKER = "タテヨミ";
+const BOOK_MARKER = "書籍";
+type SourceKind = "COMIC" | "TATE" | "BOOK";
 
 export async function parseMediado({
   filename,
@@ -79,7 +83,7 @@ export async function parseMediado({
     return { platform_code: "mediado", sales_month: null, settlement_month: null, records: [], errors: [] };
   }
 
-  const kind = detectKind(folderName, filename);
+  const fallbackKind = detectKind(folderName, filename);
   const rows = /\.xlsx$/i.test(filename)
     ? parseWorkbookRows(buffer)
     : parseTsv(decodeTsv(buffer));
@@ -90,52 +94,61 @@ export async function parseMediado({
   // Aggregate by タイトル名称 (skip aggregation/summary blanks)
   const byTitle = new Map<string, TitleAgg>();
   for (const r of rows) {
-    const form = (r.発行形態 ?? "").trim();
     const title = (r.タイトル名称 ?? "").trim();
-    // The TSV ends with one blank row (empty 発行形態 + empty title) — skip it.
-    if (!form || !title) continue;
+    // The TSV can include valid rows with blank/special 発行形態. Only the
+    // fully blank trailing row is skipped.
+    if (!title) continue;
 
     const price = toNum(r.販売価格);
     const dl = toNum(r.DL数);
     const rate = toNum(r.料率);
     const taxExcl = toNum(r.税抜き金額);
+    const sourceKind = detectRowKind(r.発行形態, fallbackKind);
 
     let agg = byTitle.get(title);
     if (!agg) {
       agg = {
         title,
-        kind,
+        fallbackKind,
+        sourceKinds: new Set(),
         salesTaxExcl: 0,
         payment: 0,
         rates: new Set(),
+        rateLabels: new Set(),
         stores: new Set(),
         rowCount: 0,
       };
       byTitle.set(title, agg);
     }
+    agg.sourceKinds.add(sourceKind);
     agg.salesTaxExcl += price * dl;
     agg.payment += taxExcl;
     if (rate > 0) agg.rates.add(rate);
+    const rateLabel = formatRateLabel(r.料率);
+    if (rateLabel) agg.rateLabels.add(rateLabel);
     if (r.書店名) agg.stores.add(r.書店名.trim());
     agg.rowCount += 1;
   }
 
   // First pass collects all titles in this folder so the type resolver
-  // can detect "[完全版] sibling" relationships on タテヨミ rows.
-  const allTitles = new Set(byTitle.keys());
+  // can detect "[完全版] sibling" relationships on タテヨミ rows. Titles are
+  // whitespace-normalized: the statement writes some siblings with a space
+  // before the bracket (e.g. "響弦文字 [完全版]【タテヨミ】").
+  const allTitles = new Set([...byTitle.keys()].map(normalizeSiblingKey));
+
+  const salesMonth = deriveSalesMonth(filename, rows);
+  const settlementMonth = salesMonth ? addMonthsEndOfMonth(salesMonth, 3) : null;
+  // MediaDo pays at the end of the settlement month (sales + 3 months).
+  const depositMonth = settlementMonth;
 
   const records: RawRecord[] = [];
   let idx = 0;
   for (const agg of byTitle.values()) {
     const type = resolveType(agg, allTitles);
-    const rsLabel = formatRs(agg.rates);
+    const rsLabel = formatRs(agg.rateLabels, agg.rates);
     const rsRate = computeRsRate(agg.rates);
 
-    // Tax math
-    const total = Math.round(agg.salesTaxExcl * 1.10);
     const afterTaxIncome = Math.round(agg.payment);
-    const beforeTaxIncome = Math.round(agg.payment * 1.10);
-    const consumptionTax = beforeTaxIncome - afterTaxIncome;
 
     records.push({
       row_index: idx++,
@@ -143,15 +156,13 @@ export async function parseMediado({
         title_jp: agg.title,
         channel_title_jp: agg.title,
         type,
-        // Totals (GT rolls consumption tax into gross)
-        total_amount_jpy: total,
-        before_tax_jpy: total,
+        total_amount_jpy: null,
+        before_tax_jpy: null,
         after_tax_jpy: Math.round(agg.salesTaxExcl),
-        gross_jpy: total,
-        // Income
-        before_tax_income_jpy: beforeTaxIncome,
+        gross_jpy: null,
+        before_tax_income_jpy: null,
         after_tax_income_jpy: afterTaxIncome,
-        consumption_tax_jpy: consumptionTax,
+        consumption_tax_jpy: null,
         withholding_tax_jpy: 0,
         fee_jpy: 0,
         // Rate
@@ -166,12 +177,10 @@ export async function parseMediado({
         // Routing
         client_code: "mediado",
         channel_code: "mediado_sales",
+        deposit_month: depositMonth,
       },
     });
   }
-
-  const salesMonth = deriveSalesMonth(filename, rows);
-  const settlementMonth = salesMonth ? addMonthsEndOfMonth(salesMonth, 3) : null;
 
   return {
     platform_code: "mediado",
@@ -184,12 +193,21 @@ export async function parseMediado({
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function detectKind(folderName?: string, filename?: string): "COMIC" | "TATE" {
+function detectKind(folderName?: string, filename?: string): SourceKind {
   const hay = `${folderName ?? ""} ${filename ?? ""}`;
   if (hay.includes(TATE_MARKER)) return "TATE";
   if (hay.includes(COMIC_MARKER)) return "COMIC";
+  if (hay.includes(BOOK_MARKER)) return "BOOK";
   // Safe default: COMIC (single-rate fallback)
   return "COMIC";
+}
+
+function detectRowKind(form: string | undefined, fallbackKind: SourceKind): SourceKind {
+  const f = (form ?? "").trim();
+  if (f.includes(TATE_MARKER)) return "TATE";
+  if (f.includes(COMIC_MARKER)) return "COMIC";
+  if (f.includes(BOOK_MARKER)) return "BOOK";
+  return fallbackKind;
 }
 
 /**
@@ -241,10 +259,23 @@ function toNum(v: string | undefined | null): number {
   return isFinite(n) ? n : 0;
 }
 
-function formatRs(rates: Set<number>): string {
+function formatRateLabel(raw: string | undefined): string | null {
+  const rate = toNum(raw);
+  if (rate <= 0) return null;
+  if (String(raw ?? "").includes("%")) return `${rate}%`;
+  return `${rate}%`;
+}
+
+function formatRs(rateLabels: Set<string>, rates: Set<number>): string {
+  const labels = Array.from(rateLabels);
+  if (labels.length > 0) {
+    return labels
+      .sort((a, b) => toNum(a) - toNum(b))
+      .map((label) => label.replace(/%$/, ""))
+      .join("/") + "%";
+  }
   const sorted = Array.from(rates).sort((a, b) => a - b);
   if (sorted.length === 0) return "";
-  if (sorted.length === 1) return String(sorted[0] / 100);
   return sorted.join("/") + "%";
 }
 
@@ -258,14 +289,26 @@ function computeRsRate(rates: Set<number>): number {
 
 function resolveType(agg: TitleAgg, allTitles: Set<string>): string {
   const t = agg.title;
-  if (agg.kind === "COMIC") {
+  if (agg.sourceKinds.has("TATE")) {
+    if (t.includes("［改訂版］") || t.includes("[改訂版]")) return "WR";
+    if (hasKanzenSibling(t, allTitles)) return "WR";
+    return "WT";
+  }
+  if (agg.sourceKinds.has("BOOK")) {
     if (t.includes("【分冊版】") || t.includes("【連載版】")) return "EP";
     return "EB";
   }
-  // TATE
+  if (agg.fallbackKind === "COMIC") {
+    if (t.includes("【分冊版】") || t.includes("【連載版】")) return "EP";
+    return "EB";
+  }
   if (t.includes("［改訂版］") || t.includes("[改訂版]")) return "WR";
   if (hasKanzenSibling(t, allTitles)) return "WR";
   return "WT";
+}
+
+function normalizeSiblingKey(title: string): string {
+  return title.replace(/[\s\u3000]+/g, "");
 }
 
 function hasKanzenSibling(title: string, allTitles: Set<string>): boolean {
@@ -274,7 +317,8 @@ function hasKanzenSibling(title: string, allTitles: Set<string>): boolean {
   //
   // e.g. '融点～とけあい～【タテヨミ】' has sibling '融点～とけあい～[完全版]【タテヨミ】'
   //      → '融点～とけあい～【タテヨミ】' is WR, the sibling is WT.
-  const mTate = title.match(/^(.*)【タテヨミ】$/);
+  // Matching is whitespace-insensitive (see normalizeSiblingKey callers).
+  const mTate = normalizeSiblingKey(title).match(/^(.*)【タテヨミ】$/);
   if (!mTate) return false;
   const base = mTate[1];
   // Stop if this title already carries a 完全版 tag itself.

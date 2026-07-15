@@ -128,6 +128,118 @@ export function suppressExistingDuplicates<T extends Record<string, unknown>>(
   return { kept, skipped };
 }
 
+function piccomaStatementKey(r: Record<string, unknown>): string | null {
+  const title = text(r.channel_title_jp) || text(r.title_jp);
+  const type = text(r.type);
+  const settlementMonth = text(r.settlement_month);
+  if (!title || !type || !settlementMonth) return null;
+  return [
+    text(r.client_id) || text(r.client_code) || text(r.clients),
+    text(r.channel_id) || text(r.channel_code) || text(r.channel),
+    text(r.channel_title_jp),
+    text(r.title_jp),
+    settlementMonth,
+    type,
+    text(r.distribution_strategy),
+    text(r.settlement_currency),
+    text(r.vehicle_currency),
+  ].join("␟");
+}
+
+/**
+ * Piccoma sends a summary workbook and a detail workbook for the same monthly
+ * statement. They can produce the same title/type rows with different derived
+ * gross fields when uploaded independently, so the exact monetary strict key is
+ * intentionally too narrow for this one paired-file suppression.
+ */
+export function suppressExistingPiccomaStatementDuplicates<T extends Record<string, unknown>>(
+  inserts: T[],
+  existing: Array<Record<string, unknown>>,
+): { kept: T[]; skipped: number } {
+  const insertChannelIds = new Set(inserts.map((row) => text(row.channel_id)).filter(Boolean));
+  const insertClientIds = new Set(inserts.map((row) => text(row.client_id)).filter(Boolean));
+  const budget = new Map<string, number>();
+  for (const row of existing) {
+    const channelId = text(row.channel_id);
+    const clientId = text(row.client_id);
+    const matchesIncomingParty = channelId
+      ? insertChannelIds.has(channelId)
+      : clientId
+        ? insertClientIds.has(clientId)
+        : false;
+    if (!isPiccomaRow(row) && !matchesIncomingParty) continue;
+    const key = piccomaStatementKey(row);
+    if (!key) continue;
+    budget.set(key, (budget.get(key) ?? 0) + 1);
+  }
+
+  const kept: T[] = [];
+  let skipped = 0;
+  for (const insert of inserts) {
+    const key = piccomaStatementKey(insert);
+    if (!key) {
+      kept.push(insert);
+      continue;
+    }
+    const left = budget.get(key) ?? 0;
+    if (left > 0) {
+      budget.set(key, left - 1);
+      skipped += 1;
+    } else {
+      kept.push(insert);
+    }
+  }
+  return { kept, skipped };
+}
+
+function isPiccomaRow(r: Record<string, unknown>): boolean {
+  const channel = text(r.channel_code) || text(r.channel);
+  const client = text(r.client_code) || text(r.clients);
+  return channel.toLowerCase() === "piccoma" || client.toLowerCase() === "piccoma";
+}
+
+export function dedupePiccomaStatementDuplicates<T extends Record<string, unknown>>(
+  records: T[],
+): { records: T[]; removed: number } {
+  const countsByKey = new Map<string, Map<string, number>>();
+  for (const row of records) {
+    if (!isPiccomaRow(row)) continue;
+    const key = piccomaStatementKey(row);
+    if (!key) continue;
+    const upload = text(row.upload_id);
+    const perUpload = countsByKey.get(key) ?? new Map<string, number>();
+    countsByKey.set(key, perUpload);
+    perUpload.set(upload, (perUpload.get(upload) ?? 0) + 1);
+  }
+
+  const keeperUpload = new Map<string, string>();
+  for (const [key, perUpload] of countsByKey) {
+    if (perUpload.size < 2) continue;
+    let best = "";
+    let bestCount = -1;
+    for (const [upload, count] of perUpload) {
+      if (count > bestCount || (count === bestCount && upload < best)) {
+        best = upload;
+        bestCount = count;
+      }
+    }
+    keeperUpload.set(key, best);
+  }
+
+  const kept: T[] = [];
+  let removed = 0;
+  for (const row of records) {
+    const key = isPiccomaRow(row) ? piccomaStatementKey(row) : null;
+    const keeper = key ? keeperUpload.get(key) : undefined;
+    if (keeper === undefined || text(row.upload_id) === keeper) {
+      kept.push(row);
+    } else {
+      removed += 1;
+    }
+  }
+  return { records: kept, removed };
+}
+
 /**
  * Remove cross-upload duplicates from already-loaded rows: within each strict
  * key group, keep only the rows of one deterministic upload and drop the same

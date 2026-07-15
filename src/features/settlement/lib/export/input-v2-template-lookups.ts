@@ -1,18 +1,22 @@
 /**
- * Fallback display lookups parsed from the golden INPUT v2 template workbook.
+ * Fallback display lookups parsed from the sanitized INPUT v2 template workbook.
  *
  * On deployments where the clients/channels/titles DB tables are empty, the
- * export/preview rows would render blank Clients/Channel columns. The golden
- * template already carries the master data we need:
+ * export/preview rows would render blank Clients/Channel columns. The
+ * sanitized template carries channel/title master sheets only — no runtime
+ * golden settlement rows are read:
  *
  * - 設定 sheet: independent dropdown lists. Column 채널 (rows 5+) is the
  *   canonical set of channel codes; it does NOT pair channels with clients
  *   row-by-row, so it only seeds the known-channel set.
- * - input_電子_N月 sheet: real settlement rows. Per channel code we take the
- *   most frequent Clients/Type/Distribution Strategy/Country/currency values
- *   as the fallback attributes (e.g. cmoa → NTTsolmare).
  * - タイトル sheet: Channel Title(JP) variants → Title(KR) / canonical
  *   Title(JP).
+ *
+ * DB rows and raw-record codes stay authoritative. The template's
+ * input_電子_N月 sheet is stripped of transactional rows, so the modal
+ * input-row fallback (per-channel Clients/Type/Distribution Strategy/
+ * Country/currency) may remain null instead of being read from the
+ * transactional golden workbook.
  */
 
 import ExcelJS from "exceljs";
@@ -20,7 +24,7 @@ import { readFile } from "node:fs/promises";
 
 // Same workbook as input-v2-filler's DEFAULT_TEMPLATE (kept private there).
 const TEMPLATE = new URL(
-  "../../data/templates/input_jp_2026_2605_golden.xlsx",
+  "../../data/templates/input_jp_2026_v3_template.xlsx",
   import.meta.url,
 );
 
@@ -279,6 +283,9 @@ async function parseTemplateLookups(): Promise<InputV2TemplateLookups> {
   const buffer = await readFile(TEMPLATE);
   await wb.xlsx.load(buffer as unknown as ExcelJS.Buffer);
 
+  // The sanitized template keeps this sheet but strips its transactional
+  // rows, so this typically yields no modal attributes — channels then come
+  // from the 設定 sheet below with null attributes, never from golden data.
   const dataSheet = wb.worksheets.find((ws) => /^input_電子_\d+月$/.test(ws.name));
   const channelByCode = dataSheet
     ? parseChannelAttributes(dataSheet)

@@ -118,6 +118,22 @@ export async function parseFile(opts: {
 
 function shouldUseGenericSummaryFallback(filename: string, platformCode: string): boolean {
   if (platformCode === "unknown") return false;
+  // The Ichijinsha 詳細別送の内訳 statement is an authoritative detail source:
+  // a zero-row parse there is a hard parser error that must surface instead
+  // of being masked by a generic one-line summary.
+  if (platformCode === "ichijinsha" && /詳細別送の内訳/.test(filename)) return false;
+  // The SB Creative monthly sales report is the authoritative EB detail
+  // source: zero rows or a totals-reconciliation failure there must surface
+  // as a parser error instead of being masked by a generic one-line summary.
+  // Invoice (【請求書】) and payment-notice (支払通知書) files keep the
+  // fallback — their evidence rows are summary-only by design.
+  if (
+    platformCode.startsWith("sb_creative") &&
+    !/【請求書】/.test(filename) &&
+    !/支払通知書/.test(filename)
+  ) {
+    return false;
+  }
   return /\.(pdf|xlsx|xls|csv|tsv)$/i.test(filename);
 }
 

@@ -215,6 +215,8 @@ export async function parseRenta({ filename, buffer }: { filename: string; buffe
   const m = filename.match(/-(\d{4})(\d{2})rnt_/);
   const salesMonth = m ? `${m[1]}-${m[2]}-01` : null;
   const settlementMonth = salesMonth ? addMonths(salesMonth, 2) : null;
+  const depositMonth = settlementMonth ? endOfMonth(settlementMonth) : null;
+  for (const record of records) record.data.deposit_month = depositMonth;
 
   return {
     platform_code: "renta",
@@ -243,4 +245,10 @@ function addMonths(iso: string, n: number): string {
   const [y, m] = iso.split("-").map(Number);
   const d = new Date(Date.UTC(y, (m ?? 1) - 1 + n, 1));
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-01`;
+}
+
+function endOfMonth(iso: string): string {
+  const [year, month] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month ?? 1, 0));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }

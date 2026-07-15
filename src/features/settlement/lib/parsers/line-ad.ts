@@ -134,9 +134,10 @@ export async function parseLineAd({
     if (!ledger || !title) continue;
 
     const sm = salesMonthFromReport(r["報告年月"]);
+    const payDueRow = isoDate(r["支払期日"]);
     if (!salesMonth && sm) salesMonth = sm;
     if (!notifyDate) notifyDate = isoDate(r["通知日付"]);
-    if (!payDue) payDue = isoDate(r["支払期日"]);
+    if (!payDue) payDue = payDueRow;
 
     const rawSales = toNumber(r["売上額(基準額)"]);
     const rawPay = toNumber(r["支払額"]);
@@ -158,6 +159,8 @@ export async function parseLineAd({
       row_index: idx++,
       data: {
         sales_month: sm,
+        // 支払期日 is the actual payout date — kept verbatim as the deposit date.
+        deposit_month: payDueRow,
         country: COUNTRY,
         client_code: CLIENT,
         channel_code: CHANNEL,

@@ -7,11 +7,20 @@
  */
 
 /**
- * Deploy blocker surfaced to the API routes: missing Supabase env (503) or a
- * Supabase query failure (500). `null` means the DB was queried successfully —
- * zero records is then a genuine "no data" case (404 at the route level).
+ * Deploy blocker surfaced to the API routes: missing Supabase env (503), a
+ * Supabase query failure (500), or a source-completeness conflict (409: a
+ * required source-family upload is missing, failed, or empty). `null` means
+ * the DB was queried successfully — zero records is then a genuine "no data"
+ * case (404 at the route level).
  */
-import { dedupeCrossUploadDuplicates } from "@/features/settlement/lib/aggregation/strict-record-key";
+import {
+  carryForwardRecordKey,
+  mergeCarryForwardRows,
+} from "./input-v2-carry-forward";
+import {
+  dedupeCrossUploadDuplicates,
+  dedupePiccomaStatementDuplicates,
+} from "@/features/settlement/lib/aggregation/strict-record-key";
 import {
   clientCodeToDisplay,
   loadInputV2TemplateLookups,
@@ -22,10 +31,88 @@ import {
 } from "./input-v2-template-lookups";
 
 export type InputV2LoadError = {
-  status: 503 | 500;
+  status: 503 | 500 | 409;
   error: string;
   details: string;
 };
+
+/** Current-batch raw_uploads projection used by the source-family gate. */
+export interface SourceUploadStatus {
+  id?: string | null;
+  platform_code: string | null;
+  status: string | null;
+  parsed_rows: number | null;
+  parse_error?: string | null;
+}
+
+/**
+ * Statement-cadence contract channels whose month can only be evidenced by a
+ * specific uploaded source family. When the baseline roster contains one of
+ * the listed channels, the current batch must hold a successful upload of a
+ * matching platform (status "parsed" or "aggregated" with parsed_rows > 0)
+ * that actually produced current-batch non-summary sales_records; otherwise
+ * the export would silently zero-carry a month whose statement was simply
+ * never uploaded (or only landed as a generic summary fallback). Channels
+ * outside this table are never gated.
+ */
+const REQUIRED_SOURCE_FAMILIES: ReadonlyArray<{
+  family: string;
+  channels: readonly string[];
+  platforms: readonly string[];
+}> = [
+  { family: "booklive", channels: ["booklive", "bookcomi"], platforms: ["booklive"] },
+  { family: "dmm", channels: ["dmm"], platforms: ["dmm"] },
+  { family: "renta", channels: ["renta"], platforms: ["renta"] },
+  { family: "shueisha", channels: ["jumptoon", "manga mee"], platforms: ["shueisha"] },
+  { family: "kadokawa", channels: ["kadokawa"], platforms: ["kadokawa"] },
+  { family: "piccoma_ads", channels: ["piccoma_ads"], platforms: ["piccoma_ads"] },
+  { family: "u_next", channels: ["u-next"], platforms: ["u_next"] },
+  { family: "cmoa", channels: ["cmoa"], platforms: ["cmoa"] },
+  { family: "comico", channels: ["comico jp", "comico_ads"], platforms: ["comico"] },
+];
+
+function normalizeChannelPart(value: unknown): string {
+  return String(value ?? "").normalize("NFKC").trim().toLowerCase();
+}
+
+/**
+ * Comparison key for channel/platform matching: internal whitespace is also
+ * collapsed so "Manga Mee" and "manga mee" compare equal.
+ */
+function normalizeChannelKey(value: unknown): string {
+  return normalizeChannelPart(value).replace(/\s+/g, "");
+}
+
+/**
+ * Returns the privacy-safe family names whose required upload is missing,
+ * failed, or empty.
+ *
+ * When `detailUploadIds` is given (the ids of uploads that produced the
+ * current batch's non-summary sales_records), a family is satisfied only by
+ * a successful upload whose id is in that set — so a generic summary-only
+ * fallback upload can never satisfy the gate on its own.
+ */
+export function validateRequiredSourceFamilies(
+  baselineChannels: ReadonlySet<string>,
+  uploads: readonly SourceUploadStatus[],
+  detailUploadIds?: ReadonlySet<string>,
+): string[] {
+  const missing: string[] = [];
+  const baselineKeys = new Set([...baselineChannels].map(normalizeChannelKey));
+  for (const { family, channels, platforms } of REQUIRED_SOURCE_FAMILIES) {
+    if (!channels.some((channel) => baselineKeys.has(normalizeChannelKey(channel)))) continue;
+    const satisfied = uploads.some((upload) => {
+      if (!platforms.includes(normalizeChannelKey(upload.platform_code))) return false;
+      const status = normalizeChannelPart(upload.status);
+      if (status !== "parsed" && status !== "aggregated") return false;
+      if (typeof upload.parsed_rows !== "number" || upload.parsed_rows <= 0) return false;
+      if (!detailUploadIds) return true;
+      return typeof upload.id === "string" && detailUploadIds.has(upload.id);
+    });
+    if (!satisfied) missing.push(family);
+  }
+  return missing;
+}
 
 function formatSupabaseError(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -82,6 +169,20 @@ export async function loadInputV2Records(
         .select("*")
         .eq("settlement_batch", batchIso)
         .order("client_id", { ascending: true, nullsFirst: false })
+        .range(offset, offset + PAGE - 1);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      all.push(...data);
+      if (data.length < PAGE) break;
+    }
+    // Contract rows must survive months with zero revenue. Build that roster
+    // from real historical DB rows instead of replaying one fixed workbook.
+    for (let offset = 0; ; offset += PAGE) {
+      const { data, error } = await supabase
+        .from("sales_records")
+        .select("*")
+        .lt("settlement_batch", batchIso)
+        .order("settlement_batch", { ascending: false, nullsFirst: false })
         .range(offset, offset + PAGE - 1);
       if (error) throw error;
       if (!data || data.length === 0) break;
@@ -273,13 +374,82 @@ export async function loadInputV2Records(
     // logical key, keep one upload's rows and drop the re-uploaded copies.
     // Legitimate variants (same title, different type/month/amount) have
     // distinct keys and always survive.
-    const deduped = dedupeCrossUploadDuplicates(all);
+    const piccomaDeduped = dedupePiccomaStatementDuplicates(all);
+    if (piccomaDeduped.removed > 0) {
+      console.warn(
+        `[input-v2] ${month}: suppressed ${piccomaDeduped.removed} Piccoma paired duplicate rows`,
+      );
+    }
+    const deduped = dedupeCrossUploadDuplicates(piccomaDeduped.records);
     if (deduped.removed > 0) {
       console.warn(
         `[input-v2] ${month}: suppressed ${deduped.removed} cross-upload duplicate rows`,
       );
     }
-    return { records: deduped.records, source: "supabase", loadError: null };
+    const current = deduped.records.filter(
+      (row) => String(row.settlement_batch ?? "").slice(0, 10) === batchIso,
+    );
+    const latestHistory = new Map<
+      string,
+      { batch: string; rows: Record<string, unknown>[] }
+    >();
+    for (const row of deduped.records) {
+      const batch = String(row.settlement_batch ?? "").slice(0, 10);
+      if (!batch || batch >= batchIso) continue;
+      const key = carryForwardRecordKey(row);
+      if (!key) continue;
+      const found = latestHistory.get(key);
+      if (!found || batch > found.batch) {
+        latestHistory.set(key, { batch, rows: [row] });
+      } else if (batch === found.batch) {
+        found.rows.push(row);
+      }
+    }
+    const baseline = [...latestHistory.values()].flatMap((entry) => entry.rows);
+
+    // Source completeness gate: contract channels that live in the baseline
+    // must be backed by a successful current-batch upload of their source
+    // family, or the export must stop instead of silently zero-carrying.
+    const baselineChannels = new Set(
+      baseline
+        .map((row) => normalizeChannelPart(row.channel ?? row.channel_code))
+        .filter(Boolean),
+    );
+    const { data: uploads, error: uploadsError } = await supabase
+      .from("raw_uploads")
+      .select("id, platform_code, status, parsed_rows, parse_error")
+      .eq("settlement_month", batchIso);
+    if (uploadsError) throw uploadsError;
+    // Uploads that produced current-batch non-summary sales_records (`all` was
+    // already stripped of SUMMARY_NON_AGGREGATED rows above). Only these can
+    // satisfy a required family — a summary-only fallback upload cannot.
+    const currentDetailUploadIds = new Set<string>();
+    for (const row of all) {
+      if (String(row.settlement_batch ?? "").slice(0, 10) !== batchIso) continue;
+      const uploadId = row.upload_id;
+      if (typeof uploadId === "string" && uploadId.length > 0) {
+        currentDetailUploadIds.add(uploadId);
+      }
+    }
+    const missingFamilies = validateRequiredSourceFamilies(
+      baselineChannels,
+      (uploads ?? []) as SourceUploadStatus[],
+      currentDetailUploadIds,
+    );
+    if (missingFamilies.length > 0) {
+      return {
+        records: [],
+        source: "supabase",
+        loadError: {
+          status: 409,
+          error: "missing_source_family",
+          details: `Required source uploads are missing, failed, or empty for this month: ${missingFamilies.join(", ")}. Upload a successful statement for each family, then retry.`,
+        },
+      };
+    }
+
+    const carried = mergeCarryForwardRows(baseline, current, month);
+    return { records: carried.records, source: "supabase", loadError: null };
   } catch (err) {
     const message = formatSupabaseError(err);
     console.warn("[input-v2] Supabase fetch failed:", message);

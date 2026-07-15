@@ -161,9 +161,7 @@ export async function parseDmm({ filename, buffer }: { filename: string; buffer:
   const records: RawRecord[] = [];
   let rowIdx = 0;
   for (const agg of [...adult.values(), ...general.values()]) {
-    if (agg.raw_sales_jpy <= 0) continue;
-    const total = Math.round(agg.raw_sales_jpy * 1.1);
-    const bti = Math.round(total * 0.45);
+    const afterTaxIncome = Math.round(agg.raw_sales_jpy * 0.45);
     records.push({
       row_index: rowIdx++,
       data: {
@@ -176,12 +174,12 @@ export async function parseDmm({ filename, buffer }: { filename: string; buffer:
         quantity: agg.quantity,
         maker: agg.maker ?? null,
         label: agg.label ?? null,
-        total_amount_jpy: total,
-        before_tax_jpy: total,
+        total_amount_jpy: null,
+        before_tax_jpy: null,
         after_tax_jpy: Math.round(agg.raw_sales_jpy),
-        before_tax_income_jpy: bti,
-        after_tax_income_jpy: Math.round(agg.raw_sales_jpy * 0.45),
-        consumption_tax_jpy: bti - Math.round(agg.raw_sales_jpy * 0.45),
+        before_tax_income_jpy: null,
+        after_tax_income_jpy: afterTaxIncome,
+        consumption_tax_jpy: null,
         rs_rate: 0.45,
       },
     });
@@ -190,6 +188,8 @@ export async function parseDmm({ filename, buffer }: { filename: string; buffer:
   // Filename "2603_..." → 2026-03
   const m = filename.match(/^(\d{2})(\d{2})_/);
   const salesMonth = m ? `20${m[1]}-${m[2]}-01` : null;
+  const depositMonth = salesMonth ? addMonthsEndOfMonth(salesMonth, 2) : null;
+  for (const record of records) record.data.deposit_month = depositMonth;
 
   return {
     platform_code: "dmm",
@@ -198,6 +198,12 @@ export async function parseDmm({ filename, buffer }: { filename: string; buffer:
     records,
     errors: records.length === 0 ? ["no records extracted from DMM file"] : [],
   };
+}
+
+function addMonthsEndOfMonth(iso: string, months: number): string {
+  const [year, month] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(year, (month ?? 1) - 1 + months + 1, 0));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }
 
 /**

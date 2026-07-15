@@ -4,9 +4,13 @@
   "channel_code": "ichijinsha",
   "client_code": "ichijinsha",
   "rules": {
-    "md_markers": ["複製色紙", "商品化権使用料", "20周年記念フレーム"],
+    "md_markers": [
+      "複製色紙",
+      "商品化権使用料",
+      "20周年記念フレーム"
+    ],
     "eb_marker": "国内電子",
-    "tax_rate": 0.10,
+    "tax_rate": 0.1,
     "raw_value_is_pre_tax": true
   },
   "md_channel_title_suffix": "（商品化使用料）",
@@ -14,10 +18,6 @@
     "MD (商品化) rows: raw 差引版権支払額 is after-tax income (税抜). × 1.10 = GT before_tax_income_jpy.",
     "EB (国内電子) rows: same rule — raw amount is 税抜, × 1.10 = GT before_tax_income_jpy.",
     "For MG offsets: rows of the form 'X (3)（MG）' are paired with 'X (3)' and the two are combined (summed).",
-    "The merged (sum) becomes the single GT row with channel_title_jp 'X 3' (no volume punctuation)."
-  ],
-  "volume_suffix_rewrite": [
-    { "raw": "義家族に執着されています (3)", "gt_title": "義家族に執着されています 3" },
-    { "raw": "捨てられた王女の秘密の寝室（3）", "gt_title": "捨てられた王女の秘密の寝室 3" }
+    "詳細別送の内訳 detail titles keep their printed volume, canonicalized as fullwidth parens+digits: タイトル（７）."
   ]
 }

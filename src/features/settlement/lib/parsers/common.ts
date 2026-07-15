@@ -43,6 +43,11 @@ const JPY_CLEAN_RE = /[¥￥,\s円]/g;
 export function toNumber(v: unknown): number {
   if (v == null || v === "") return 0;
   if (typeof v === "number") return isFinite(v) ? v : 0;
+  if (typeof v === "object") {
+    const obj = v as { v?: unknown; result?: unknown };
+    if (obj.v !== undefined) return toNumber(obj.v);
+    if (obj.result !== undefined) return toNumber(obj.result);
+  }
   const s = String(v).replace(JPY_CLEAN_RE, "").replace(/−/g, "-");
   const n = Number(s);
   return isFinite(n) ? n : 0;

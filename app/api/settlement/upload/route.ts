@@ -25,11 +25,14 @@ import {
 } from "@/features/settlement/lib/aggregation/to-sales-records";
 import {
   STRICT_KEY_COLUMNS,
+  suppressExistingPiccomaStatementDuplicates,
   suppressExistingDuplicates,
 } from "@/features/settlement/lib/aggregation/strict-record-key";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+// Local OCR of scanned payment notices (Shueisha) rasterizes + reads two
+// pages per file; 60s was sized for spreadsheet parsing only.
+export const maxDuration = 300;
 
 export async function POST(request: Request) {
   const unauthorized = requireSettlementApiAuth(request);
@@ -332,29 +335,6 @@ export async function POST(request: Request) {
       const transformed = toSalesRecords(parsed.records, ctx);
       transformWarnings = transformed.errors.length > 0 ? transformed.errors : undefined;
       let inserts = transformed.inserts;
-      if (parsed.platform_code === "piccoma" && inserts.length > 0) {
-        const piccomaChannelIds = [...new Set(inserts.map((r) => r.channel_id).filter(Boolean))];
-        if (piccomaChannelIds.length > 0) {
-          const { count, error } = await supabase
-            .from("sales_records")
-            .select("id", { count: "exact", head: true })
-            .eq("settlement_batch", batch)
-            .in("channel_id", piccomaChannelIds);
-          if (!error && (count ?? 0) > 0) {
-            skippedDuplicates += inserts.length;
-            inserts = [];
-            transformWarnings = [
-              ...(transformWarnings ?? []),
-              {
-                row_index: -1,
-                platform_code: parsed.platform_code,
-                field: "piccoma",
-                message: "same settlement batch already has Piccoma rows; skipped to prevent double counting",
-              },
-            ];
-          }
-        }
-      }
       if (inserts.length > 0) {
         // Skip rows whose strict logical key already exists in this batch —
         // re-uploads and CSV+XLSX twins of the same statement. Legitimate
@@ -378,12 +358,14 @@ export async function POST(request: Request) {
             if (data.length < PAGE) break;
           }
           if (existing.length > 0) {
-            const suppressed = suppressExistingDuplicates(inserts, existing);
+            const suppressed = parsed.platform_code === "piccoma"
+              ? suppressExistingPiccomaStatementDuplicates(inserts, existing)
+              : suppressExistingDuplicates(inserts, existing);
             inserts = suppressed.kept;
-            skippedDuplicates = suppressed.skipped;
-            if (skippedDuplicates > 0) {
+            skippedDuplicates += suppressed.skipped;
+            if (suppressed.skipped > 0) {
               console.warn(
-                `[upload]${runLabel} ${f.name}: skipped ${skippedDuplicates} duplicate sales rows already in ${batch}`,
+                `[upload]${runLabel} ${f.name}: skipped ${suppressed.skipped} duplicate sales rows already in ${batch}`,
               );
             }
           }

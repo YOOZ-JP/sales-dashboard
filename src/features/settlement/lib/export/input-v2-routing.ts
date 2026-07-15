@@ -25,7 +25,7 @@ export function monthNumber(month: string): number {
 }
 
 export function inputV2ElectronicSheet(month: string): string {
-  return `input_電子_${monthNumber(month)}月`;
+  return `input_電子_${(monthNumber(month) % 12) + 1}月`;
 }
 
 export function isPublicationClient(value: unknown): boolean {

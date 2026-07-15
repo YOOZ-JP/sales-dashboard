@@ -165,6 +165,7 @@ export async function parseBooklive({ buffer }: { filename: string; buffer: Buff
       row_index: i + 2,
       data: {
         sales_month,
+        deposit_month: sales_month ? addMonthsEndOfMonth(sales_month, 2) : null,
         pay_due: toIsoDate(r["支払期日"]),
         client_code: "booklive",
         channel_code: channel,
@@ -176,6 +177,7 @@ export async function parseBooklive({ buffer }: { filename: string; buffer: Buff
         publisher: r["出版社名"] ?? null,
         raw_store: storeStr,
         raw_wt: wtStr,
+        note2: "TYPE_HEURISTIC",
         raw_title: String(title).trim(),
         // Amounts
         gross_jpy: total_amount_jpy,               // aggregate engine reads gross_jpy
@@ -206,4 +208,10 @@ function nextMonth(iso: string): string {
   const [y, m] = iso.split("-").map(Number);
   const d = new Date(y, (m ?? 1), 1);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+}
+
+function addMonthsEndOfMonth(iso: string, months: number): string {
+  const [year, month] = iso.split("-").map(Number);
+  const date = new Date(Date.UTC(year, (month ?? 1) - 1 + months + 1, 0));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
 }

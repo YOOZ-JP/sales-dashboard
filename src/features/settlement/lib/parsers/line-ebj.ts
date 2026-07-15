@@ -16,7 +16,10 @@
  *   4. Type derivation (priority):
  *        - 【タテヨミ】 suffix         → WT, or WR if title has ［改訂版］ or a [完全版]
  *                                       sibling exists (older/non-full-edition variant)
- *        - 【分冊版】 / 【連載版】      → EP
+ *        - 【分冊版】 / 【連載版】      → EP  (distribution-unit marker only, so it is
+ *                                       a TYPE_HEURISTIC: a webnovel split into parts
+ *                                       carries the same tag; carry-forward may adopt
+ *                                       the unique baseline type, e.g. WN)
  *        - 単話 販売単位区分 (no tag)  → WT  (covers 年下旦那 which lacks 【タテヨミ】)
  *        - otherwise                  → EB  (single volume / 【特装版】 / plain title)
  *   5. ebookjapan store splits by type:  WT/WR → ebj_webtoon,  EP/EB → ebj
@@ -45,7 +48,7 @@ type Row = {
 };
 
 type Channel = "line" | "ebj" | "ebj_webtoon";
-type EbjType = "WT" | "WR" | "EP" | "EB";
+type EbjType = "WT" | "WR" | "WN" | "EP" | "EB";
 
 /** Wave dash (U+301C) → full-width tilde (U+FF5E). Matches GT convention. */
 function normalizeTitle(t: string): string {
@@ -98,24 +101,69 @@ function computeWrSet(titles: Iterable<string>): Set<string> {
   return wr;
 }
 
-function classifyType(title: string, unit: string, wrSet: Set<string>): EbjType {
+function hasNovelEvidence(row: Row, title: string): boolean {
+  const hay = [
+    title,
+    row["表示用刊行物名"],
+    row["刊行物名"],
+    row["販売単位区分"],
+    row["サービス区分"],
+  ].join(" ");
+  return /(?:^|[（(【[\s])(?:ノベル|小説|web\s*novel|ｗｅｂ\s*novel|WN|ＷＮ)(?:$|[）)】\]\s])/iu.test(hay);
+}
+
+/**
+ * Explicit source evidence (novel markers, 【タテヨミ】, 【分冊版】/【連載版】)
+ * is authoritative. The unit-only fallback is a heuristic: rows typed that way
+ * carry the TYPE_HEURISTIC audit marker in note2 so carry-forward may
+ * reconcile them against the prior contract ledger.
+ */
+function classifyType(
+  row: Row,
+  title: string,
+  unit: string,
+  wrSet: Set<string>,
+): { type: EbjType; heuristic: boolean } {
+  if (hasNovelEvidence(row, title)) return { type: "WN", heuristic: false };
   if (title.includes("【タテヨミ】")) {
-    return wrSet.has(title) ? "WR" : "WT";
+    return { type: wrSet.has(title) ? "WR" : "WT", heuristic: false };
   }
-  if (title.includes("【分冊版】") || title.includes("【連載版】")) return "EP";
+  if (title.includes("【分冊版】") || title.includes("【連載版】")) {
+    // 分冊/連載 are distribution-unit markers, not genre evidence: with no
+    // explicit novel/vertical signal the EP guess stays heuristic so the
+    // baseline ledger may reconcile it (e.g. to WN). Channel is unaffected.
+    return { type: "EP", heuristic: true };
+  }
   // No genre tag — fall back to unit. 単話 is a chapter (webtoon); else treat as EB volume.
-  if (unit === "単話") return "WT";
-  return "EB";
+  if (unit === "単話") return { type: "WT", heuristic: true };
+  return { type: "EB", heuristic: true };
 }
 
 function classifyChannel(store: string, type: EbjType): Channel {
   if (store.includes("LINE")) return "line";
-  return type === "WT" || type === "WR" ? "ebj_webtoon" : "ebj";
+  return type === "WT" || type === "WR" || type === "WN" ? "ebj_webtoon" : "ebj";
 }
 
 /** Round half-up so a .5 residue from the ×1.1 multiplication doesn't drift. */
 function round1(n: number): number {
   return Math.round(n);
+}
+
+/** Shift a `YYYY-MM-01` month string by delta calendar months (UTC-safe). */
+function shiftMonth(monthFirst: string, delta: number): string {
+  const y = Number(monthFirst.slice(0, 4));
+  const mo = Number(monthFirst.slice(5, 7));
+  const d = new Date(Date.UTC(y, mo - 1 + delta, 1));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-01`;
+}
+
+/** Last day of the month `delta` calendar months after a `YYYY-MM-01` string (UTC-safe). */
+function endOfShiftedMonth(monthFirst: string, delta: number): string {
+  const y = Number(monthFirst.slice(0, 4));
+  const mo = Number(monthFirst.slice(5, 7));
+  // Day 0 of the following month = last day of the target month.
+  const d = new Date(Date.UTC(y, mo - 1 + delta + 1, 0));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
 export async function parseLineEbj({
@@ -144,6 +192,7 @@ export async function parseLineEbj({
     title_jp: string;
     channel: Channel;
     type: EbjType;
+    type_heuristic: boolean;
     store_samples: Set<string>;
     publisher: string;
     author: string;
@@ -159,7 +208,7 @@ export async function parseLineEbj({
     if (!title || !store) continue;
 
     const unit = (r["販売単位区分"] || "").trim();
-    const type = classifyType(title, unit, wrSet);
+    const { type, heuristic } = classifyType(r, title, unit, wrSet);
     const channel = classifyChannel(store, type);
     const key = `${channel}||${type}||${title}`;
 
@@ -169,6 +218,7 @@ export async function parseLineEbj({
         title_jp: title,
         channel,
         type,
+        type_heuristic: heuristic,
         store_samples: new Set(),
         publisher: (r["出版社名"] || "").trim(),
         author: (r["著者名"] || "").trim(),
@@ -184,12 +234,24 @@ export async function parseLineEbj({
     a.royalty_jpy_raw += toNumber(r["許諾額計"]);
   }
 
+  // EBJ file names encode the settlement (export) date, e.g.
+  // `...20260409132654817.csv` → settlement month 2026-04.
+  const m = filename.match(/(\d{4})(\d{2})\d{2}\d{6,}/);
+  const settlement = m ? `${m[1]}-${m[2]}-01` : "";
+  // Per Nakatani's notes the LINE store settles on a two-month lag while the
+  // ebookjapan stores settle on a one-month lag. No per-row payment date
+  // exists, so deposit is the end of the month after settlement.
+  const salesMonth = settlement ? shiftMonth(settlement, -2) : null;
+  const depositMonth = settlement ? endOfShiftedMonth(settlement, 1) : null;
+
   const records = Array.from(byKey.values()).map((a, i) => {
-    const total = round1(a.sales_jpy_raw * 1.1);
-    const income = round1(a.royalty_jpy_raw * 1.1);
     return {
       row_index: i,
       data: {
+        sales_month: settlement
+          ? shiftMonth(settlement, a.channel === "line" ? -2 : -1)
+          : null,
+        deposit_month: depositMonth,
         title_jp: a.title_jp,
         channel_code: a.channel,
         client_code: "line_dl_frontier",
@@ -201,29 +263,17 @@ export async function parseLineEbj({
         // pre-tax raw figures kept for audit
         sales_jpy_pretax: a.sales_jpy_raw,
         royalty_jpy_pretax: a.royalty_jpy_raw,
-        // tax-inclusive figures matching GT
-        total_amount_jpy: total,
-        before_tax_jpy: total,
-        before_tax_income_jpy: income,
+        total_amount_jpy: null,
+        before_tax_jpy: null,
+        after_tax_jpy: round1(a.sales_jpy_raw),
+        before_tax_income_jpy: null,
+        after_tax_income_jpy: round1(a.royalty_jpy_raw),
         after_tax_income_jpy_a: a.royalty_jpy_raw,
-        consumption_tax_jpy: income - a.royalty_jpy_raw,
+        consumption_tax_jpy: null,
+        note2: a.type_heuristic ? "TYPE_HEURISTIC" : null,
       },
     };
   });
-
-  // EBJ file names encode the settlement (export) date, e.g.
-  // `...20260409132654817.csv` → settlement month 2026-04.
-  const m = filename.match(/(\d{4})(\d{2})\d{2}\d{6,}/);
-  const settlement = m ? `${m[1]}-${m[2]}-01` : "";
-  // Per Nakatani's notes EBJ runs on a two-month lag.
-  const salesMonth = settlement
-    ? (() => {
-        const y = Number(settlement.slice(0, 4));
-        const mo = Number(settlement.slice(5, 7));
-        const prev2 = new Date(Date.UTC(y, mo - 1 - 2, 1));
-        return `${prev2.getUTCFullYear()}-${String(prev2.getUTCMonth() + 1).padStart(2, "0")}-01`;
-      })()
-    : null;
 
   return {
     platform_code: "ebj_line",

@@ -11,13 +11,12 @@
   },
   "type_overrides": [
     {
-      "comment": "Raw titles that should be typed EB (electronic book) when wt=版面 — derived from GT.",
+      "comment": "Raw titles whose 版面 rows are consistently typed EB in the official monthly INPUT_JP ledgers.",
       "match": { "wt": "版面" },
       "titles": [
         "俺だけレベルMAXなビギナー",
         "腐食人【特装版】",
-        "肝臓を奪われた妻",
-        "融点〜とけあい〜[完全版]【特装版】"
+        "肝臓を奪われた妻"
       ],
       "type": "EB"
     },

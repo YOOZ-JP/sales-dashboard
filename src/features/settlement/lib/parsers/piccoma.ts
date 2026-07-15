@@ -44,12 +44,14 @@
  *
  * Type derivation (title-level; multiple GT rows per title when raw has both 話 and 巻 flowing):
  *   - If raw 精算対象当月売上[話]>0 OR 最終精算[話]>0 → emit a 話-row:
- *       * ends with "（ノベル）" → WN
- *       * overrides map {title → 'WR'} for editorial/revised webtoons
- *       * else → WT
+ *       * overrides map {title → 'WR'} for editorial/revised webtoons (authoritative)
+ *       * ends with "（ノベル）" → WN (explicit novel evidence, authoritative)
+ *       * else → WT, marked TYPE_HEURISTIC:chapter in note2 so carry-forward may
+ *         reconcile within the chapter family (WT/WR/WN)
  *   - If raw 精算対象当月売上[巻]>0 OR 最終精算[巻]>0 → emit a 巻-row:
- *       * overrides map {title → 'EP'} (e.g. 結婚商売【完全版】【分冊版】)
- *       * else → EB
+ *       * overrides map {title → 'EP'} (e.g. 結婚商売【完全版】【分冊版】, authoritative)
+ *       * else → EB, marked TYPE_HEURISTIC:volume in note2 so carry-forward may
+ *         reconcile within the volume family (EB/EP)
  *
  * Rs rate: the 取次 column "料率" is a whole-number %. For 202604 only two values
  *   appear (26, 35) and these drive GT.rs. Both 話 and 巻 rows share the same rate.
@@ -100,13 +102,18 @@ function loadAliases(): PiccomaAliases {
   return _aliases;
 }
 
-function classifyKanaType(title: string, column: "話" | "巻"): TypeOverride {
+function classifyKanaType(
+  title: string,
+  column: "話" | "巻",
+): { type: TypeOverride; heuristic: boolean } {
   const a = loadAliases();
   const override = a.type_overrides[title];
-  if (override) return override;
-  if (column === "巻") return "EB";
-  if (/（ノベル）$/.test(title) || /\(ノベル\)$/.test(title)) return "WN";
-  return "WT";
+  if (override) return { type: override, heuristic: false };
+  if (column === "巻") return { type: "EB", heuristic: true };
+  if (/（ノベル）$/.test(title) || /\(ノベル\)$/.test(title)) {
+    return { type: "WN", heuristic: false };
+  }
+  return { type: "WT", heuristic: true };
 }
 
 interface DetailSums {
@@ -220,19 +227,14 @@ function inferMonthFromPiccomaFilename(filename: string): string | null {
   return `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-01`;
 }
 
-function previousMonth(isoMonth: string): string {
-  const [y, m] = isoMonth.split("-").map(Number);
-  const prev = new Date(Date.UTC(y, m - 2, 1));
-  return `${prev.getUTCFullYear()}-${String(prev.getUTCMonth() + 1).padStart(2, "0")}-01`;
-}
-
 function recordsFromDetailOnly(filename: string, buffer: Buffer): { records: RawRecord[]; salesMonth: string | null; settlementMonth: string | null } {
   const detail = parseDetailBuffer(buffer);
-  const settlementMonth = inferMonthFromPiccomaFilename(filename);
-  // Piccoma regular reports usually settle the previous month's sales. The
-  // upload UI still forces the operator-selected settlement month for the DB
-  // batch, so this only fills the workbook's sales-month column when available.
-  const salesMonth = settlementMonth ? previousMonth(settlementMonth) : null;
+  // The 出版社report filename date is the detail report's sales month. Settlement
+  // follows one month later and the deposit lands at the end of the month after
+  // settlement. The upload UI still forces the operator-selected settlement month
+  // for the DB batch, so this only fills the workbook's month columns.
+  const salesMonth = inferMonthFromPiccomaFilename(filename);
+  const settlementMonth = salesMonth ? addMonth(salesMonth) : null;
   const depositMonth = settlementMonth ? addMonth(settlementMonth) : null;
   const records: RawRecord[] = [];
   let rowIdx = 0;
@@ -241,10 +243,12 @@ function recordsFromDetailOnly(filename: string, buffer: Buffer): { records: Raw
     const rawSettle = detail.settle話.get(title) ?? 0;
     if (rawSales === 0 && rawSettle === 0) continue;
     const rsRate = detail.rs話.get(title) ?? (rawSales > 0 ? rawSettle / rawSales : 0);
+    const classified話 = classifyKanaType(title, "話");
     records.push(buildRecord({
       rowIdx: rowIdx++,
       title,
-      type: classifyKanaType(title, "話"),
+      type: classified話.type,
+      typeHeuristic: classified話.heuristic,
       rsRate,
       rawSales,
       rawSettle,
@@ -260,10 +264,12 @@ function recordsFromDetailOnly(filename: string, buffer: Buffer): { records: Raw
     const rawSettle = detail.settle巻.get(title) ?? 0;
     if (rawSales === 0 && rawSettle === 0) continue;
     const rsRate = detail.rs巻.get(title) ?? (rawSales > 0 ? rawSettle / rawSales : 0);
+    const classified巻 = classifyKanaType(title, "巻");
     records.push(buildRecord({
       rowIdx: rowIdx++,
       title,
-      type: classifyKanaType(title, "巻"),
+      type: classified巻.type,
+      typeHeuristic: classified巻.heuristic,
       rsRate,
       rawSales,
       rawSettle,
@@ -377,7 +383,7 @@ export async function parsePiccoma({
       settlement_month: detailOnly.settlementMonth,
       records: detailOnly.records,
       errors: detailOnly.records.length > 0
-        ? ["piccoma: 出版社report detail-only upload parsed directly; 取次report was not uploaded"]
+        ? []
         : ["piccoma: 出版社report detail-only upload contained no parseable detail rows"],
     };
   }
@@ -393,11 +399,6 @@ export async function parsePiccoma({
   const depositMonth = settlementMonth ? addMonth(settlementMonth) : null;
 
   const errors: string[] = [];
-  if (!detail) {
-    errors.push(
-      "piccoma: sibling 出版社report (detail) not found — total_amount_jpy will be approximated via 取次 settle/rs",
-    );
-  }
 
   const records: RawRecord[] = [];
   let rowIdx = 0;
@@ -406,13 +407,14 @@ export async function parsePiccoma({
     // 話 emission
     const settle話 = Math.max(r.settle_current話, r.settle_final話);
     if (settle話 > 0) {
-      const type = classifyKanaType(r.title, "話");
+      const { type, heuristic } = classifyKanaType(r.title, "話");
       const rawSales = detail?.sales話.get(r.title) ?? (r.rs_rate > 0 ? settle話 / r.rs_rate : 0);
       records.push(
         buildRecord({
           rowIdx: rowIdx++,
           title: r.title,
           type,
+          typeHeuristic: heuristic,
           rsRate: r.rs_rate,
           rawSales,
           rawSettle: settle話,
@@ -427,13 +429,14 @@ export async function parsePiccoma({
     // 巻 emission
     const settle巻 = Math.max(r.settle_current巻, r.settle_final巻);
     if (settle巻 > 0) {
-      const type = classifyKanaType(r.title, "巻");
+      const { type, heuristic } = classifyKanaType(r.title, "巻");
       const rawSales = detail?.sales巻.get(r.title) ?? (r.rs_rate > 0 ? settle巻 / r.rs_rate : 0);
       records.push(
         buildRecord({
           rowIdx: rowIdx++,
           title: r.title,
           type,
+          typeHeuristic: heuristic,
           rsRate: r.rs_rate,
           rawSales,
           rawSettle: settle巻,
@@ -460,6 +463,7 @@ function buildRecord(opts: {
   rowIdx: number;
   title: string;
   type: TypeOverride;
+  typeHeuristic: boolean;
   rsRate: number;
   rawSales: number;
   rawSettle: number;
@@ -470,7 +474,7 @@ function buildRecord(opts: {
   col: "話" | "巻";
 }): RawRecord {
   const {
-    rowIdx, title, type, rsRate, rawSales, rawSettle,
+    rowIdx, title, type, typeHeuristic, rsRate, rawSales, rawSettle,
     salesMonth, settlementMonth, depositMonth, mg, col,
   } = opts;
 
@@ -507,6 +511,9 @@ function buildRecord(opts: {
       raw_column: col,
       raw_sales_tax_excl: rawSales,
       raw_settle_tax_excl: rawSettle,
+      note2: typeHeuristic
+        ? (col === "巻" ? "TYPE_HEURISTIC:volume" : "TYPE_HEURISTIC:chapter")
+        : null,
     },
   };
 }

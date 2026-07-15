@@ -6,8 +6,10 @@ import assert from "node:assert/strict";
 
 import {
   dedupeCrossUploadDuplicates,
+  dedupePiccomaStatementDuplicates,
   hasStrictPartyIdentity,
   strictRecordKey,
+  suppressExistingPiccomaStatementDuplicates,
   suppressExistingDuplicates,
 } from "../src/features/settlement/lib/aggregation/strict-record-key";
 
@@ -96,6 +98,79 @@ assert.equal(strictRecordKey(base), strictRecordKey({ ...base }), "identical row
   assert.equal(skipped, 0);
 }
 
+// Piccoma paired summary/detail rows suppress even when derived gross fields differ.
+{
+  const existing = {
+    ...base,
+    client_id: null,
+    channel_id: null,
+    clients: "Piccoma",
+    channel: "piccoma",
+    type: "WT",
+    total_amount_jpy: 1000,
+    before_tax_jpy: 1000,
+  };
+  const incoming = {
+    ...existing,
+    sales_month: "2026-06-01",
+    total_amount_jpy: 999,
+    before_tax_jpy: 999,
+  };
+  const { kept, skipped } = suppressExistingPiccomaStatementDuplicates([incoming], [existing]);
+  assert.equal(kept.length, 0, "Piccoma paired duplicate suppresses without ids or exact amounts");
+  assert.equal(skipped, 1);
+}
+
+// A same-looking row from another platform must never consume Piccoma's budget.
+{
+  const incoming = {
+    ...base,
+    client_id: null,
+    channel_id: null,
+    clients: "Piccoma",
+    channel: "piccoma",
+    type: "WT",
+  };
+  const unrelated = {
+    ...incoming,
+    clients: "Other Client",
+    channel: "other-channel",
+  };
+  const { kept, skipped } = suppressExistingPiccomaStatementDuplicates([incoming], [unrelated]);
+  assert.equal(kept.length, 1, "non-Piccoma row cannot suppress Piccoma insert");
+  assert.equal(skipped, 0);
+}
+
+// Supabase existing-row queries carry foreign-key ids but not display codes.
+// A matching Piccoma DB row must still suppress, while another channel id must not.
+{
+  const incoming = {
+    ...base,
+    client_id: "client-piccoma",
+    channel_id: "channel-piccoma",
+    clients: null,
+    channel: null,
+    type: "WT",
+  };
+  const existing = { ...incoming };
+  const unrelated = { ...incoming, channel_id: "channel-other" };
+  const matched = suppressExistingPiccomaStatementDuplicates([incoming], [existing]);
+  assert.equal(matched.kept.length, 0, "Piccoma DB row suppresses by foreign-key ids");
+  assert.equal(matched.skipped, 1);
+  const notMatched = suppressExistingPiccomaStatementDuplicates([incoming], [unrelated]);
+  assert.equal(notMatched.kept.length, 1, "different channel id cannot consume Piccoma budget");
+  assert.equal(notMatched.skipped, 0);
+}
+
+// Same Piccoma title with different types is legitimate and must survive.
+{
+  const existing = { ...base, clients: "Piccoma", channel: "piccoma", type: "WT" };
+  const incoming = { ...existing, type: "EB" };
+  const { kept, skipped } = suppressExistingPiccomaStatementDuplicates([incoming], [existing]);
+  assert.equal(kept.length, 1, "Piccoma same-title multi-type row survives");
+  assert.equal(skipped, 0);
+}
+
 // --- dedupeCrossUploadDuplicates (export time) ---
 
 // CSV + XLSX twins (1 copy each) → one survives.
@@ -139,6 +214,20 @@ assert.equal(strictRecordKey(base), strictRecordKey({ ...base }), "identical row
   const { records, removed } = dedupeCrossUploadDuplicates(rows);
   assert.equal(records.length, 2, "variants across uploads preserved");
   assert.equal(removed, 0);
+}
+
+// Export-time Piccoma paired duplicate suppression is deterministic by upload id.
+{
+  const rows = [
+    { ...base, clients: "Piccoma", channel: "piccoma", type: "WT", total_amount_jpy: 1000, upload_id: "u2" },
+    { ...base, clients: "Piccoma", channel: "piccoma", type: "WT", total_amount_jpy: 999, upload_id: "u1" },
+    { ...base, clients: "Piccoma", channel: "piccoma", type: "EB", total_amount_jpy: 999, upload_id: "u1" },
+  ];
+  const { records, removed } = dedupePiccomaStatementDuplicates(rows);
+  assert.equal(records.length, 2, "Piccoma paired duplicate hidden, multi-type preserved");
+  assert.equal(removed, 1);
+  assert.ok(records.some((r) => r.type === "EB"), "EB variant survives");
+  assert.ok(records.some((r) => r.upload_id === "u1" && r.type === "WT"), "stable upload keeper");
 }
 
 console.log("strict-record-key: all checks passed");

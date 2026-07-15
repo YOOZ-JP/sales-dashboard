@@ -18,26 +18,19 @@
  *  3. GT `before_tax_income_jpy` = floor(Σ 支払 × 1.10)   ← NOT round; consistently truncates.
  *  4. `rs_rate` = 率 / 100 (each group uses a single rate; raw reports 30 or 35).
  *  5. Type mapping (WT / EP / EB / WR):
+ *       - 種別 contains '話'                                  → WT   (checked before
+ *         title markers: the source kind is authoritative, like MBJ webtoon-first)
+ *       - Whenever title contains '[改訂版]'                  → WR   (override)
  *       - 種別 == '巻' && title contains '分冊版'           → EP
  *       - 種別 == '巻' (no 分冊版)                            → EB   (physical-like volume)
- *       - 種別 contains '話'                                  → WT
- *       - Whenever title contains '[改訂版]'                  → WR   (override)
  *       - Whenever the same series has a sibling whose title adds
  *         '[完全版]' or '【完全版】' → the base series becomes WR (override)
- *     A handful of ambiguous '巻' rows (where 完全版 but no 分冊版 suffix) need an
- *     alias override — captured in data/aliases/mechacomic.json.
+ *     Ambiguous resolutions (bare 巻 → EB, 完全版-sibling WR, no-kind WT) are
+ *     marked TYPE_HEURISTIC in note2; carry-forward reconciles them against
+ *     the prior contract ledger instead of per-title alias overrides.
  */
 import type { ParseResult, RawRecord } from "@/features/settlement/lib/schema/sales";
 import ExcelJS from "exceljs";
-
-// Static alias overrides for the handful of ambiguous 巻 (volume) rows where
-// the default EP/EB heuristic can't tell. Keyed by `${series}|${kind}`.
-// Kept small and data-driven — this table, not the parser logic, is the
-// authoritative record of the exceptions.
-const TYPE_OVERRIDES: Record<string, string> = {
-  "結婚商売[完全版]|巻": "WT",
-  "融点～とけあい～【完全版】|巻": "EP",
-};
 
 const DETAIL_SHEETS = ["スマートフォン明細", "アプリ明細"];
 const REQUIRED_HEADERS = ["シリーズ名", "書名", "売上金額", "率", "支払", "種別"];
@@ -123,19 +116,26 @@ export async function parseMechacomic({
   const allSeries = new Set<string>();
   for (const g of groups.values()) allSeries.add(g.series);
 
+  // Filename: RIVERSE_YYYYMM.xlsx — YYYYMM is the sales month; settlement is the
+  // month *after* the sales month (GT rows in 202604.json have sales_month =
+  // 2026-03-01 for the 202603 file; settlement 2026-04-30) and the deposit lands
+  // at the end of the month after settlement (2026-05-31).
+  const m = filename.match(/(\d{4})(\d{2})/);
+  const salesMonth = m ? `${m[1]}-${m[2]}-01` : null;
+  const settlementMonth = salesMonth ? addMonthsEndOfMonth(salesMonth, 1) : null;
+  const depositMonth = salesMonth ? addMonthsEndOfMonth(salesMonth, 2) : null;
+
   const records: RawRecord[] = [];
   let idx = 0;
   for (const g of groups.values()) {
-    const type = resolveType(g.series, g.kind, allSeries);
+    const { type, heuristic } = resolveType(g, allSeries);
     const rsRate = g.rateCount > 0 ? g.rateSum / g.rateCount / 100 : 0;
 
     // Tax rules (reverse-engineered):
     //   total_amount_jpy    = round(sales * 1.10)
     //   before_tax_income   = floor(pay  * 1.10)   ← floor, not round
-    const total = Math.round(g.sales * 1.10);
     const beforeTaxIncome = Math.floor(g.pay * 1.10);
-    const consumptionTax = total - Math.round(g.sales); // tax part of total
-    const afterTaxIncome = beforeTaxIncome; // withholding is 0 for JP inter-corporate
+    const afterTaxIncome = g.pay;
 
     records.push({
       row_index: idx++,
@@ -146,13 +146,14 @@ export async function parseMechacomic({
         kind_raw: g.kind,
         kubuns: Array.from(g.kubuns),
         // gross/sales
-        gross_jpy: total,
-        total_amount_jpy: total,
-        before_tax_jpy: total,
+        gross_jpy: null,
+        total_amount_jpy: null,
+        before_tax_jpy: null,
+        after_tax_jpy: Math.round(g.sales),
         // income
         before_tax_income_jpy: beforeTaxIncome,
         after_tax_income_jpy: afterTaxIncome,
-        consumption_tax_jpy: consumptionTax,
+        consumption_tax_jpy: null,
         withholding_tax_jpy: 0,
         // raw (tax-exclusive) kept for audit
         raw_sales_jpy: g.sales,
@@ -163,15 +164,11 @@ export async function parseMechacomic({
         // routing
         channel_code: "mechacomic",
         client_code: "amutus",
+        deposit_month: depositMonth,
+        note2: heuristic ? "TYPE_HEURISTIC" : null,
       },
     });
   }
-
-  // Filename: RIVERSE_YYYYMM.xlsx — settlement month = the month *after* the sales month
-  // (GT rows in 202604.json have sales_month = 2026-03-01 for 202603 file; settlement 2026-04-30).
-  const m = filename.match(/(\d{4})(\d{2})/);
-  const salesMonth = m ? `${m[1]}-${m[2]}-01` : null;
-  const settlementMonth = salesMonth ? nextMonthIso(salesMonth) : null;
 
   return {
     platform_code: "mechacomic",
@@ -244,23 +241,41 @@ function findHeaderRow(matrix: unknown[][]): number {
   return -1;
 }
 
-function resolveType(series: string, kind: string, allSeries: Set<string>): string {
-  const overrideKey = `${series}|${kind}`;
-  if (TYPE_OVERRIDES[overrideKey]) return TYPE_OVERRIDES[overrideKey];
-
-  // Revision edition always → WR
-  if (series.includes("改訂版")) return "WR";
-
-  // If this series has a sibling "{series}[完全版]" or "{series}【完全版】" then
-  // the base series is the legacy version → WR.
-  if (hasKanzenSibling(series, allSeries)) return "WR";
-
-  if (kind && kind.includes("話")) return "WT";
-  if (kind === "巻") {
-    if (series.includes("分冊版")) return "EP";
-    return "EB";
+/**
+ * Explicit markers (novel evidence, 改訂版 in the series' own title, 話 kind,
+ * 分冊版 split marker) are authoritative. The 完全版-sibling inference, the
+ * bare-巻 EB default, and the no-kind WT default are heuristics: rows typed
+ * that way carry the TYPE_HEURISTIC audit marker in note2 so carry-forward
+ * may reconcile them against the prior contract ledger.
+ */
+function resolveType(
+  group: Group,
+  allSeries: Set<string>,
+): { type: string; heuristic: boolean } {
+  const { series, kind } = group;
+  if (hasNovelMarker([series, kind, ...group.kubuns].join(" "))) {
+    return { type: "WN", heuristic: false };
   }
-  return "WT"; // safe default
+  // Revision-edition contract remains authoritative for MechaComic even when
+  // the statement kind is 話.
+  if (series.includes("改訂版")) return { type: "WR", heuristic: false };
+
+  // A complete-edition sibling is a contract-family signal and must be
+  // evaluated before the coarse 話/巻 kind. It remains heuristic so the prior
+  // ledger may reconcile the exact contract type.
+  if (hasKanzenSibling(series, allSeries)) return { type: "WR", heuristic: true };
+
+  if (kind && kind.includes("話")) return { type: "WT", heuristic: false };
+
+  if (kind === "巻") {
+    if (series.includes("分冊版")) return { type: "EP", heuristic: false };
+    return { type: "EB", heuristic: true };
+  }
+  return { type: "WT", heuristic: true }; // safe default
+}
+
+function hasNovelMarker(value: string): boolean {
+  return /(?:ノベル|小説|書籍|web\s*novel|ｗｅｂ\s*novel|WN)/iu.test(value);
 }
 
 function hasKanzenSibling(series: string, allSeries: Set<string>): boolean {
@@ -278,10 +293,12 @@ function hasKanzenSibling(series: string, allSeries: Set<string>): boolean {
   return false;
 }
 
-function nextMonthIso(iso: string): string {
+/** End of month `months` after a YYYY-MM-01 string (UTC-safe). */
+function addMonthsEndOfMonth(iso: string, months: number): string {
   const [y, m] = iso.split("-").map(Number);
-  const d = new Date(Date.UTC(y, m, 0)); // last day of (y, m)
-  return d.toISOString().slice(0, 10);
+  // Day 0 of the following month index = last day of the target month.
+  const target = new Date(Date.UTC(y, m - 1 + months + 1, 0));
+  return target.toISOString().slice(0, 10);
 }
 
 function strOr(v: unknown): string {

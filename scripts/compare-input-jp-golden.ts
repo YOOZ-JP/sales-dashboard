@@ -2,9 +2,6 @@ import ExcelJS from "exceljs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-const DEFAULT_GOLDEN = path.resolve(
-  "src/features/settlement/data/templates/input_jp_2026_2605_golden.xlsx",
-);
 const DEFAULT_REPORT = path.resolve(
   "tmp_2605_analysis/input_jp_golden_compare_report.json",
 );
@@ -141,13 +138,11 @@ function compareRecord(
 
 async function main(): Promise<void> {
   const candidatePath = process.argv[2];
-  const goldenPath = process.argv[3] ?? DEFAULT_GOLDEN;
+  const goldenPath = process.argv[3];
   const reportPath = process.argv[4] ?? DEFAULT_REPORT;
 
-  if (!candidatePath) {
-    throw new Error(
-      "Usage: tsx scripts/compare-input-jp-golden.ts <candidate.xlsx> [golden.xlsx] [report.json]",
-    );
+  if (!candidatePath || !goldenPath) {
+    throw new Error("Usage: compare-input-jp-golden <candidate.xlsx> <private-golden.xlsx> [report.json]");
   }
 
   const [goldenWorkbook, candidateWorkbook] = await Promise.all([

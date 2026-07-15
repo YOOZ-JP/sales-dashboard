@@ -38,8 +38,10 @@
  *     (only affects 融点〜とけあい〜【タテヨミ】)
  *
  * TYPE
- *   default WT — every raw title carries 【タテヨミ】.
- *   one editorial WR override: 融点～とけあい～【タテヨミ】 (all-ages variant).
+ *   The detail CSV is authoritative vertical evidence: 【タテヨミ】 → WT, and
+ *   the config default (WT) covers the rest. No per-title overrides — a type
+ *   conflict with the prior contract ledger is reconciled at carry-forward,
+ *   not by re-tagging source rows.
  */
 import type { ParseResult, RawRecord } from "@/features/settlement/lib/schema/sales";
 import Papa from "papaparse";
@@ -49,7 +51,6 @@ import path from "node:path";
 
 interface AliasConfig {
   title_rules: Array<{ pattern: string; replace: string }>;
-  type_overrides: Record<string, string>;
   default_type: string;
   default_rs: number;
 }
@@ -68,7 +69,6 @@ function loadAliases(): AliasConfig {
       const j = JSON.parse(fs.readFileSync(p, "utf-8"));
       aliasCache = {
         title_rules: j.title_normalization ?? [],
-        type_overrides: j.type_overrides ?? {},
         default_type: j.type_rules?.[0]?.type ?? "WT",
         default_rs: j.default_rs ?? 0.35,
       };
@@ -77,7 +77,6 @@ function loadAliases(): AliasConfig {
   }
   aliasCache = {
     title_rules: [{ pattern: "〜", replace: "～" }],
-    type_overrides: {},
     default_type: "WT",
     default_rs: 0.35,
   };
@@ -92,14 +91,6 @@ export function normalizeMangabangTitle(s: string): string {
     out = out.split(rule.pattern).join(rule.replace);
   }
   return out;
-}
-
-/** WT by default, with per-title WR overrides loaded from alias config. */
-export function classifyMangabangType(channelTitle: string): "WT" | "WR" | "EP" | "EB" {
-  const a = loadAliases();
-  const override = a.type_overrides[channelTitle];
-  if (override) return override as "WT" | "WR" | "EP" | "EB";
-  return a.default_type as "WT" | "WR" | "EP" | "EB";
 }
 
 function decodeShiftJis(buffer: Buffer): string {
@@ -138,6 +129,21 @@ function toNum(v: unknown): number {
   if (v == null || v === "") return 0;
   const n = typeof v === "number" ? v : Number(String(v).replace(/,/g, ""));
   return isFinite(n) ? n : 0;
+}
+
+/** First day of month `months` after a YYYY-MM-01 string (UTC-safe). */
+function addMonthsFirstOfMonth(iso: string, months: number): string {
+  const [y, m] = iso.split("-").map(Number);
+  const d = new Date(Date.UTC(y, m - 1 + months, 1));
+  return d.toISOString().slice(0, 10);
+}
+
+/** End of month `months` after a YYYY-MM-01 string (UTC-safe). */
+function addMonthsEndOfMonth(iso: string, months: number): string {
+  // Day 0 of the following month index = last day of the target month.
+  const [y, m] = iso.split("-").map(Number);
+  const target = new Date(Date.UTC(y, m - 1 + months + 1, 0));
+  return target.toISOString().slice(0, 10);
 }
 
 export async function parseMangabang({
@@ -236,12 +242,24 @@ export async function parseMangabang({
     aggs.set(channelTitle, prev);
   }
 
+  // Derive settlement month from filename YYYYMM (= sales_month + 1); the
+  // payout lands at the end of that settlement month.
+  const mm = filename.match(/(\d{4})(\d{2})/);
+  const sales_month_filename = mm ? `${mm[1]}-${mm[2]}-01` : null;
+  const settlement_month = sales_month_filename
+    ? addMonthsFirstOfMonth(sales_month_filename, 1)
+    : null;
+  const deposit_month = sales_month_filename
+    ? addMonthsEndOfMonth(sales_month_filename, 1)
+    : null;
+
   const aliases = loadAliases();
   const records: RawRecord[] = [];
   let rowIdx = 0;
 
   for (const a of aggs.values()) {
-    const type = classifyMangabangType(a.channel_title);
+    // The detail CSV is authoritative vertical evidence: every row is WT.
+    const type = "WT";
     const rs_rate = a.rs_rates.size === 1 ? [...a.rs_rates][0] : aliases.default_rs;
 
     const total_amount_jpy = Math.round(a.sum_excl * 1.10);
@@ -256,6 +274,7 @@ export async function parseMangabang({
       row_index: rowIdx++,
       data: {
         sales_month: a.sales_month,
+        deposit_month,
         channel_title_jp: a.channel_title,
         title_jp: a.channel_title,
         client_code: "amazia",
@@ -275,18 +294,8 @@ export async function parseMangabang({
     });
   }
 
-  // Derive settlement month from filename YYYYMM (= sales_month + 1).
-  const mm = filename.match(/(\d{4})(\d{2})/);
-  let settlement_month: string | null = null;
-  let sales_month_top: string | null = null;
-  if (mm) {
-    const y = Number(mm[1]);
-    const m = Number(mm[2]);
-    sales_month_top = `${mm[1]}-${mm[2]}-01`;
-    const ny = m === 12 ? y + 1 : y;
-    const nm = m === 12 ? 1 : m + 1;
-    settlement_month = `${ny}-${String(nm).padStart(2, "0")}-01`;
-  } else {
+  let sales_month_top = sales_month_filename;
+  if (!sales_month_top) {
     // Fallback to the first record's sales_month.
     const firstWithMonth = records.find(r => typeof r.data.sales_month === "string");
     sales_month_top = firstWithMonth ? (firstWithMonth.data.sales_month as string) : null;
