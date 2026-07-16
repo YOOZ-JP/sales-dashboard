@@ -171,11 +171,16 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
-export default function SettlementCompareClient({ month }: { month: string }) {
+export default function SettlementCompareClient({ month, embedded = false }: { month: string; embedded?: boolean }) {
   const { t } = useApp();
   const sourceFilesInputRef = useRef<HTMLInputElement | null>(null);
   const sourceFolderInputRef = useRef<HTMLInputElement | null>(null);
   const answerInputRef = useRef<HTMLInputElement | null>(null);
+  const loadRunsSeqRef = useRef(0);
+  const loadRunDetailsSeqRef = useRef(0);
+  const compareSeqRef = useRef(0);
+  const patchDiffSeqRef = useRef(0);
+  const currentMonthRef = useRef(month);
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string>("");
   const [run, setRun] = useState<Run | null>(null);
@@ -197,28 +202,72 @@ export default function SettlementCompareClient({ month }: { month: string }) {
   const [uploadSummary, setUploadSummary] = useState<UploadSummary | null>(null);
   const [answerFile, setAnswerFile] = useState<File | null>(null);
 
+  currentMonthRef.current = month;
+
   const monthLabel = t(`${Number(month.slice(0, 4))}년 ${Number(month.slice(4, 6))}월`, `${Number(month.slice(0, 4))}年${Number(month.slice(4, 6))}月`);
 
+  function clearMonthState() {
+    setRuns([]);
+    setSelectedRunId("");
+    setRun(null);
+    setDiffs([]);
+    setTotalDiffs(0);
+    setOffset(0);
+    setCategory("");
+    setReviewStatus("");
+    setNotes({});
+    setError(null);
+    setAnswerFile(null);
+    setSourceSelection([]);
+    setIgnoredSourceCount(0);
+    setUploadSummary(null);
+    setUploadProgress(null);
+    setLoadingDiffs(false);
+    if (answerInputRef.current) answerInputRef.current.value = "";
+    if (sourceFilesInputRef.current) sourceFilesInputRef.current.value = "";
+    if (sourceFolderInputRef.current) sourceFolderInputRef.current.value = "";
+  }
+
+  function invalidateRunDetails() {
+    loadRunDetailsSeqRef.current += 1;
+  }
+
   async function loadRuns(selectLatest = false) {
+    const requestSeq = ++loadRunsSeqRef.current;
+    const requestMonth = month;
     setLoadingRuns(true);
     setError(null);
     try {
-      const res = await fetch(`/api/settlement/comparisons?month=${month}`);
+      const res = await fetch(`/api/settlement/comparisons?month=${requestMonth}`);
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      if (requestSeq !== loadRunsSeqRef.current || requestMonth !== currentMonthRef.current) return;
       const nextRuns = (json.runs ?? []) as Run[];
       setRuns(nextRuns);
       if (nextRuns.length > 0 && (selectLatest || !selectedRunId)) {
+        invalidateRunDetails();
         setSelectedRunId(nextRuns[0].id);
+      } else if (nextRuns.length === 0) {
+        invalidateRunDetails();
+        setSelectedRunId("");
+        setRun(null);
+        setDiffs([]);
+        setTotalDiffs(0);
+        setNotes({});
       }
     } catch (e) {
+      if (requestSeq !== loadRunsSeqRef.current || requestMonth !== currentMonthRef.current) return;
       setError((e as Error).message);
     } finally {
-      setLoadingRuns(false);
+      if (requestSeq === loadRunsSeqRef.current && requestMonth === currentMonthRef.current) {
+        setLoadingRuns(false);
+      }
     }
   }
 
   async function loadRunDetails(id: string, nextOffset = offset) {
+    const requestSeq = ++loadRunDetailsSeqRef.current;
+    const requestMonth = month;
     if (!id) {
       setRun(null);
       setDiffs([]);
@@ -237,19 +286,29 @@ export default function SettlementCompareClient({ month }: { month: string }) {
       const res = await fetch(`/api/settlement/comparisons/${id}?${params.toString()}`);
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      if (requestSeq !== loadRunDetailsSeqRef.current || requestMonth !== currentMonthRef.current) return;
       setRun(json.run as Run);
       const nextDiffs = (json.diffs ?? []) as Diff[];
       setDiffs(nextDiffs);
       setTotalDiffs(Number(json.pagination?.total ?? 0));
       setNotes(Object.fromEntries(nextDiffs.map((d) => [d.id, d.review_note ?? ""])));
     } catch (e) {
+      if (requestSeq !== loadRunDetailsSeqRef.current || requestMonth !== currentMonthRef.current) return;
       setError((e as Error).message);
     } finally {
-      setLoadingDiffs(false);
+      if (requestSeq === loadRunDetailsSeqRef.current && requestMonth === currentMonthRef.current) {
+        setLoadingDiffs(false);
+      }
     }
   }
 
   useEffect(() => {
+    compareSeqRef.current += 1;
+    patchDiffSeqRef.current += 1;
+    setSubmitting(false);
+    setPatchingId(null);
+    invalidateRunDetails();
+    clearMonthState();
     void loadRuns(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [month]);
@@ -356,31 +415,45 @@ export default function SettlementCompareClient({ month }: { month: string }) {
 
   async function compareAnswer() {
     if (!answerFile) return;
+    const requestSeq = ++compareSeqRef.current;
+    const requestMonth = month;
+    const isCurrentRequest = () => requestSeq === compareSeqRef.current && requestMonth === currentMonthRef.current;
     setSubmitting(true);
     setError(null);
     try {
       const form = new FormData();
-      form.append("month", month);
+      form.append("month", requestMonth);
       form.append("answer", answerFile);
       const res = await fetch("/api/settlement/comparisons", { method: "POST", body: form });
+      if (!isCurrentRequest()) return;
       const json = await res.json().catch(() => ({}));
+      if (!isCurrentRequest()) return;
       if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
       await loadRuns(true);
+      if (!isCurrentRequest()) return;
       if (json.run_id) {
+        invalidateRunDetails();
         setSelectedRunId(String(json.run_id));
         setOffset(0);
       }
       setAnswerFile(null);
       if (answerInputRef.current) answerInputRef.current.value = "";
     } catch (e) {
+      if (!isCurrentRequest()) return;
       setError((e as Error).message);
       await loadRuns(true);
+      if (!isCurrentRequest()) return;
     } finally {
-      setSubmitting(false);
+      if (isCurrentRequest()) {
+        setSubmitting(false);
+      }
     }
   }
 
   async function patchDiff(diff: Diff, status: ReviewStatus) {
+    const requestSeq = ++patchDiffSeqRef.current;
+    const requestMonth = month;
+    const isCurrentRequest = () => requestSeq === patchDiffSeqRef.current && requestMonth === currentMonthRef.current;
     setPatchingId(diff.id);
     setError(null);
     try {
@@ -389,15 +462,20 @@ export default function SettlementCompareClient({ month }: { month: string }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ review_status: status, note: notes[diff.id] ?? "" }),
       });
+      if (!isCurrentRequest()) return;
       const json = await res.json().catch(() => ({}));
+      if (!isCurrentRequest()) return;
       if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
       const updated = json.diff as Diff;
       setDiffs((prev) => prev.map((row) => (row.id === updated.id ? updated : row)));
       setNotes((prev) => ({ ...prev, [updated.id]: updated.review_note ?? "" }));
     } catch (e) {
+      if (!isCurrentRequest()) return;
       setError((e as Error).message);
     } finally {
-      setPatchingId(null);
+      if (isCurrentRequest()) {
+        setPatchingId(null);
+      }
     }
   }
 
@@ -406,17 +484,17 @@ export default function SettlementCompareClient({ month }: { month: string }) {
     () => (Array.isArray(summary?.source_warnings) ? summary.source_warnings : []),
     [summary],
   );
-  const busy = uploadingSources || submitting;
+  const busy = (!embedded && uploadingSources) || submitting;
   const pageStart = totalDiffs === 0 ? 0 : offset + 1;
   const pageEnd = Math.min(offset + PAGE_SIZE, totalDiffs);
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-8">
+    <div className={embedded ? "flex w-full flex-col gap-6" : "mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-8"}>
+      {!embedded && (
       <header className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-emerald-600">Settlement Compare</p>
-            <h1 className="mt-2 text-2xl font-bold text-slate-950 dark:text-white">
+            <h1 className="text-2xl font-bold text-slate-950 dark:text-white">
               {t("정산 정답지 비교", "精算 正解ファイル比較")} · {monthLabel}
             </h1>
             <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
@@ -428,12 +506,30 @@ export default function SettlementCompareClient({ month }: { month: string }) {
           {t("페이지의 정산월이 기준입니다. 소스 원본은 직접 업로드로 저장하고, 정답지는 3.5MB 이하 .xlsx만 비교에 사용합니다.", "ページの精算月が基準です。ソース原本は直接アップロードで保存し、正解ファイルは3.5MB以下の .xlsx のみ比較に使用します。")}
         </p>
       </header>
+      )}
+
+      {embedded && (
+        <div>
+          <h2 className="text-lg font-bold text-slate-950 dark:text-white">
+            {t("정답지 비교", "正解ファイル比較")} · {monthLabel}
+          </h2>
+        </div>
+      )}
 
       <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
         <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t("비교 워크플로", "比較ワークフロー")}</h2>
         <div className="mt-4 grid gap-4 lg:grid-cols-3">
           <div className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
             <p className="text-xs font-bold text-emerald-700 dark:text-emerald-300">{t("1단계 · 기존 INPUT 저장·파싱", "ステップ1 · 既存INPUTの保存・解析")}</p>
+            {embedded ? (
+              <p className="mt-3 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+                {t(
+                  "INPUT 업로드는 상단의 정산 작업 탭에서 진행해 주세요. 이 비교 탭은 같은 정산월에 저장된 INPUT 후보를 사용합니다.",
+                  "INPUTアップロードは上部の精算作業タブで行ってください。この比較タブは同じ精算月に保存されたINPUT候補を使用します。",
+                )}
+              </p>
+            ) : (
+              <>
             <div className="mt-3 flex flex-wrap gap-2">
               <label className="inline-flex cursor-pointer items-center rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-800 transition hover:border-emerald-500 dark:border-slate-700 dark:text-slate-100">
                 <UploadCloud className="mr-1.5 h-3.5 w-3.5" />
@@ -521,6 +617,8 @@ export default function SettlementCompareClient({ month }: { month: string }) {
                 )}
               </div>
             )}
+              </>
+            )}
           </div>
 
           <div className="rounded-xl border border-slate-200 p-4 dark:border-slate-800">
@@ -602,6 +700,7 @@ export default function SettlementCompareClient({ month }: { month: string }) {
                 key={item.id}
                 type="button"
                 onClick={() => {
+                  invalidateRunDetails();
                   setSelectedRunId(item.id);
                   setOffset(0);
                 }}
@@ -702,6 +801,7 @@ export default function SettlementCompareClient({ month }: { month: string }) {
                 <select
                   value={category}
                   onChange={(e) => {
+                    invalidateRunDetails();
                     setCategory(e.target.value as DiffCategory | "");
                     setOffset(0);
                   }}
@@ -713,6 +813,7 @@ export default function SettlementCompareClient({ month }: { month: string }) {
                 <select
                   value={reviewStatus}
                   onChange={(e) => {
+                    invalidateRunDetails();
                     setReviewStatus(e.target.value as ReviewStatus | "");
                     setOffset(0);
                   }}
@@ -795,7 +896,10 @@ export default function SettlementCompareClient({ month }: { month: string }) {
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                  onClick={() => {
+                    invalidateRunDetails();
+                    setOffset(Math.max(0, offset - PAGE_SIZE));
+                  }}
                   disabled={offset === 0 || loadingDiffs}
                   className="rounded-lg border border-slate-300 px-3 py-1.5 font-semibold disabled:opacity-40 dark:border-slate-700"
                 >
@@ -803,7 +907,10 @@ export default function SettlementCompareClient({ month }: { month: string }) {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setOffset(offset + PAGE_SIZE)}
+                  onClick={() => {
+                    invalidateRunDetails();
+                    setOffset(offset + PAGE_SIZE);
+                  }}
                   disabled={offset + PAGE_SIZE >= totalDiffs || loadingDiffs}
                   className="rounded-lg border border-slate-300 px-3 py-1.5 font-semibold disabled:opacity-40 dark:border-slate-700"
                 >

@@ -1,6 +1,4 @@
-import { notFound } from "next/navigation";
-
-import SettlementCompareClient from "@/features/settlement/components/SettlementCompareClient";
+import { notFound, redirect } from "next/navigation";
 
 function validMonth(month: string) {
   if (!/^\d{6}$/.test(month)) return false;
@@ -15,5 +13,5 @@ export default async function SettlementComparePage({
 }) {
   const { month } = await params;
   if (!validMonth(month)) notFound();
-  return <SettlementCompareClient month={month} />;
+  redirect(`/settlement?month=${month}&tab=compare`);
 }

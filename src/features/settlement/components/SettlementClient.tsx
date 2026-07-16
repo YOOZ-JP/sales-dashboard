@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FolderOpen, Loader2, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
+import SettlementCompareClient from '@/features/settlement/components/SettlementCompareClient';
 import { uploadSettlementFileDirect } from '@/features/settlement/lib/storage/direct-upload-client';
 
 type UploadResult = {
@@ -123,7 +124,15 @@ async function collectFilesFromEntry(entry: FileSystemEntry, collected: Selected
 
 const YEAR_RANGE = 3;
 
-export default function SettlementClient() {
+type SettlementTab = 'work' | 'compare';
+
+export default function SettlementClient({
+  initialMonth,
+  initialTab = 'work',
+}: {
+  initialMonth?: string;
+  initialTab?: SettlementTab;
+}) {
   const { t } = useApp();
   const now = new Date();
   const currentYear = now.getFullYear();
@@ -131,7 +140,8 @@ export default function SettlementClient() {
   // The single source of truth for "which settlement month is this upload":
   // whatever the operator picked here is sent as activeMonth with every
   // request and overrides any month found inside file contents or names.
-  const [month, setMonth] = useState(defaultMonth);
+  const [month, setMonth] = useState(initialMonth ?? defaultMonth);
+  const [tab, setTab] = useState<SettlementTab>(initialTab);
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
   // Synchronous guard against overlapping runs: a second drop while a folder
@@ -159,6 +169,10 @@ export default function SettlementClient() {
   const selectedMonthNum = Number(month.slice(4, 6));
   const minYear = currentYear - YEAR_RANGE;
   const maxYear = currentYear + YEAR_RANGE;
+
+  useEffect(() => {
+    window.history.replaceState(null, '', `/settlement?month=${month}&tab=${tab}`);
+  }, [month, tab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -439,113 +453,139 @@ export default function SettlementClient() {
         <h1 className="mt-2 text-2xl font-bold text-slate-950 dark:text-white">{t('정산 / INPUT Export', '精算 / INPUT Export')}</h1>
         <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
           {t(
-            '정산월을 고른 뒤 파일이나 폴더를 올리면 바로 파싱·저장되고, 해당 월의 INPUT v2 엑셀 미리보기와 다운로드가 준비됩니다.',
-            '精算月を選んでファイルやフォルダをアップロードすると、すぐに解析・保存され、該当月のINPUT v2 Excelのプレビューとダウンロードが利用できます。',
+            '정산월 선택부터 파일 업로드, INPUT 미리보기·내보내기, 정답지 비교, 담당자 검토까지 한 흐름에서 처리합니다.',
+            '精算月の選択からファイルアップロード、INPUTプレビュー・エクスポート、正解ファイル比較、担当者レビューまで一連の流れで処理します。',
           )}
         </p>
       </header>
 
-      <section className="grid gap-4 lg:grid-cols-[340px_1fr]">
-        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t('1. 정산월 선택', '1. 精算月を選択')}</h2>
-          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            {t('어느 달의 정산 데이터를 업로드하나요?', 'どの月の精算データをアップロードしますか？')}
-          </p>
-
-          <div className="mt-4 flex items-center justify-between rounded-xl bg-slate-100 px-2 py-1.5 dark:bg-slate-950">
-            <button
-              type="button"
-              onClick={() => changeYear(selectedYear - 1)}
-              disabled={uploading || selectedYear <= minYear}
-              aria-label={t('이전 연도', '前の年')}
-              className="rounded-lg p-2 text-slate-600 transition hover:bg-white hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <ChevronLeft className="h-5 w-5" />
-            </button>
-            <span className="text-xl font-bold text-slate-950 dark:text-white">{t(`${selectedYear}년`, `${selectedYear}年`)}</span>
-            <button
-              type="button"
-              onClick={() => changeYear(selectedYear + 1)}
-              disabled={uploading || selectedYear >= maxYear}
-              aria-label={t('다음 연도', '次の年')}
-              className="rounded-lg p-2 text-slate-600 transition hover:bg-white hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <ChevronRight className="h-5 w-5" />
-            </button>
-          </div>
-
-          <div className="mt-3 grid grid-cols-3 gap-2">
-            {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
-              const yyyymm = `${selectedYear}${String(m).padStart(2, '0')}`;
-              const active = m === selectedMonthNum;
-              const hasData = (monthPlatforms?.[yyyymm]?.length ?? 0) > 0;
-              return (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => changeMonth(yyyymm)}
-                  disabled={uploading}
-                  className={`${pickerButtonBase} ${
-                    active && hasData
-                      ? 'bg-emerald-600 text-white shadow-sm ring-2 ring-emerald-300 dark:ring-emerald-500'
-                      : active
-                        ? 'bg-blue-600 text-white shadow-sm'
-                        : hasData
-                          ? 'bg-emerald-50 text-emerald-800 ring-1 ring-inset ring-emerald-300 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-200 dark:ring-emerald-800 dark:hover:bg-emerald-950/70'
-                          : 'bg-slate-100 text-slate-700 hover:bg-blue-100 hover:text-blue-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800'
-                  }`}
-                >
-                  {t(`${m}월`, `${m}月`)}
-                  {hasData && <span aria-hidden className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-current align-middle" />}
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950">
-            <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
-              {t(`${monthLabel(month)} 저장된 플랫폼`, `${monthLabel(month)} 保存済みプラットフォーム`)}
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t('1. 정산월 선택', '1. 精算月を選択')}</h2>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              {t('작업과 정답지 비교가 함께 사용할 정산월입니다.', '作業と正解ファイル比較で共通して使用する精算月です。')}
             </p>
-            {monthPlatformsLoading ? (
-              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                <Loader2 className="mr-1 inline h-3 w-3 animate-spin align-[-2px]" />
-                {t('플랫폼 현황을 불러오는 중…', 'プラットフォーム状況を読み込み中…')}
-              </p>
-            ) : monthPlatforms === null ? (
-              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                {t('플랫폼 현황을 불러오지 못했습니다.', 'プラットフォーム状況を読み込めませんでした。')}
-              </p>
-            ) : (monthPlatforms[month]?.length ?? 0) === 0 ? (
-              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                {t('이 달에는 저장된 정산 데이터가 없습니다.', 'この月には保存された精算データはありません。')}
-              </p>
-            ) : (
-              <>
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {monthPlatforms[month].map((p, idx) => (
-                    <span
-                      key={`${p.code ?? 'unknown'}-${idx}`}
-                      className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-semibold text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
-                    >
-                      {p.name ?? p.code ?? t('미분류', '未分類')}
-                    </span>
-                  ))}
-                </div>
-                <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
-                  {t('초록색 월은 이미 정산 데이터가 저장된 달입니다.', '緑色の月はすでに精算データが保存されている月です。')}
-                </p>
-              </>
-            )}
           </div>
-
-          <p className="mt-4 rounded-lg bg-blue-50 p-3 text-xs leading-relaxed text-blue-900 dark:bg-blue-950/40 dark:text-blue-100">
-            {t(
-              `선택한 ${monthLabel(month)}이(가) 이번 업로드의 정산월이 됩니다. 파일 내용이나 폴더 이름에 다른 월이 적혀 있어도 항상 이 선택이 우선합니다.`,
-              `選択した${monthLabel(month)}が今回のアップロードの精算月になります。ファイル内容やフォルダ名に別の月が書かれていても、常にこの選択が優先されます。`,
-            )}
-          </p>
         </div>
 
+        <div className="mt-4 flex items-center justify-between rounded-xl bg-slate-100 px-2 py-1.5 dark:bg-slate-950">
+          <button
+            type="button"
+            onClick={() => changeYear(selectedYear - 1)}
+            disabled={uploading || selectedYear <= minYear}
+            aria-label={t('이전 연도', '前の年')}
+            className="rounded-lg p-2 text-slate-600 transition hover:bg-white hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+          <span className="text-xl font-bold text-slate-950 dark:text-white">{t(`${selectedYear}년`, `${selectedYear}年`)}</span>
+          <button
+            type="button"
+            onClick={() => changeYear(selectedYear + 1)}
+            disabled={uploading || selectedYear >= maxYear}
+            aria-label={t('다음 연도', '次の年')}
+            className="rounded-lg p-2 text-slate-600 transition hover:bg-white hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            <ChevronRight className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-6 xl:grid-cols-12">
+          {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => {
+            const yyyymm = `${selectedYear}${String(m).padStart(2, '0')}`;
+            const active = m === selectedMonthNum;
+            const hasData = (monthPlatforms?.[yyyymm]?.length ?? 0) > 0;
+            return (
+              <button
+                key={m}
+                type="button"
+                onClick={() => changeMonth(yyyymm)}
+                disabled={uploading}
+                className={`${pickerButtonBase} ${
+                  active && hasData
+                    ? 'bg-emerald-600 text-white shadow-sm ring-2 ring-emerald-300 dark:ring-emerald-500'
+                    : active
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : hasData
+                        ? 'bg-emerald-50 text-emerald-800 ring-1 ring-inset ring-emerald-300 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-200 dark:ring-emerald-800 dark:hover:bg-emerald-950/70'
+                        : 'bg-slate-100 text-slate-700 hover:bg-blue-100 hover:text-blue-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800'
+                }`}
+              >
+                {t(`${m}월`, `${m}月`)}
+                {hasData && <span aria-hidden className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-current align-middle" />}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-950">
+          <p className="text-xs font-bold text-slate-700 dark:text-slate-200">
+            {t(`${monthLabel(month)} 저장된 플랫폼`, `${monthLabel(month)} 保存済みプラットフォーム`)}
+          </p>
+          {monthPlatformsLoading ? (
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              <Loader2 className="mr-1 inline h-3 w-3 animate-spin align-[-2px]" />
+              {t('플랫폼 현황을 불러오는 중…', 'プラットフォーム状況を読み込み中…')}
+            </p>
+          ) : monthPlatforms === null ? (
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              {t('플랫폼 현황을 불러오지 못했습니다.', 'プラットフォーム状況を読み込めませんでした。')}
+            </p>
+          ) : (monthPlatforms[month]?.length ?? 0) === 0 ? (
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              {t('이 달에는 저장된 정산 데이터가 없습니다.', 'この月には保存された精算データはありません。')}
+            </p>
+          ) : (
+            <>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {monthPlatforms[month].map((p, idx) => (
+                  <span
+                    key={`${p.code ?? 'unknown'}-${idx}`}
+                    className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-semibold text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300"
+                  >
+                    {p.name ?? p.code ?? t('미분류', '未分類')}
+                  </span>
+                ))}
+              </div>
+              <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                {t('초록색 월은 이미 정산 데이터가 저장된 달입니다.', '緑色の月はすでに精算データが保存されている月です。')}
+              </p>
+            </>
+          )}
+        </div>
+
+        <p className="mt-4 rounded-lg bg-blue-50 p-3 text-xs leading-relaxed text-blue-900 dark:bg-blue-950/40 dark:text-blue-100">
+          {t(
+            `선택한 ${monthLabel(month)}이(가) 이번 업로드와 정답지 비교의 정산월이 됩니다. 파일 내용이나 폴더 이름에 다른 월이 적혀 있어도 항상 이 선택이 우선합니다.`,
+            `選択した${monthLabel(month)}が今回のアップロードと正解ファイル比較の精算月になります。ファイル内容やフォルダ名に別の月が書かれていても、常にこの選択が優先されます。`,
+          )}
+        </p>
+      </section>
+
+      <div className="inline-flex w-full rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:w-fit">
+        {[
+          ['work', t('정산 작업', '精算作業')],
+          ['compare', t('정답지 비교', '正解ファイル比較')],
+        ].map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            onClick={() => setTab(value as SettlementTab)}
+            className={`flex-1 rounded-lg px-4 py-2 text-sm font-bold transition sm:flex-none ${
+              tab === value
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'work' ? (
+        <>
+      <section>
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t('2. 파일 올리기', '2. ファイルをアップロード')}</h2>
           <div
@@ -602,13 +642,6 @@ export default function SettlementClient() {
               <ExternalLink className="mr-2 h-4 w-4" />
               {t('INPUT Excel 미리보기 열기', 'INPUT Excel プレビューを開く')}
             </button>
-            <a
-              href={validMonth ? `/settlement-compare/${month}` : undefined}
-              className={`inline-flex items-center rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2 text-sm font-semibold dark:border-emerald-900 dark:bg-emerald-950/40 ${validMonth ? 'text-emerald-800 transition hover:border-emerald-500 hover:bg-emerald-100 dark:text-emerald-200 dark:hover:bg-emerald-950' : 'pointer-events-none opacity-50'}`}
-            >
-              <ExternalLink className="mr-2 h-4 w-4" />
-              {t('정답지 비교 열기', '正解ファイル比較を開く')}
-            </a>
             <button
               onClick={resetMonth}
               disabled={!validMonth || resetting || uploading}
@@ -755,6 +788,10 @@ export default function SettlementClient() {
             </table>
           </div>
         </section>
+      )}
+        </>
+      ) : (
+        <SettlementCompareClient month={month} embedded />
       )}
     </div>
   );
