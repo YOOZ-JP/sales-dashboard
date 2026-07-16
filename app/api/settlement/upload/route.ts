@@ -1,27 +1,32 @@
 /**
  * POST /api/settlement/upload
  *
- * Accepts multipart form with one or more raw settlement files. Per file:
- *   1. Insert a raw_uploads row in status 'parsing' — done before any parsing
- *      so a function timeout (504) still leaves durable evidence of which
- *      file was in flight
- *   2. Detect platform + parse (server-side)
- *   3. Write to the archive (archive/YYYY-MM/<ts>_<name>) and update the
- *      raw_uploads row with the parse outcome
- *   4. Insert raw_records (line-items)
- *   5. Build sales_records rows via the shared transformer
+ * Supports two upload modes:
+ *   - multipart/form-data with raw files, archived before parsing
+ *   - application/json { upload_id } for files already uploaded directly to
+ *     private Supabase Storage through /api/settlement/uploads/prepare
  *
- * Requires the same dashboard refresh-token cookie as protected pages.
- * The DB is touched only after the dashboard cookie guard passes, using the
- * same server Supabase client as the rest of the dashboard.
+ * Both modes converge on the same buffer -> parse -> raw_records ->
+ * sales_records business logic.
  */
 import { NextResponse } from "next/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+import { supabaseServer } from "@/lib/supabase-server";
 import { requireSettlementApiAuth } from "@/features/settlement/lib/api-auth";
 import { resolveSettlementMonth } from "@/features/settlement/lib/resolve-settlement-month";
-import type { Json, RawUploadInsert } from "@/features/settlement/lib/supabase/types";
+import { archiveBeforeParse } from "@/features/settlement/lib/storage/archive-before-parse";
 import {
-  type TransformContext,
-  type LookupMaps,
+  DIRECT_UPLOAD_BUCKET,
+  parseProcessUploadPayload,
+  prepareDirectUploadForParse,
+  statusAfterParseMetadata,
+  validateFolderHint,
+} from "@/features/settlement/lib/storage/direct-upload";
+import type { Json, RawUploadInsert } from "@/features/settlement/lib/supabase/types";
+import type {
+  TransformContext,
+  LookupMaps,
 } from "@/features/settlement/lib/aggregation/to-sales-records";
 import {
   STRICT_KEY_COLUMNS,
@@ -30,14 +35,39 @@ import {
 } from "@/features/settlement/lib/aggregation/strict-record-key";
 
 export const runtime = "nodejs";
-// Local OCR of scanned payment notices (Shueisha) rasterizes + reads two
-// pages per file; 60s was sized for spreadsheet parsing only.
 export const maxDuration = 300;
+
+type ParseFile = typeof import("@/features/settlement/lib/parsers").parseFile;
+type ParsedFile = Awaited<ReturnType<ParseFile>>;
+type ToSalesRecords = typeof import("@/features/settlement/lib/aggregation/to-sales-records").toSalesRecords;
+type BuildLookupMaps = typeof import("@/features/settlement/lib/aggregation/to-sales-records").buildLookupMaps;
+
+type UploadResult = Record<string, unknown>;
+
+type ProcessParsedArgs = {
+  supabase: SupabaseClient;
+  uploadId: string;
+  filename: string;
+  parsed: ParsedFile;
+  activeMonth: string | null;
+  fallbackMonth: string | null;
+  lookups: LookupMaps;
+  toSalesRecords: ToSalesRecords;
+  runLabel: string;
+};
 
 export async function POST(request: Request) {
   const unauthorized = requireSettlementApiAuth(request);
   if (unauthorized) return unauthorized;
 
+  const contentType = request.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    return handlePreparedUpload(request);
+  }
+  return handleMultipartUpload(request);
+}
+
+async function handleMultipartUpload(request: Request) {
   const [sharedSupabase, parsers, aggregation, archive] = await Promise.all([
     import("@/lib/supabase-server"),
     import("@/features/settlement/lib/parsers"),
@@ -51,27 +81,18 @@ export async function POST(request: Request) {
 
   const form = await request.formData();
   const files = form.getAll("files") as File[];
-  const folderHint = (form.get("folder") as string) || undefined;
+  const folderHintValidation = validateFolderHint(form.get("folder"));
+  if (!folderHintValidation.ok) {
+    return NextResponse.json({ error: folderHintValidation.error }, { status: 400 });
+  }
+  const folderHint = folderHintValidation.value;
   const activeMonthRaw = (form.get("activeMonth") as string) || "";
   const activeMonth = /^\d{4}-\d{2}-01$/.test(activeMonthRaw) ? activeMonthRaw : null;
-  // Batch-level month hint the client derived from the selected upload's
-  // folder/file names (only sent when every hint agrees on one month).
-  // Consulted only when a file's content yields no settlement month.
   const fallbackMonthRaw = (form.get("fallbackMonth") as string) || "";
   const fallbackMonth = /^\d{4}-\d{2}-01$/.test(fallbackMonthRaw) ? fallbackMonthRaw : null;
-  // Test-scenario flag: when the UI passes replaceMonth=1 we wipe the
-  // active month's sales_records before inserting, so the operator can
-  // re-run a test upload without stacking duplicates on top of the
-  // existing rows. raw_uploads / raw_records are kept for audit.
   const replaceMonth = form.get("replaceMonth") === "1";
-  // Client-generated correlation id (see SettlementClient). raw_uploads has no
-  // column for it, so it only goes to the function logs; sanitized because it
-  // is caller-supplied and printed there.
-  const rawRunId =
-    request.headers.get("x-settlement-upload-run-id") ||
-    (typeof form.get("uploadRunId") === "string" ? (form.get("uploadRunId") as string) : "");
-  const uploadRunId = rawRunId.replace(/[^\w.-]/g, "").slice(0, 64) || null;
-  const runLabel = uploadRunId ? ` run=${uploadRunId}` : "";
+  const runLabel = buildRunLabel(request, form);
+
   if (files.length === 0) {
     return NextResponse.json({ error: "no files" }, { status: 400 });
   }
@@ -90,35 +111,14 @@ export async function POST(request: Request) {
     }
   }
 
-  // Preload client/channel lookup maps
-  let lookups: LookupMaps;
-  try {
-    const [{ data: clients, error: clientsError }, { data: channels, error: channelsError }] = await Promise.all([
-      supabase.from("clients").select("*"),
-      supabase.from("channels").select("*"),
-    ]);
-    if (clientsError || channelsError) {
-      throw new Error(
-        [clientsError?.message, channelsError?.message].filter(Boolean).join("; "),
-      );
-    }
-    lookups = buildLookupMaps({ clients: clients ?? [], channels: channels ?? [] });
-  } catch (e) {
-    return NextResponse.json(
-      { error: `failed to load lookups: ${(e as Error).message}` },
-      { status: 500 },
-    );
+  const lookups = await loadLookups(supabase, buildLookupMaps);
+  if ("error" in lookups) {
+    return NextResponse.json({ error: lookups.error }, { status: 500 });
   }
 
-  const results: Array<Record<string, unknown>> = [];
-
+  const results: UploadResult[] = [];
   for (const f of files) {
     const buffer = Buffer.from(await f.arrayBuffer());
-
-    // 1. Create the raw_uploads row before parsing. If the function times out
-    //    or crashes mid-parse (504 → no JSON response reaches the browser),
-    //    this row stays in status 'parsing' — durable evidence of which file
-    //    it died on. All later steps update this same row; nothing re-inserts.
     const { data: uploadRow, error: insertErr } = await supabase
       .from("raw_uploads")
       .insert({
@@ -131,6 +131,7 @@ export async function POST(request: Request) {
       })
       .select("id")
       .single();
+
     if (insertErr || !uploadRow) {
       const msg = insertErr?.message ?? "upload insert failed";
       console.error(`[upload]${runLabel} ${f.name}: raw_uploads insert failed`);
@@ -139,315 +140,428 @@ export async function POST(request: Request) {
     }
     console.log(`[upload]${runLabel} parsing ${f.name} (${buffer.byteLength} bytes) upload_id=${uploadRow.id}`);
 
-    // Leaves the pre-created row in a terminal state on the failure paths
-    // below. An update error here is only logged — the file result already
-    // carries the original failure.
-    const markUploadFailed = async (fields: Partial<RawUploadInsert>) => {
-      const { error } = await supabase
-        .from("raw_uploads")
-        .update({ ...fields, status: "failed", parsed_at: new Date().toISOString() })
-        .eq("id", uploadRow.id);
-      if (error) {
-        console.error(`[upload]${runLabel} ${f.name}: raw_uploads failed-status update error`);
-      }
-    };
+    const coordinated = await archiveBeforeParse<ParsedFile>(buffer, {
+      archive: () => writeToArchive(f.name, buffer, activeMonth, supabase),
+      recordArchived: async (path, sha256) => {
+        const { error } = await supabase
+          .from("raw_uploads")
+          .update({ storage_path: path, sha256, archived_at: new Date().toISOString() })
+          .eq("id", uploadRow.id);
+        if (error) throw new Error(error.message);
+      },
+      parse: () => parseFile({ filename: f.name, buffer, folderName: folderHint }),
+    });
 
-    // 2. Parse so we know which month bucket to archive under.
-    let parsed: Awaited<ReturnType<typeof parseFile>>;
-    try {
-      parsed = await parseFile({
-        filename: f.name,
-        buffer,
-        folderName: folderHint,
-      });
-    } catch (e) {
-      const msg = `parse failed: ${(e as Error).message}`;
+    if (!coordinated.ok) {
+      const msg =
+        coordinated.stage === "parse"
+          ? `parse failed: ${coordinated.error}`
+          : coordinated.stage === "archive"
+            ? `archive failed: ${coordinated.error}`
+            : `archive record failed: ${coordinated.error}`;
       console.error(`[upload]${runLabel} ${f.name}: ${msg}`);
-      await markUploadFailed({ parse_error: msg });
+      await markUploadFailed(supabase, uploadRow.id, {
+        parse_error: msg,
+        storage_path: coordinated.archivePath ?? `(not archived) ${f.name}`,
+        sha256: coordinated.sha256,
+      }, runLabel, f.name);
       results.push({ file: f.name, error: msg });
       continue;
     }
 
-    // Settlement-month resolution:
-    //   · When the operator explicitly picked a month in the UI (manual
-    //     mode), trust it — this is the "I'm processing May now" intent.
-    //   · Otherwise (auto mode) the month parsed from the file content
-    //     counts; a file without one inherits the batch's unambiguous
-    //     folder/file-name month (fallbackMonth) when the client sent one.
-    //     A file with records but no resolvable month is rejected here,
-    //     before any DB write — never bucketed into the current date.
-    const resolution = resolveSettlementMonth({
+    results.push(await processParsedUpload({
+      supabase,
+      uploadId: uploadRow.id,
+      filename: f.name,
+      parsed: coordinated.parsed,
       activeMonth,
-      parsedSettlementMonth: parsed.settlement_month,
-      hasRecords: parsed.records.length > 0,
       fallbackMonth,
-    });
-    if (!resolution.ok) {
-      console.warn(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: ${resolution.error}`);
-      await markUploadFailed({
-        platform_code: parsed.platform_code,
-        sales_month: parsed.sales_month || null,
-        detection_confidence: parsed.detection_confidence,
-        parsed_rows: parsed.records.length,
-        parse_error: resolution.error,
-      });
-      results.push({
-        file: f.name,
-        platform: parsed.platform_code,
-        parsed_rows: parsed.records.length,
-        sales_month: parsed.sales_month || null,
-        error: resolution.error,
-      });
-      continue;
-    }
-    const effectiveSettlement = resolution.month;
-    // Inherited-month case: surface it as an informational note (never a
-    // failure). Pushed onto parsed.errors so it reaches both the response
-    // row and the raw_uploads.parse_error audit trail below.
-    if (resolution.note) {
-      console.log(`[upload]${runLabel} ${f.name}: settlement month inherited from batch hint ${effectiveSettlement}`);
-      parsed.errors.push(resolution.note);
-    }
-    const zeroRowFailure = isZeroRowParseFailure(parsed.platform_code, parsed.records.length, parsed.errors);
-
-    // 3. Archive the raw file into Supabase Storage (upload-debug bucket).
-    let archivePath: string | null = null;
-    let archiveError: string | null = null;
-    try {
-      const archived = await writeToArchive(f.name, buffer, effectiveSettlement, supabase);
-      archivePath = archived.path;
-    } catch (e) {
-      archiveError = (e as Error).message || "archive write failed";
-      console.warn(`[upload]${runLabel} ${f.name}: archive write failed: ${archiveError}`);
-    }
-
-    // 4. Update the pre-created raw_uploads row with the parse outcome.
-    const { error: updateErr } = await supabase
-      .from("raw_uploads")
-      .update({
-        storage_path: archivePath ?? `(not archived) ${f.name}`,
-        platform_code: parsed.platform_code,
-        settlement_month: effectiveSettlement,
-        sales_month: parsed.sales_month || null,
-        // Files with no settlement rows are not necessarily failures: monthly
-        // folders often include payment notices, detail PDFs, or companion
-        // workbooks that are useful for audit but do not create INPUT rows.
-        // But if the platform is unknown/no-parser or a tabular parser reports
-        // "no data rows", keep it in the red bucket so real sales files do not
-        // get hidden as harmless skips.
-        status: zeroRowFailure ? "failed" : "parsed",
-        detection_confidence: parsed.detection_confidence,
-        parse_error: [...parsed.errors, archiveError ? `archive: ${archiveError}` : null]
-          .filter(Boolean)
-          .join("; ") || null,
-        parsed_rows: parsed.records.length,
-        parsed_at: new Date().toISOString(),
-      })
-      .eq("id", uploadRow.id);
-
-    if (updateErr) {
-      console.error(`[upload]${runLabel} ${f.name}: raw_uploads update failed`);
-      results.push({ file: f.name, error: updateErr.message });
-      continue;
-    }
-
-    // 5. Insert raw_records (JSONB line-items)
-    let rawRecordIds: Map<number, string> | undefined;
-    if (parsed.records.length > 0) {
-      const { data: insertedRaws, error: rawsErr } = await supabase
-        .from("raw_records")
-        .insert(
-          parsed.records.map((r) => ({
-            upload_id: uploadRow.id,
-            row_index: r.row_index,
-            data: r.data as unknown as Json,
-          })),
-        )
-        .select("id, row_index");
-      if (rawsErr) {
-        const msg = `raw_records insert: ${rawsErr.message}`;
-        console.error(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: raw_records insert failed`);
-        await markUploadFailed({
-          platform_code: parsed.platform_code,
-          settlement_month: effectiveSettlement,
-          sales_month: parsed.sales_month || null,
-          detection_confidence: parsed.detection_confidence,
-          parsed_rows: parsed.records.length,
-          parse_error: msg,
-        });
-        results.push({ file: f.name, error: `raw_records insert: ${rawsErr.message}` });
-        continue;
-      }
-      if (insertedRaws) {
-        rawRecordIds = new Map(insertedRaws.map((r) => [r.row_index, r.id]));
-      }
-    }
-
-    // 6. Transform → sales_records
-    let salesWritten = 0;
-    let skippedDuplicates = 0;
-    let transformWarnings: unknown[] | undefined;
-    if (parsed.records.length === 0) {
-      if (zeroRowFailure) {
-        const msg = parsed.errors.join("; ") || "정산행 0건: 파일 형식 분석 실패/파서 미지원입니다.";
-        results.push({
-          file: f.name,
-          platform: parsed.platform_code,
-          parsed_rows: 0,
-          sales_records_written: 0,
-          error: msg,
-          settlement_month: effectiveSettlement,
-          sales_month: parsed.sales_month || null,
-        });
-        continue;
-      }
-      const msg = "정산행 없음: 보조자료/비정산 파일로 보고 건너뛰었습니다.";
-      results.push({
-        file: f.name,
-        platform: parsed.platform_code,
-        parsed_rows: 0,
-        sales_records_written: 0,
-        skipped: true,
-        skip_reason: msg,
-        archive_error: archiveError,
-        settlement_month: effectiveSettlement,
-        sales_month: parsed.sales_month || null,
-        });
-      continue;
-    }
-    if (parsed.records.length > 0) {
-      // resolveSettlementMonth guarantees a month whenever records exist;
-      // this guard only keeps TypeScript honest and catches regressions.
-      const batch = effectiveSettlement;
-      if (!batch) {
-        results.push({ file: f.name, error: "internal: settlement month missing for records" });
-        continue;
-      }
-      const ctx: TransformContext = {
-        settlement_month: batch,
-        forceSettlementMonth: true,
-        sales_month: parsed.sales_month || null,
-        platform_code: parsed.platform_code,
-        upload_id: uploadRow.id,
-        raw_record_id_by_index: rawRecordIds,
-        lookups,
-      };
-      const transformed = toSalesRecords(parsed.records, ctx);
-      transformWarnings = transformed.errors.length > 0 ? transformed.errors : undefined;
-      let inserts = transformed.inserts;
-      if (inserts.length > 0) {
-        // Skip rows whose strict logical key already exists in this batch —
-        // re-uploads and CSV+XLSX twins of the same statement. Legitimate
-        // variants (same title, different type/month/amount) key differently
-        // and are kept.
-        try {
-          const existing: Record<string, unknown>[] = [];
-          const PAGE = 1000;
-          for (let offset = 0; ; offset += PAGE) {
-            const { data, error } = await supabase
-              .from("sales_records")
-              .select(STRICT_KEY_COLUMNS)
-              .eq("settlement_batch", batch)
-              .range(offset, offset + PAGE - 1)
-              // STRICT_KEY_COLUMNS is a runtime string, so supabase-js cannot
-              // derive the row shape at the type level.
-              .returns<Record<string, unknown>[]>();
-            if (error) throw error;
-            if (!data || data.length === 0) break;
-            existing.push(...data);
-            if (data.length < PAGE) break;
-          }
-          if (existing.length > 0) {
-            const suppressed = parsed.platform_code === "piccoma"
-              ? suppressExistingPiccomaStatementDuplicates(inserts, existing)
-              : suppressExistingDuplicates(inserts, existing);
-            inserts = suppressed.kept;
-            skippedDuplicates += suppressed.skipped;
-            if (suppressed.skipped > 0) {
-              console.warn(
-                `[upload]${runLabel} ${f.name}: skipped ${suppressed.skipped} duplicate sales rows already in ${batch}`,
-              );
-            }
-          }
-        } catch {
-          console.warn(`[upload]${runLabel} ${f.name}: duplicate check failed, inserting all rows`);
-        }
-      }
-      if (inserts.length === 0 && skippedDuplicates === 0) {
-        const msg = transformed.errors.length > 0
-          ? `정산 행으로 변환하지 못했습니다: ${transformed.errors.slice(0, 3).map((e) => `${e.field} ${e.message}`).join('; ')}`
-          : "정산 행으로 변환할 수 있는 데이터가 없습니다.";
-        await markUploadFailed({
-          platform_code: parsed.platform_code,
-          settlement_month: effectiveSettlement,
-          sales_month: parsed.sales_month || null,
-          detection_confidence: parsed.detection_confidence,
-          parsed_rows: parsed.records.length,
-          parse_error: msg,
-        });
-        results.push({
-          file: f.name,
-          platform: parsed.platform_code,
-          parsed_rows: parsed.records.length,
-          sales_records_written: 0,
-          settlement_month: effectiveSettlement,
-          sales_month: parsed.sales_month || null,
-          error: msg,
-        });
-        continue;
-      }
-      if (inserts.length > 0) {
-        const { error: salesErr, data: salesData } = await supabase
-          .from("sales_records")
-          .insert(inserts)
-          .select("id");
-        if (salesErr) {
-          const msg = `sales_records insert: ${salesErr.message}`;
-          console.error(`[upload]${runLabel} ${f.name} platform=${parsed.platform_code}: sales_records insert failed`);
-          await markUploadFailed({
-            platform_code: parsed.platform_code,
-            settlement_month: effectiveSettlement,
-            sales_month: parsed.sales_month || null,
-            detection_confidence: parsed.detection_confidence,
-            parsed_rows: parsed.records.length,
-            parse_error: msg,
-          });
-          results.push({
-            file: f.name,
-            platform: parsed.platform_code,
-            error: `sales_records insert: ${salesErr.message}`,
-          });
-          continue;
-        }
-        salesWritten = salesData?.length ?? 0;
-      }
-
-      if (salesWritten > 0 || skippedDuplicates > 0) {
-        await supabase
-          .from("raw_uploads")
-          .update({ status: "aggregated" })
-          .eq("id", uploadRow.id);
-      }
-    }
-
-    results.push({
-      file: f.name,
-      platform: parsed.platform_code,
-      confidence: parsed.detection_confidence,
-      parsed_rows: parsed.records.length,
-      sales_records_written: salesWritten,
-      sales_records_skipped_duplicates: skippedDuplicates,
-      skipped_duplicates: skippedDuplicates,
-      archive_error: archiveError,
-      settlement_month: effectiveSettlement,
-      sales_month: parsed.sales_month || null,
-      archive_path: archivePath,
-      warnings: transformWarnings,
-      errors: parsed.errors,
-    });
+      lookups: lookups.value,
+      toSalesRecords,
+      runLabel,
+    }));
   }
 
   return NextResponse.json({ results });
+}
+
+async function handlePreparedUpload(request: Request) {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+  const { uploadId, folderHint } = parseProcessUploadPayload(body);
+  if (!folderHint.ok) {
+    return NextResponse.json({ error: folderHint.error }, { status: 400 });
+  }
+
+  const prepared = await prepareDirectUploadForParse(String(uploadId ?? ""), {
+    getUpload: async (id) => {
+      const { data, error } = await supabaseServer
+        .from("raw_uploads")
+        .select("id, filename, storage_path, size_bytes, content_type, settlement_month, status")
+        .eq("id", id)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      return data;
+    },
+    download: async (path) => {
+      const { data, error } = await supabaseServer.storage.from(DIRECT_UPLOAD_BUCKET).download(path);
+      if (error || !data) throw new Error(error?.message ?? "download failed");
+      return Buffer.from(await data.arrayBuffer());
+    },
+    markParsing: async (id, sha256) => {
+      const { data, error } = await supabaseServer
+        .from("raw_uploads")
+        .update({ status: "parsing", sha256, archived_at: new Date().toISOString() })
+        .eq("id", id)
+        .eq("status", "uploaded")
+        .select("id");
+      if (error) throw new Error(error.message);
+      return data && data.length === 1 ? "updated" : "not_uploaded";
+    },
+    markFailed: async (id, message) => {
+      await markUploadFailed(supabaseServer, id, { parse_error: message }, "", "direct upload");
+    },
+  });
+
+  if (!prepared.ok) {
+    if (prepared.skipped) {
+      return NextResponse.json({
+        results: [{
+          upload_id: prepared.row?.id,
+          file: prepared.row?.filename,
+          skipped: true,
+          skip_reason: prepared.error,
+          status: prepared.row?.status,
+        }],
+      });
+    }
+    return NextResponse.json({ error: prepared.error }, { status: prepared.status });
+  }
+
+  const [parsers, aggregation] = await Promise.all([
+    import("@/features/settlement/lib/parsers"),
+    import("@/features/settlement/lib/aggregation/to-sales-records"),
+  ]);
+  const lookups = await loadLookups(supabaseServer, aggregation.buildLookupMaps);
+  if ("error" in lookups) {
+    return NextResponse.json({ error: lookups.error }, { status: 500 });
+  }
+
+  let parsed: ParsedFile;
+  try {
+    parsed = await parsers.parseFile({
+      filename: prepared.row.filename,
+      buffer: prepared.buffer,
+      folderName: folderHint.value,
+    });
+  } catch (e) {
+    const msg = `parse failed: ${(e as Error).message || "parse failed"}`;
+    await markUploadFailed(supabaseServer, prepared.row.id, { parse_error: msg }, "", prepared.row.filename);
+    return NextResponse.json({
+      results: [{ upload_id: prepared.row.id, file: prepared.row.filename, error: msg }],
+    });
+  }
+
+  const result = await processParsedUpload({
+    supabase: supabaseServer,
+    uploadId: prepared.row.id,
+    filename: prepared.row.filename,
+    parsed,
+    activeMonth: prepared.row.settlement_month,
+    fallbackMonth: null,
+    lookups: lookups.value,
+    toSalesRecords: aggregation.toSalesRecords,
+    runLabel: "",
+  });
+  return NextResponse.json({ results: [result] });
+}
+
+async function loadLookups(
+  supabase: SupabaseClient,
+  buildLookupMaps: BuildLookupMaps,
+): Promise<{ value: LookupMaps } | { error: string }> {
+  try {
+    const [{ data: clients, error: clientsError }, { data: channels, error: channelsError }] = await Promise.all([
+      supabase.from("clients").select("*"),
+      supabase.from("channels").select("*"),
+    ]);
+    if (clientsError || channelsError) {
+      throw new Error(
+        [clientsError?.message, channelsError?.message].filter(Boolean).join("; "),
+      );
+    }
+    return { value: buildLookupMaps({ clients: clients ?? [], channels: channels ?? [] }) };
+  } catch (e) {
+    return { error: `failed to load lookups: ${(e as Error).message}` };
+  }
+}
+
+async function processParsedUpload(args: ProcessParsedArgs): Promise<UploadResult> {
+  const {
+    supabase,
+    uploadId,
+    filename,
+    parsed,
+    activeMonth,
+    fallbackMonth,
+    lookups,
+    toSalesRecords,
+    runLabel,
+  } = args;
+
+  const resolution = resolveSettlementMonth({
+    activeMonth,
+    parsedSettlementMonth: parsed.settlement_month,
+    hasRecords: parsed.records.length > 0,
+    fallbackMonth,
+  });
+  if (!resolution.ok) {
+    console.warn(`[upload]${runLabel} ${filename} platform=${parsed.platform_code}: ${resolution.error}`);
+    await markUploadFailed(supabase, uploadId, {
+      platform_code: parsed.platform_code,
+      sales_month: parsed.sales_month || null,
+      detection_confidence: parsed.detection_confidence,
+      parsed_rows: parsed.records.length,
+      parse_error: resolution.error,
+    }, runLabel, filename);
+    return {
+      file: filename,
+      platform: parsed.platform_code,
+      parsed_rows: parsed.records.length,
+      sales_month: parsed.sales_month || null,
+      error: resolution.error,
+    };
+  }
+
+  const effectiveSettlement = resolution.month;
+  if (resolution.note) {
+    console.log(`[upload]${runLabel} ${filename}: settlement month inherited from batch hint ${effectiveSettlement}`);
+    parsed.errors.push(resolution.note);
+  }
+  const zeroRowFailure = isZeroRowParseFailure(parsed.platform_code, parsed.records.length, parsed.errors);
+  const parsedStatus = statusAfterParseMetadata(parsed.records.length, zeroRowFailure);
+
+  const { error: updateErr } = await supabase
+    .from("raw_uploads")
+    .update({
+      platform_code: parsed.platform_code,
+      settlement_month: effectiveSettlement,
+      sales_month: parsed.sales_month || null,
+      status: parsedStatus,
+      detection_confidence: parsed.detection_confidence,
+      parse_error: parsed.errors.filter(Boolean).join("; ") || null,
+      parsed_rows: parsed.records.length,
+      parsed_at: new Date().toISOString(),
+    })
+    .eq("id", uploadId);
+
+  if (updateErr) {
+    console.error(`[upload]${runLabel} ${filename}: raw_uploads update failed`);
+    return { file: filename, error: updateErr.message };
+  }
+
+  let rawRecordIds: Map<number, string> | undefined;
+  if (parsed.records.length > 0) {
+    const { data: insertedRaws, error: rawsErr } = await supabase
+      .from("raw_records")
+      .insert(
+        parsed.records.map((r) => ({
+          upload_id: uploadId,
+          row_index: r.row_index,
+          data: r.data as unknown as Json,
+        })),
+      )
+      .select("id, row_index");
+    if (rawsErr) {
+      const msg = `raw_records insert: ${rawsErr.message}`;
+      console.error(`[upload]${runLabel} ${filename} platform=${parsed.platform_code}: raw_records insert failed`);
+      await markUploadFailed(supabase, uploadId, {
+        platform_code: parsed.platform_code,
+        settlement_month: effectiveSettlement,
+        sales_month: parsed.sales_month || null,
+        detection_confidence: parsed.detection_confidence,
+        parsed_rows: parsed.records.length,
+        parse_error: msg,
+      }, runLabel, filename);
+      return { file: filename, error: msg };
+    }
+    if (insertedRaws) {
+      rawRecordIds = new Map(insertedRaws.map((r) => [r.row_index, r.id]));
+    }
+  }
+
+  let salesWritten = 0;
+  let skippedDuplicates = 0;
+
+  if (parsed.records.length === 0) {
+    if (zeroRowFailure) {
+      const msg = parsed.errors.join("; ") || "정산행 0건: 파일 형식 분석 실패/파서 미지원입니다.";
+      return {
+        file: filename,
+        platform: parsed.platform_code,
+        parsed_rows: 0,
+        sales_records_written: 0,
+        error: msg,
+        settlement_month: effectiveSettlement,
+        sales_month: parsed.sales_month || null,
+      };
+    }
+    const msg = "정산행 없음: 보조자료/비정산 파일로 보고 건너뛰었습니다.";
+    return {
+      file: filename,
+      platform: parsed.platform_code,
+      parsed_rows: 0,
+      sales_records_written: 0,
+      skipped: true,
+      skip_reason: msg,
+      settlement_month: effectiveSettlement,
+      sales_month: parsed.sales_month || null,
+    };
+  }
+
+  const batch = effectiveSettlement;
+  if (!batch) {
+    return { file: filename, error: "internal: settlement month missing for records" };
+  }
+
+  const ctx: TransformContext = {
+    settlement_month: batch,
+    forceSettlementMonth: true,
+    sales_month: parsed.sales_month || null,
+    platform_code: parsed.platform_code,
+    upload_id: uploadId,
+    raw_record_id_by_index: rawRecordIds,
+    lookups,
+  };
+  const transformed = toSalesRecords(parsed.records, ctx);
+  const transformWarnings = transformed.errors.length > 0 ? transformed.errors : undefined;
+  let inserts = transformed.inserts;
+
+  if (inserts.length > 0) {
+    try {
+      const existing: Record<string, unknown>[] = [];
+      const PAGE = 1000;
+      for (let offset = 0; ; offset += PAGE) {
+        const { data, error } = await supabase
+          .from("sales_records")
+          .select(STRICT_KEY_COLUMNS)
+          .eq("settlement_batch", batch)
+          .range(offset, offset + PAGE - 1)
+          .returns<Record<string, unknown>[]>();
+        if (error) throw error;
+        if (!data || data.length === 0) break;
+        existing.push(...data);
+        if (data.length < PAGE) break;
+      }
+      if (existing.length > 0) {
+        const suppressed = parsed.platform_code === "piccoma"
+          ? suppressExistingPiccomaStatementDuplicates(inserts, existing)
+          : suppressExistingDuplicates(inserts, existing);
+        inserts = suppressed.kept;
+        skippedDuplicates += suppressed.skipped;
+        if (suppressed.skipped > 0) {
+          console.warn(
+            `[upload]${runLabel} ${filename}: skipped ${suppressed.skipped} duplicate sales rows already in ${batch}`,
+          );
+        }
+      }
+    } catch {
+      console.warn(`[upload]${runLabel} ${filename}: duplicate check failed, inserting all rows`);
+    }
+  }
+
+  if (inserts.length === 0 && skippedDuplicates === 0) {
+    const msg = transformed.errors.length > 0
+      ? `정산 행으로 변환하지 못했습니다: ${transformed.errors.slice(0, 3).map((e) => `${e.field} ${e.message}`).join("; ")}`
+      : "정산 행으로 변환할 수 있는 데이터가 없습니다.";
+    await markUploadFailed(supabase, uploadId, {
+      platform_code: parsed.platform_code,
+      settlement_month: effectiveSettlement,
+      sales_month: parsed.sales_month || null,
+      detection_confidence: parsed.detection_confidence,
+      parsed_rows: parsed.records.length,
+      parse_error: msg,
+    }, runLabel, filename);
+    return {
+      file: filename,
+      platform: parsed.platform_code,
+      parsed_rows: parsed.records.length,
+      sales_records_written: 0,
+      settlement_month: effectiveSettlement,
+      sales_month: parsed.sales_month || null,
+      error: msg,
+    };
+  }
+
+  if (inserts.length > 0) {
+    const { error: salesErr, data: salesData } = await supabase
+      .from("sales_records")
+      .insert(inserts)
+      .select("id");
+    if (salesErr) {
+      const msg = `sales_records insert: ${salesErr.message}`;
+      console.error(`[upload]${runLabel} ${filename} platform=${parsed.platform_code}: sales_records insert failed`);
+      await markUploadFailed(supabase, uploadId, {
+        platform_code: parsed.platform_code,
+        settlement_month: effectiveSettlement,
+        sales_month: parsed.sales_month || null,
+        detection_confidence: parsed.detection_confidence,
+        parsed_rows: parsed.records.length,
+        parse_error: msg,
+      }, runLabel, filename);
+      return { file: filename, platform: parsed.platform_code, error: msg };
+    }
+    salesWritten = salesData?.length ?? 0;
+  }
+
+  if (salesWritten > 0 || skippedDuplicates > 0) {
+    await supabase
+      .from("raw_uploads")
+      .update({ status: "aggregated" })
+      .eq("id", uploadId);
+  }
+
+  return {
+    file: filename,
+    platform: parsed.platform_code,
+    confidence: parsed.detection_confidence,
+    parsed_rows: parsed.records.length,
+    sales_records_written: salesWritten,
+    sales_records_skipped_duplicates: skippedDuplicates,
+    skipped_duplicates: skippedDuplicates,
+    settlement_month: effectiveSettlement,
+    sales_month: parsed.sales_month || null,
+    warnings: transformWarnings,
+    errors: parsed.errors,
+  };
+}
+
+async function markUploadFailed(
+  supabase: SupabaseClient,
+  uploadId: string,
+  fields: Partial<RawUploadInsert>,
+  runLabel: string,
+  filename: string,
+) {
+  const { error } = await supabase
+    .from("raw_uploads")
+    .update({ ...fields, status: "failed", parsed_at: new Date().toISOString() })
+    .eq("id", uploadId);
+  if (error) {
+    console.error(`[upload]${runLabel} ${filename}: raw_uploads failed-status update error`);
+  }
+}
+
+function buildRunLabel(request: Request, form: FormData): string {
+  const rawRunId =
+    request.headers.get("x-settlement-upload-run-id") ||
+    (typeof form.get("uploadRunId") === "string" ? (form.get("uploadRunId") as string) : "");
+  const uploadRunId = rawRunId.replace(/[^\w.-]/g, "").slice(0, 64) || null;
+  return uploadRunId ? ` run=${uploadRunId}` : "";
 }
 
 function isZeroRowParseFailure(platformCode: string, parsedRows: number, errors: string[]): boolean {

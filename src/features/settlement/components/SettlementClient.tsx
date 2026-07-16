@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type InputHTMLAttributes } from 'react';
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FolderOpen, Loader2, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
+import { uploadSettlementFileDirect } from '@/features/settlement/lib/storage/direct-upload-client';
 
 type UploadResult = {
   file?: string;
@@ -48,29 +49,6 @@ function dedupeSelection(incoming: SelectedFile[]): SelectedFile[] {
 
 // React/TS don't type the non-standard directory-picker attributes; the cast keeps them on the DOM input.
 const folderInputProps = { webkitdirectory: '', directory: '' } as unknown as InputHTMLAttributes<HTMLInputElement>;
-
-// Vercel rejects request bodies over ~4.5MB with 413 before the route runs, and
-// parsing several workbooks in one invocation can exceed the function timeout (504),
-// so each file is sent as its own request.
-const BATCH_MAX_FILES = 1;
-const BATCH_MAX_BYTES = 3_500_000;
-
-function buildBatches(selected: SelectedFile[]): SelectedFile[][] {
-  const batches: SelectedFile[][] = [];
-  let current: SelectedFile[] = [];
-  let currentBytes = 0;
-  for (const sf of selected) {
-    if (current.length > 0 && (current.length >= BATCH_MAX_FILES || currentBytes + sf.file.size > BATCH_MAX_BYTES)) {
-      batches.push(current);
-      current = [];
-      currentBytes = 0;
-    }
-    current.push(sf);
-    currentBytes += sf.file.size;
-  }
-  if (current.length > 0) batches.push(current);
-  return batches;
-}
 
 type UploadRunFailure = { file: string; status: number | null; error: string };
 
@@ -262,7 +240,6 @@ export default function SettlementClient() {
     setResults([]);
     setResultsExpanded(false);
     try {
-      const batches = buildBatches(selected);
       // Correlation id for this run: shown in failed rows, kept in the
       // localStorage run log, and echoed by the server into Vercel function
       // logs — the only way to match a body-less failure (504) to a request.
@@ -270,22 +247,7 @@ export default function SettlementClient() {
       const httpStatusByFile = new Map<string, number>();
       const aggregated: UploadResult[] = [];
 
-      const send = async (chunk: SelectedFile[]) => {
-        const fd = new FormData();
-        fd.append('uploadRunId', uploadRunId);
-        for (const sf of chunk) fd.append('files', sf.file);
-        // The picked month is authoritative: the server stores every row under
-        // it, above any month parsed from file contents or names.
-        fd.append('activeMonth', targetIso);
-        if (folderHint) fd.append('folder', folderHint);
-        return fetch('/api/settlement/upload', {
-          method: 'POST',
-          body: fd,
-          headers: { 'X-Settlement-Upload-Run-Id': uploadRunId },
-        });
-      };
-
-      const recordFailure = (chunk: SelectedFile[], error: string, status: number | null = null) => {
+      const recordFailure = (sf: SelectedFile, error: string, status: number | null = null) => {
         const at = new Date().toISOString();
         const suffix = [
           `run ${uploadRunId}`,
@@ -296,43 +258,23 @@ export default function SettlementClient() {
           runId: uploadRunId,
           at,
           status,
-          files: chunk.map((sf) => sf.relativePath),
+          files: [sf.relativePath],
           error,
         });
-        for (const sf of chunk) {
-          if (status !== null) httpStatusByFile.set(sf.relativePath, status);
-          aggregated.push({ file: sf.relativePath, error: `${error} [${suffix}]` });
-        }
+        if (status !== null) httpStatusByFile.set(sf.relativePath, status);
+        aggregated.push({ file: sf.relativePath, error: `${error} [${suffix}]` });
       };
 
-      const handleResponse = async (res: Response, chunk: SelectedFile[]) => {
-        if (res.status === 413) {
-          recordFailure(chunk, t(
-            '파일이 Vercel 업로드 용량 제한(약 4.5MB)을 초과합니다. 이 파일은 추후 스토리지 직접 업로드 방식으로 처리해야 합니다.',
-            'ファイルがVercelのアップロード容量制限（約4.5MB）を超えています。このファイルは今後ストレージ直接アップロード方式での対応が必要です。',
-          ), 413);
-          return;
-        }
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          recordFailure(chunk, json.error || `HTTP ${res.status}`, res.status);
-          return;
-        }
-        if (Array.isArray(json.results)) aggregated.push(...json.results);
-      };
-
-      // Batches are 1 file each today (BATCH_MAX_FILES=1), but the gauge
-      // counts files, not batches, so it stays correct if that changes.
       let sentFiles = 0;
-      for (const batch of batches) {
-        setProgress({ current: sentFiles + batch.length, total: selected.length, currentFile: batch[0].relativePath });
+      for (const sf of selected) {
+        setProgress({ current: sentFiles + 1, total: selected.length, currentFile: sf.relativePath });
         try {
-          const res = await send(batch);
-          await handleResponse(res, batch);
+          const json = await uploadSettlementFileDirect(sf.file, targetIso, folderHint);
+          if (Array.isArray(json.results)) aggregated.push(...json.results);
         } catch (err) {
-          recordFailure(batch, (err as Error).message);
+          recordFailure(sf, (err as Error).message);
         }
-        sentFiles += batch.length;
+        sentFiles += 1;
         setResults([...aggregated]);
       }
       // Transfer is done; hide the gauge before the summary/preview phase.
@@ -660,6 +602,13 @@ export default function SettlementClient() {
               <ExternalLink className="mr-2 h-4 w-4" />
               {t('INPUT Excel 미리보기 열기', 'INPUT Excel プレビューを開く')}
             </button>
+            <a
+              href={validMonth ? `/settlement-compare/${month}` : undefined}
+              className={`inline-flex items-center rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2 text-sm font-semibold dark:border-emerald-900 dark:bg-emerald-950/40 ${validMonth ? 'text-emerald-800 transition hover:border-emerald-500 hover:bg-emerald-100 dark:text-emerald-200 dark:hover:bg-emerald-950' : 'pointer-events-none opacity-50'}`}
+            >
+              <ExternalLink className="mr-2 h-4 w-4" />
+              {t('정답지 비교 열기', '正解ファイル比較を開く')}
+            </a>
             <button
               onClick={resetMonth}
               disabled={!validMonth || resetting || uploading}

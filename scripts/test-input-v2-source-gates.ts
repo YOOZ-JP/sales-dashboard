@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 
 import {
+  decideSourceCompleteness,
   validateRequiredSourceFamilies,
   type SourceUploadStatus,
 } from "../src/features/settlement/lib/export/load-input-v2-records";
@@ -238,6 +239,23 @@ assert.deepEqual(
   ["shueisha"],
   "Shueisha summary-only upload cannot satisfy the detail gate",
 );
+
+{
+  const decision = decideSourceCompleteness(["booklive"]);
+  assert.equal(decision.ok, false, "default export/preview decision blocks missing families");
+  if (!decision.ok) {
+    assert.equal(decision.loadError.status, 409);
+    assert.deepEqual(decision.sourceWarnings, ["booklive"]);
+  }
+}
+
+{
+  const decision = decideSourceCompleteness(["booklive", "dmm"], {
+    allowIncompleteSources: true,
+  });
+  assert.equal(decision.ok, true, "audit-mode decision continues with missing families");
+  assert.deepEqual(decision.sourceWarnings, ["booklive", "dmm"]);
+}
 
 assert.deepEqual(
   validateRequiredSourceFamilies(

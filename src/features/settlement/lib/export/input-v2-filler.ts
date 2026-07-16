@@ -18,7 +18,9 @@ const DEFAULT_TEMPLATE = new URL(
 
 const FIRST_DATA_ROW = 6;
 
-const ELECTRONIC_COL = {
+// Exported: the comparison library reads workbooks back with this same
+// column mapping, so filler and comparator can never drift apart.
+export const ELECTRONIC_COL = {
   unique_identifier: 1,
   channel_title_jp: 2,
   title_kr: 3,

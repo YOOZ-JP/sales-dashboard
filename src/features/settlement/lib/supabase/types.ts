@@ -182,6 +182,8 @@ export type RawUploadRow = {
   uploaded_by: string | null;
   uploaded_at: string;
   parsed_at: string | null;
+  sha256: string | null;
+  archived_at: string | null;
 }
 export type RawUploadInsert = {
   id?: string;
@@ -206,6 +208,8 @@ export type RawUploadInsert = {
   uploaded_by?: string | null;
   uploaded_at?: string;
   parsed_at?: string | null;
+  sha256?: string | null;
+  archived_at?: string | null;
 }
 
 export type RawRecordRow = {
@@ -245,6 +249,86 @@ export type MgBalanceInsert = {
   increase_mg?: number | null;
   decrease_mg?: number | null;
   notes?: string | null;
+}
+
+export type SettlementComparisonRunStatus = "processing" | "completed" | "failed";
+
+export type SettlementComparisonRunRow = {
+  id: string;
+  month: string;                       // YYYY-MM-01
+  status: SettlementComparisonRunStatus;
+  answer_filename: string;
+  answer_storage_path: string;
+  answer_sha256: string | null;
+  candidate_filename: string | null;
+  candidate_storage_path: string | null;
+  candidate_sha256: string | null;
+  source_upload_ids: string[] | null;
+  source_manifest: Json | null;
+  summary: Json | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+export type SettlementComparisonRunInsert = {
+  id?: string;
+  month: string;
+  status?: SettlementComparisonRunStatus;
+  answer_filename: string;
+  answer_storage_path: string;
+  answer_sha256?: string | null;
+  candidate_filename?: string | null;
+  candidate_storage_path?: string | null;
+  candidate_sha256?: string | null;
+  source_upload_ids?: string[] | null;
+  source_manifest?: Json | null;
+  summary?: Json | null;
+  error?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  completed_at?: string | null;
+}
+
+export type ComparisonDiffCategory = "missing" | "extra" | "field" | "formula";
+export type ComparisonDiffReviewStatus =
+  | "pending"
+  | "candidate_correct"
+  | "golden_correct"
+  | "needs_review"
+  | "resolved";
+
+export type SettlementComparisonDiffRow = {
+  id: string;
+  run_id: string;
+  category: ComparisonDiffCategory;
+  identity_channel: string | null;
+  identity_type: string | null;
+  identity_title: string | null;
+  field: string | null;
+  candidate_value: Json | null;
+  golden_value: Json | null;
+  review_status: ComparisonDiffReviewStatus;
+  review_note: string | null;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+  created_at: string;
+}
+export type SettlementComparisonDiffInsert = {
+  id?: string;
+  run_id: string;
+  category: ComparisonDiffCategory;
+  identity_channel?: string | null;
+  identity_type?: string | null;
+  identity_title?: string | null;
+  field?: string | null;
+  candidate_value?: Json | null;
+  golden_value?: Json | null;
+  review_status?: ComparisonDiffReviewStatus;
+  review_note?: string | null;
+  reviewed_at?: string | null;
+  reviewed_by?: string | null;
+  created_at?: string;
 }
 
 export type AuditLogRow = {
@@ -525,6 +609,18 @@ export type Database = {
         Row: AuditLogRow;
         Insert: AuditLogInsert;
         Update: Partial<AuditLogInsert>;
+        Relationships: [];
+      };
+      settlement_comparison_runs: {
+        Row: SettlementComparisonRunRow;
+        Insert: SettlementComparisonRunInsert;
+        Update: Partial<SettlementComparisonRunInsert>;
+        Relationships: [];
+      };
+      settlement_comparison_diffs: {
+        Row: SettlementComparisonDiffRow;
+        Insert: SettlementComparisonDiffInsert;
+        Update: Partial<SettlementComparisonDiffInsert>;
         Relationships: [];
       };
     };

@@ -57,6 +57,47 @@ export async function writeToArchive(
 }
 
 /**
+ * Comparison artifacts live in the same private bucket under dedicated
+ * prefixes, separate from the raw-upload archive:
+ *   comparisons/answer-keys/YYYY-MM/<ts>_<name>  — human answer-key workbooks
+ *   comparisons/candidates/YYYY-MM/<ts>_<name>   — generated candidate workbooks
+ */
+const ARTIFACT_PREFIX: Record<ComparisonArtifactKind, string> = {
+  "answer-key": "comparisons/answer-keys",
+  candidate: "comparisons/candidates",
+};
+
+export type ComparisonArtifactKind = "answer-key" | "candidate";
+
+/**
+ * Write an immutable comparison artifact into the private archive bucket.
+ *
+ * Same durability contract as `writeToArchive`: private bucket only,
+ * `upsert: false` so an existing object is never overwritten, timestamped
+ * path so retries create a new object instead of clobbering evidence.
+ *
+ * @param kind  Which dedicated prefix the artifact belongs under.
+ * @param month 'YYYY-MM-DD' | 'YYYY-MM' | null — decides the month folder.
+ */
+export async function writeComparisonArtifact(
+  kind: ComparisonArtifactKind,
+  filename: string,
+  buffer: Buffer,
+  month?: string | null,
+  client?: SupabaseClient,
+): Promise<ArchiveWriteResult> {
+  const supabase = client ?? createServiceClient();
+  const folder = month ? month.slice(0, 7) : "undated";
+  const path = `${ARTIFACT_PREFIX[kind]}/${folder}/${Date.now()}_${safeName(filename)}`;
+  const { error } = await supabase.storage.from(BUCKET).upload(path, buffer, {
+    contentType: "application/octet-stream",
+    upsert: false,
+  });
+  if (error) throw new Error(`artifact upload failed: ${error.message}`);
+  return { path, bucket: BUCKET, size: buffer.byteLength };
+}
+
+/**
  * Issue a signed URL for an archived file. Default TTL is 1 hour.
  * Returns null if the object is missing so callers can show a clean UI.
  */

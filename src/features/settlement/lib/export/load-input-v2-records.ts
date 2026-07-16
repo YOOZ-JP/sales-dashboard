@@ -36,6 +36,16 @@ export type InputV2LoadError = {
   details: string;
 };
 
+export type InputV2SourceWarning = string;
+
+export type LoadInputV2RecordsOptions = {
+  /**
+   * Audit-only mode for comparison runs. Export/preview callers must keep the
+   * default false so missing source families remain a 409 conflict.
+   */
+  allowIncompleteSources?: boolean;
+};
+
 /** Current-batch raw_uploads projection used by the source-family gate. */
 export interface SourceUploadStatus {
   id?: string | null;
@@ -114,6 +124,32 @@ export function validateRequiredSourceFamilies(
   return missing;
 }
 
+export type SourceCompletenessDecision =
+  | { ok: true; sourceWarnings: InputV2SourceWarning[] }
+  | { ok: false; sourceWarnings: InputV2SourceWarning[]; loadError: InputV2LoadError };
+
+export function decideSourceCompleteness(
+  missingFamilies: readonly string[],
+  options: LoadInputV2RecordsOptions = {},
+): SourceCompletenessDecision {
+  const sourceWarnings = missingFamilies
+    .map((family) => String(family).trim())
+    .filter(Boolean)
+    .slice(0, REQUIRED_SOURCE_FAMILIES.length);
+  if (sourceWarnings.length === 0 || options.allowIncompleteSources) {
+    return { ok: true, sourceWarnings };
+  }
+  return {
+    ok: false,
+    sourceWarnings,
+    loadError: {
+      status: 409,
+      error: "missing_source_family",
+      details: `Required source uploads are missing, failed, or empty for this month: ${sourceWarnings.join(", ")}. Upload a successful statement for each family, then retry.`,
+    },
+  };
+}
+
 function formatSupabaseError(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (err && typeof err === "object") {
@@ -132,10 +168,12 @@ function formatSupabaseError(err: unknown): string {
 
 export async function loadInputV2Records(
   month: string,
+  options: LoadInputV2RecordsOptions = {},
 ): Promise<{
   records: Record<string, unknown>[];
   source: string;
   loadError: InputV2LoadError | null;
+  sourceWarnings: InputV2SourceWarning[];
 }> {
   const missingEnv = [
     "NEXT_PUBLIC_SUPABASE_URL",
@@ -151,6 +189,7 @@ export async function loadInputV2Records(
         error: "Supabase is not configured on this deployment",
         details: `Missing environment variables: ${missingEnv.join(", ")}. Set them in the deployment settings, then retry.`,
       },
+      sourceWarnings: [],
     };
   }
 
@@ -436,20 +475,23 @@ export async function loadInputV2Records(
       (uploads ?? []) as SourceUploadStatus[],
       currentDetailUploadIds,
     );
-    if (missingFamilies.length > 0) {
+    const sourceDecision = decideSourceCompleteness(missingFamilies, options);
+    if (!sourceDecision.ok) {
       return {
         records: [],
         source: "supabase",
-        loadError: {
-          status: 409,
-          error: "missing_source_family",
-          details: `Required source uploads are missing, failed, or empty for this month: ${missingFamilies.join(", ")}. Upload a successful statement for each family, then retry.`,
-        },
+        loadError: sourceDecision.loadError,
+        sourceWarnings: sourceDecision.sourceWarnings,
       };
     }
 
     const carried = mergeCarryForwardRows(baseline, current, month);
-    return { records: carried.records, source: "supabase", loadError: null };
+    return {
+      records: carried.records,
+      source: "supabase",
+      loadError: null,
+      sourceWarnings: sourceDecision.sourceWarnings,
+    };
   } catch (err) {
     const message = formatSupabaseError(err);
     console.warn("[input-v2] Supabase fetch failed:", message);
@@ -461,6 +503,7 @@ export async function loadInputV2Records(
         error: "Failed to fetch settlement records from Supabase",
         details: message,
       },
+      sourceWarnings: [],
     };
   }
 }
