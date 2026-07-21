@@ -37,6 +37,10 @@ import {
   STRICT_KEY_COLUMNS,
   suppressDuplicatesAtInsert,
 } from "@/features/settlement/lib/aggregation/strict-record-key";
+import {
+  createHeartbeatJsonStream,
+  wantsHeartbeatStream,
+} from "@/features/settlement/lib/storage/heartbeat-stream";
 
 export const runtime = "nodejs";
 // Pro plan allows up to 800s; deterministic image-PDF OCR (Shueisha) can
@@ -70,9 +74,35 @@ export async function POST(request: Request) {
 
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
+    if (wantsHeartbeatStream(request)) {
+      return streamPreparedUploadWithHeartbeat(request);
+    }
     return handlePreparedUpload(request);
   }
   return handleMultipartUpload(request);
+}
+
+/**
+ * Opt-in (x-settlement-heartbeat: 1) wrapper around handlePreparedUpload for
+ * authenticated JSON process requests only. Long OCR parses emit no bytes for
+ * minutes, so intermediaries reset the idle connection; streaming JSON
+ * whitespace keeps it alive. The status is fixed at 200 once streaming starts,
+ * so error/skip bodies travel unchanged and the client inspects the payload.
+ */
+function streamPreparedUploadWithHeartbeat(request: Request): Response {
+  const stream = createHeartbeatJsonStream(async () => {
+    const response = await handlePreparedUpload(request);
+    return await response.text();
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      // Ask buffering proxies to pass heartbeat bytes through immediately.
+      "x-accel-buffering": "no",
+    },
+  });
 }
 
 async function handleMultipartUpload(request: Request) {
