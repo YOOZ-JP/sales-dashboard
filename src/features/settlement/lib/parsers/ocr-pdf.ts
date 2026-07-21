@@ -147,6 +147,35 @@ export async function createLocalOcrWorker(langs: string): Promise<OcrWorker> {
 }
 
 /**
+ * Create one OCR worker per langs spec, all concurrently. Either every
+ * worker comes up and they are returned in spec order, or every worker
+ * that did come up is terminated before the first creation error is
+ * rethrown — a partial failure must not leak WASM workers inside a
+ * serverless function. `create` is injectable for synthetic tests.
+ */
+export async function createLocalOcrWorkers(
+  langsList: string[],
+  create: (langs: string) => Promise<OcrWorker> = createLocalOcrWorker,
+): Promise<OcrWorker[]> {
+  const settled = await Promise.allSettled(langsList.map((langs) => create(langs)));
+  const failure = settled.find((s) => s.status === "rejected");
+  if (failure) {
+    await terminateOcrWorkers(
+      settled
+        .filter((s): s is PromiseFulfilledResult<OcrWorker> => s.status === "fulfilled")
+        .map((s) => s.value),
+    );
+    throw (failure as PromiseRejectedResult).reason;
+  }
+  return (settled as PromiseFulfilledResult<OcrWorker>[]).map((s) => s.value);
+}
+
+/** Terminate every worker, tolerating individual terminate() failures. */
+export async function terminateOcrWorkers(workers: OcrWorker[]): Promise<void> {
+  await Promise.allSettled(workers.map((worker) => worker.terminate()));
+}
+
+/**
  * Threshold a rendered page to pure black & white. Kills tinted
  * carbon-copy backgrounds and light dashed digit guides that otherwise
  * corrupt digit OCR.

@@ -31,7 +31,7 @@ import type { ParseResult } from "@/features/settlement/lib/schema/sales";
 import { SHUEISHA_OCR_TITLE_MARKER } from "@/features/settlement/lib/export/input-v2-carry-forward";
 import {
   binarizePng,
-  createLocalOcrWorker,
+  createLocalOcrWorkers,
   detectTableGrid,
   gridCellRect,
   loadPageImage,
@@ -40,6 +40,7 @@ import {
   ocrPngToLines,
   regionInkRatio,
   renderPdfPagesToPng,
+  terminateOcrWorkers,
   type BinarizedPage,
   type OcrLine,
   type OcrWorker,
@@ -603,10 +604,11 @@ async function extractPage1(
   page: SourcePage,
   out: ShueishaExtract,
   reconciliation: Page1Reconciliation,
+  errors: string[],
 ): Promise<void> {
   const grid = detectTableGrid(page.bin);
   if (!grid || grid.ys.length < 3) {
-    out.ocr_errors.push("shueisha: page-1 table grid not detected");
+    errors.push("shueisha: page-1 table grid not detected");
     return;
   }
 
@@ -627,7 +629,7 @@ async function extractPage1(
   const detectedRemarkCol = findColumn(headers, (h) => /備|考/.test(h));
   const remarkCol = detectedRemarkCol >= 0 ? detectedRemarkCol : grid.xs.length - 2;
   if (payCol < 0) {
-    out.ocr_errors.push("shueisha: page-1 支払金額 column not found");
+    errors.push("shueisha: page-1 支払金額 column not found");
     return;
   }
   const pageLines = await ocrPngToLines(textWorker, page.png);
@@ -678,7 +680,7 @@ async function extractPage1(
         ? await ocrCellText(textWorker, page.img, gridCellRect(grid, remarkCol, row))
         : "";
       if (!title) {
-        out.ocr_errors.push("shueisha: page-1 Manga Mee row without a readable title");
+        errors.push("shueisha: page-1 Manga Mee row without a readable title");
         continue;
       }
       out.manga_rows.push({
@@ -689,7 +691,7 @@ async function extractPage1(
       reconciliation.mangaCandidates.push(amountCandidates.length > 0 ? amountCandidates : [-1]);
     } else {
       if (out.jumptoon_summary_total !== null) {
-        out.ocr_errors.push("shueisha: multiple Jumptoon summary rows on page 1");
+        errors.push("shueisha: multiple Jumptoon summary rows on page 1");
         continue;
       }
       out.jumptoon_summary_total = amount;
@@ -703,10 +705,11 @@ async function extractPage2(
   amountWorker: OcrWorker,
   page: SourcePage,
   out: ShueishaExtract,
+  errors: string[],
 ): Promise<void> {
   const grid = detectTableGrid(page.bin);
   if (!grid || grid.ys.length < 3) {
-    out.ocr_errors.push("shueisha: page-2 table grid not detected");
+    errors.push("shueisha: page-2 table grid not detected");
     return;
   }
 
@@ -729,7 +732,7 @@ async function extractPage2(
   const titleCol = Math.max(0, findColumn(headers, (h) => h.includes("作品名")));
   const payCol = findColumn(headers, (h) => h.includes("支払額") && !h.includes("率"));
   if (payCol < 0) {
-    out.ocr_errors.push("shueisha: page-2 御支払額 column not found");
+    errors.push("shueisha: page-2 御支払額 column not found");
     return;
   }
 
@@ -768,7 +771,7 @@ async function extractPage2(
     const amountCandidates = await readAmountCandidates(amountWorker, page, payRect);
     const amount = amountCandidates[0] ?? null;
     if (!work) {
-      out.ocr_errors.push("shueisha: page-2 detail row without a readable title");
+      errors.push("shueisha: page-2 detail row without a readable title");
       continue;
     }
     out.detail_rows.push({
@@ -831,21 +834,40 @@ export async function extractShueishaFromPdf(buffer: Buffer): Promise<ShueishaEx
     return out;
   }
 
-  const textWorker = await createLocalOcrWorker("jpn+eng");
-  const amountWorker = await createLocalOcrWorker("eng");
+  // Each page gets its own text+amount worker pair so the two pages OCR
+  // truly concurrently. Worker parameter state (psm/whitelist) is per
+  // worker, so per-page call sequences — and therefore OCR readings —
+  // are identical to the old sequential run.
+  const workers = await createLocalOcrWorkers(["jpn+eng", "eng", "jpn+eng", "eng"]);
+  const [page1Text, page1Amount, page2Text, page2Amount] = workers;
   try {
-    const page1: SourcePage = { png: pages[0], img: await loadPageImage(pages[0]), bin: await binarizePng(pages[0]) };
-    const page2: SourcePage = { png: pages[1], img: await loadPageImage(pages[1]), bin: await binarizePng(pages[1]) };
+    const prepare = async (png: Buffer): Promise<SourcePage> => {
+      const [img, bin] = await Promise.all([loadPageImage(png), binarizePng(png)]);
+      return { png, img, bin };
+    };
+    const [page1, page2] = await Promise.all([prepare(pages[0]), prepare(pages[1])]);
     const reconciliation: Page1Reconciliation = {
       mangaCandidates: [],
       summaryCandidates: [],
       grandCandidates: [],
     };
-    await extractPage1(textWorker, amountWorker, page1, out, reconciliation);
-    await extractPage2(textWorker, amountWorker, page2, out);
+    // Per-page error sinks keep ocr_errors in a fixed page-1-then-page-2
+    // order regardless of completion timing; allSettled guarantees both
+    // extractions have finished before workers terminate (no in-flight
+    // recognize on a dead worker) and before either failure is rethrown.
+    const page1Errors: string[] = [];
+    const page2Errors: string[] = [];
+    const settled = await Promise.allSettled([
+      extractPage1(page1Text, page1Amount, page1, out, reconciliation, page1Errors),
+      extractPage2(page2Text, page2Amount, page2, out, page2Errors),
+    ]);
+    out.ocr_errors.push(...page1Errors, ...page2Errors);
+    for (const result of settled) {
+      if (result.status === "rejected") throw result.reason;
+    }
     reconcilePage1Amounts(out, reconciliation);
   } finally {
-    await Promise.all([textWorker.terminate(), amountWorker.terminate()]);
+    await terminateOcrWorkers(workers);
   }
   return out;
 }
