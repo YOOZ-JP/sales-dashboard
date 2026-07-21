@@ -18,10 +18,14 @@ import { resolveSettlementMonth } from "@/features/settlement/lib/resolve-settle
 import { archiveBeforeParse } from "@/features/settlement/lib/storage/archive-before-parse";
 import {
   DIRECT_UPLOAD_BUCKET,
+  TERMINAL_UPLOAD_STATUSES,
+  evaluateExactSourceDuplicate,
   parseProcessUploadPayload,
   prepareDirectUploadForParse,
   statusAfterParseMetadata,
   validateFolderHint,
+  type ExactSourceCandidate,
+  type ExactSourceDuplicateDecision,
 } from "@/features/settlement/lib/storage/direct-upload";
 import type { Json, RawUploadInsert } from "@/features/settlement/lib/supabase/types";
 import type {
@@ -240,6 +244,65 @@ async function handlePreparedUpload(request: Request) {
       });
     }
     return NextResponse.json({ error: prepared.error }, { status: prepared.status });
+  }
+
+  // Exact-source duplicate gate: the row is already claimed as parsing with
+  // sha256/archived_at stamped, so a byte-identical reupload of an already
+  // processed month is preserved as an audit row and skipped with zero writes.
+  // A gate lookup failure only degrades to parsing normally — it never blocks.
+  let duplicate: ExactSourceDuplicateDecision = { skip: false };
+  if (prepared.row.settlement_month) {
+    try {
+      const { data, error } = await supabaseServer
+        .from("raw_uploads")
+        .select("id, filename, status, sha256, settlement_month, parsed_rows")
+        .eq("sha256", prepared.sha256)
+        .eq("settlement_month", prepared.row.settlement_month)
+        .neq("id", prepared.row.id)
+        .in("status", TERMINAL_UPLOAD_STATUSES as string[])
+        .limit(20)
+        .returns<ExactSourceCandidate[]>();
+      if (error) throw new Error(error.message);
+      duplicate = evaluateExactSourceDuplicate(prepared.row, prepared.sha256, data ?? []);
+    } catch (e) {
+      console.warn(
+        `[upload] ${prepared.row.filename}: exact-source duplicate check failed (${(e as Error).message}); continuing with parse`,
+      );
+    }
+  }
+  if (duplicate.skip) {
+    const { error: skipErr } = await supabaseServer
+      .from("raw_uploads")
+      .update({
+        status: duplicate.status,
+        parsed_rows: duplicate.parsedRows,
+        parse_error: duplicate.note,
+        parsed_at: new Date().toISOString(),
+      })
+      .eq("id", prepared.row.id);
+    if (skipErr) {
+      const msg = `duplicate skip update: ${skipErr.message}`;
+      console.error(`[upload] ${prepared.row.filename}: ${msg}`);
+      await markUploadFailed(supabaseServer, prepared.row.id, { parse_error: msg }, "", prepared.row.filename);
+      return NextResponse.json({
+        results: [{ upload_id: prepared.row.id, file: prepared.row.filename, error: msg }],
+      });
+    }
+    console.log(
+      `[upload] ${prepared.row.filename}: skipped exact-source duplicate of upload ${duplicate.prior.id}`,
+    );
+    return NextResponse.json({
+      results: [{
+        upload_id: prepared.row.id,
+        file: prepared.row.filename,
+        skipped: true,
+        skip_reason: duplicate.note,
+        status: duplicate.status,
+        parsed_rows: duplicate.parsedRows,
+        sales_records_written: 0,
+        settlement_month: prepared.row.settlement_month,
+      }],
+    });
   }
 
   const [parsers, aggregation] = await Promise.all([

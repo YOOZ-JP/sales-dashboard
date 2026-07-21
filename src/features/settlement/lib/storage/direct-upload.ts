@@ -177,8 +177,69 @@ export function isValidUploadId(uploadId: unknown): uploadId is string {
   return typeof uploadId === "string" && UUID_RE.test(uploadId);
 }
 
+export const TERMINAL_UPLOAD_STATUSES: readonly DirectUploadStatus[] = [
+  "parsed",
+  "aggregated",
+  "archived",
+];
+
 export function isTerminalUploadStatus(status: DirectUploadStatus): boolean {
-  return status === "parsed" || status === "aggregated" || status === "archived";
+  return TERMINAL_UPLOAD_STATUSES.includes(status);
+}
+
+export interface ExactSourceCandidate {
+  id: string;
+  filename: string;
+  status: DirectUploadStatus;
+  sha256: string | null;
+  settlement_month: string | null;
+  parsed_rows: number | null;
+}
+
+export type ExactSourceDuplicateDecision =
+  | { skip: false }
+  | {
+      skip: true;
+      prior: ExactSourceCandidate;
+      status: "parsed" | "aggregated";
+      parsedRows: number;
+      note: string;
+    };
+
+const DUPLICATE_NOTE_MAX = 300;
+
+/**
+ * Exact-source duplicate gate for direct uploads: a reupload of byte-identical
+ * content for the same settlement month is skipped before parsing when another
+ * row already carried it to a successful terminal status. Failed, sha-less,
+ * and in-flight (non-terminal) rows never qualify, so retries after failures
+ * are unaffected and two concurrent identical uploads cannot skip each other.
+ */
+export function evaluateExactSourceDuplicate(
+  current: Pick<DirectUploadRow, "id" | "settlement_month">,
+  sha256: string,
+  candidates: ExactSourceCandidate[],
+): ExactSourceDuplicateDecision {
+  if (!current.settlement_month || !sha256) return { skip: false };
+  const prior = candidates.find(
+    (c) =>
+      c.id !== current.id &&
+      c.sha256 !== null &&
+      c.sha256 === sha256 &&
+      c.settlement_month === current.settlement_month &&
+      isTerminalUploadStatus(c.status),
+  );
+  if (!prior) return { skip: false };
+  const status = prior.status === "aggregated" ? "aggregated" : "parsed";
+  const note =
+    `동일 원본 재업로드 건너뜀: ${current.settlement_month} 정산월에 같은 파일(sha256 일치)이 이미 처리되었습니다.`;
+  return {
+    skip: true,
+    prior,
+    status,
+    parsedRows: prior.parsed_rows ?? 0,
+    note: note.slice(0, DUPLICATE_NOTE_MAX),
+  };
 }
 
 function isSafeRaceSkipStatus(status: DirectUploadStatus): boolean {
