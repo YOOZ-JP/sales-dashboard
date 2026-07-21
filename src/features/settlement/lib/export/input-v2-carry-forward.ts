@@ -1183,11 +1183,10 @@ function readBaselineRow(row: ExcelJS.Row): Record<string, unknown> | null {
   return record;
 }
 
-export async function loadCarryForwardBaselineRows(
-  baselinePath: string | URL,
+export async function loadCarryForwardBaselineRowsFromBuffer(
+  buffer: Buffer | ArrayBuffer | Uint8Array,
 ): Promise<Record<string, unknown>[]> {
   const wb = new ExcelJS.Workbook();
-  const buffer = await readFile(baselinePath);
   await wb.xlsx.load(buffer as unknown as ExcelJS.Buffer);
   const ws = wb.worksheets.find((sheet) => /^input_電子_\d+月$/.test(sheet.name));
   if (!ws) {
@@ -1200,4 +1199,10 @@ export async function loadCarryForwardBaselineRows(
     if (record) records.push(record);
   }
   return records;
+}
+
+export async function loadCarryForwardBaselineRows(
+  baselinePath: string | URL,
+): Promise<Record<string, unknown>[]> {
+  return loadCarryForwardBaselineRowsFromBuffer(await readFile(baselinePath));
 }

@@ -22,6 +22,17 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   return body as T;
 }
 
+// Parent directory of a selection-relative path (slash or backslash
+// separated), without the filename. File-only selections have no directory
+// part and yield undefined. Parsers key off the parent folder basename
+// (e.g. ichijinsha deposit dates), so each file must carry its own.
+export function parentFolderHint(relativePath: string | undefined): string | undefined {
+  if (!relativePath) return undefined;
+  const segments = relativePath.split(/[\\/]/).filter(Boolean);
+  if (segments.length < 2) return undefined;
+  return segments.slice(0, -1).join("/");
+}
+
 function cleanFolderHint(folderHint: string | undefined): string | undefined {
   if (!folderHint) return undefined;
   // eslint-disable-next-line no-control-regex

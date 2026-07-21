@@ -20,6 +20,7 @@ import {
   DIRECT_UPLOAD_BUCKET,
   TERMINAL_UPLOAD_STATUSES,
   evaluateExactSourceDuplicate,
+  isZeroRowParseFailure,
   parseProcessUploadPayload,
   prepareDirectUploadForParse,
   statusAfterParseMetadata,
@@ -625,15 +626,4 @@ function buildRunLabel(request: Request, form: FormData): string {
     (typeof form.get("uploadRunId") === "string" ? (form.get("uploadRunId") as string) : "");
   const uploadRunId = rawRunId.replace(/[^\w.-]/g, "").slice(0, 64) || null;
   return uploadRunId ? ` run=${uploadRunId}` : "";
-}
-
-function isZeroRowParseFailure(platformCode: string, parsedRows: number, errors: string[]): boolean {
-  if (parsedRows > 0) return false;
-  const joined = errors.join("; ").toLowerCase();
-  if (platformCode === "unknown") return true;
-  return (
-    joined.includes("no parser for platform") ||
-    joined.includes("no data rows parsed") ||
-    joined.includes("unsupported")
-  );
 }

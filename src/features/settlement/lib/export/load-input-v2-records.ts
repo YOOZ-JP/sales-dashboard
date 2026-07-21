@@ -15,11 +15,15 @@
  */
 import {
   carryForwardRecordKey,
+  loadCarryForwardBaselineRowsFromBuffer,
   mergeCarryForwardRows,
 } from "./input-v2-carry-forward";
 import {
   dedupeCrossUploadDuplicates,
   dedupePiccomaStatementDuplicates,
+  isPiccomaRow,
+  piccomaSourceRoleFromFilename,
+  type PiccomaSourceRole,
 } from "@/features/settlement/lib/aggregation/strict-record-key";
 import {
   clientCodeToDisplay,
@@ -148,6 +152,118 @@ export function decideSourceCompleteness(
       details: `Required source uploads are missing, failed, or empty for this month: ${sourceWarnings.join(", ")}. Upload a successful statement for each family, then retry.`,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Private carry-baseline fallback
+//
+// When sales_records holds no months before the target, the DB-derived
+// baseline roster is empty and every contract row of the prior month would
+// silently vanish from the export. In that case the loader falls back to the
+// previous month's verified INPUT workbook stored in the private Storage
+// bucket (never in Git or the runtime bundle). The DB baseline always wins
+// when it exists; with neither baseline the export fails closed instead of
+// generating a misleadingly incomplete workbook. Failure reasons are category
+// strings only — workbook titles/amounts never reach errors or logs.
+// ---------------------------------------------------------------------------
+
+const CARRY_BASELINE_BUCKET = "upload-debug";
+
+/** Real INPUT workbooks are ~0.2–0.8MB; refuse anything implausibly large. */
+export const CARRY_BASELINE_MAX_BYTES = 10_000_000;
+
+/** Previous YYYYMM for a valid YYYYMM month, or null when underivable. */
+export function previousSettlementMonth(month: string): string | null {
+  if (!/^\d{6}$/.test(month)) return null;
+  const year = Number(month.slice(0, 4));
+  const monthNumber = Number(month.slice(4, 6));
+  if (monthNumber < 1 || monthNumber > 12) return null;
+  const prevYear = monthNumber === 1 ? year - 1 : year;
+  const prevMonth = monthNumber === 1 ? 12 : monthNumber - 1;
+  return `${prevYear}${String(prevMonth).padStart(2, "0")}`;
+}
+
+/** Bucket-relative path of a month's private carry-baseline workbook. */
+export function carryBaselineStoragePath(baselineMonth: string): string {
+  return `settlement-baselines/${baselineMonth}/input-jp-fin.xlsx`;
+}
+
+export type PrivateCarryBaselineFetch =
+  | { ok: true; rows: Record<string, unknown>[] }
+  | { ok: false; reason: string };
+
+export type CarryBaselineDecision =
+  | { ok: true; source: "db" | "private" }
+  | { ok: false; loadError: InputV2LoadError };
+
+/**
+ * Which baseline feeds the carry-forward merge. The DB historical baseline is
+ * always preferred; the private workbook only stands in when the DB has no
+ * prior months at all. `allowIncompleteSources` is deliberately not consulted:
+ * comparison audit runs may tolerate missing source families, but a missing
+ * carry baseline makes the whole candidate meaningless, so it always blocks.
+ */
+export function decideCarryBaseline(
+  dbBaselineRowCount: number,
+  privateBaseline: PrivateCarryBaselineFetch | null,
+  options: LoadInputV2RecordsOptions = {},
+): CarryBaselineDecision {
+  void options;
+  if (dbBaselineRowCount > 0) return { ok: true, source: "db" };
+  if (privateBaseline?.ok && privateBaseline.rows.length > 0) {
+    return { ok: true, source: "private" };
+  }
+  const reason = privateBaseline && !privateBaseline.ok
+    ? privateBaseline.reason
+    : "private baseline unavailable";
+  return {
+    ok: false,
+    loadError: {
+      status: 409,
+      error: "missing_carry_baseline",
+      details:
+        `No historical baseline rows exist in the database before this month, and the previous month's private carry-baseline workbook could not be used (${reason}). ` +
+        "Store the prior month's verified INPUT workbook in the private baseline archive, then retry.",
+    },
+  };
+}
+
+/** Minimal structural view of the Supabase client used for the download. */
+export type StorageDownloadClient = {
+  storage: {
+    from(bucket: string): {
+      download(path: string): Promise<{ data: Blob | null; error: { message?: string } | null }>;
+    };
+  };
+};
+
+export async function fetchPrivateCarryBaseline(
+  month: string,
+  supabase: StorageDownloadClient,
+): Promise<PrivateCarryBaselineFetch> {
+  const baselineMonth = previousSettlementMonth(month);
+  if (!baselineMonth) return { ok: false, reason: "previous month underivable" };
+  const path = carryBaselineStoragePath(baselineMonth);
+  let blob: Blob;
+  try {
+    const { data, error } = await supabase.storage.from(CARRY_BASELINE_BUCKET).download(path);
+    if (error || !data) return { ok: false, reason: "baseline object missing" };
+    blob = data;
+  } catch {
+    return { ok: false, reason: "baseline object missing" };
+  }
+  if (blob.size > CARRY_BASELINE_MAX_BYTES) {
+    return { ok: false, reason: "baseline object too large" };
+  }
+  try {
+    const rows = await loadCarryForwardBaselineRowsFromBuffer(
+      Buffer.from(await blob.arrayBuffer()),
+    );
+    if (rows.length === 0) return { ok: false, reason: "baseline sheet has no rows" };
+    return { ok: true, rows };
+  } catch {
+    return { ok: false, reason: "baseline workbook unreadable" };
+  }
 }
 
 function formatSupabaseError(err: unknown): string {
@@ -408,12 +524,47 @@ export async function loadInputV2Records(
       }
     }
 
+    // Piccoma companion reconciliation needs to know which upload carried the
+    // 出版社report (detail) file and which the 取次report (summary) file. The
+    // raw_uploads filenames are consulted internally only — they never reach
+    // logs, errors, or the export. Lookup failure degrades to the legacy
+    // deterministic keeper inside the dedupe helper.
+    const piccomaRoleByUploadId = new Map<string, PiccomaSourceRole>();
+    try {
+      const piccomaUploadIds = [
+        ...new Set(
+          all
+            .filter((row) => isPiccomaRow(row))
+            .map((row) => row.upload_id)
+            .filter((id): id is string => typeof id === "string" && id.length > 0),
+        ),
+      ];
+      if (piccomaUploadIds.length > 0) {
+        const { data: piccomaUploads, error: piccomaUploadsError } = await supabase
+          .from("raw_uploads")
+          .select("id, filename")
+          .in("id", piccomaUploadIds);
+        if (piccomaUploadsError) throw piccomaUploadsError;
+        for (const upload of piccomaUploads ?? []) {
+          const role = piccomaSourceRoleFromFilename(upload.filename);
+          if (role && typeof upload.id === "string") {
+            piccomaRoleByUploadId.set(upload.id, role);
+          }
+        }
+      }
+    } catch {
+      console.warn(
+        `[input-v2] ${month}: piccoma upload role lookup failed; falling back to keeper dedupe`,
+      );
+    }
+
     // Hide historical cross-upload duplicates (the same statement uploaded
     // twice, e.g. as CSV and XLSX) without touching the DB: per strict
     // logical key, keep one upload's rows and drop the re-uploaded copies.
     // Legitimate variants (same title, different type/month/amount) have
-    // distinct keys and always survive.
-    const piccomaDeduped = dedupePiccomaStatementDuplicates(all);
+    // distinct keys and always survive. Piccoma companion pairs are
+    // reconciled by source role when provenance identifies both files.
+    const piccomaDeduped = dedupePiccomaStatementDuplicates(all, piccomaRoleByUploadId);
     if (piccomaDeduped.removed > 0) {
       console.warn(
         `[input-v2] ${month}: suppressed ${piccomaDeduped.removed} Piccoma paired duplicate rows`,
@@ -444,7 +595,32 @@ export async function loadInputV2Records(
         found.rows.push(row);
       }
     }
-    const baseline = [...latestHistory.values()].flatMap((entry) => entry.rows);
+    let baseline = [...latestHistory.values()].flatMap((entry) => entry.rows);
+    let baselineSource: "db" | "private" = "db";
+
+    // With no prior months in the DB, fall back to the previous month's
+    // verified workbook in the private Storage bucket, or fail closed. This
+    // gate ignores allowIncompleteSources: an audit run without any carry
+    // baseline would only produce a meaningless candidate.
+    if (baseline.length === 0) {
+      const privateBaseline = await fetchPrivateCarryBaseline(month, supabase);
+      const decision = decideCarryBaseline(baseline.length, privateBaseline, options);
+      if (!decision.ok) {
+        return {
+          records: [],
+          source: "supabase",
+          loadError: decision.loadError,
+          sourceWarnings: [],
+        };
+      }
+      if (privateBaseline.ok) {
+        baseline = privateBaseline.rows;
+        baselineSource = "private";
+        console.warn(
+          `[input-v2] ${month}: DB historical baseline empty; using private carry baseline (${baseline.length} rows)`,
+        );
+      }
+    }
 
     // Source completeness gate: contract channels that live in the baseline
     // must be backed by a successful current-batch upload of their source
@@ -488,7 +664,7 @@ export async function loadInputV2Records(
     const carried = mergeCarryForwardRows(baseline, current, month);
     return {
       records: carried.records,
-      source: "supabase",
+      source: baselineSource === "private" ? "supabase+private-carry-baseline" : "supabase",
       loadError: null,
       sourceWarnings: sourceDecision.sourceWarnings,
     };

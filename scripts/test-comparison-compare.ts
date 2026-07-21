@@ -156,12 +156,30 @@ async function run() {
     assert.ok(missing.golden, "missing diff carries a golden row digest");
   }
 
-  // 4. Formula vs blank and formula vs value are 'formula' diffs.
+  // 4. Uncached formula vs uncached formula: no diff, row exact — even with
+  //    different formula text.
   {
     const result = await compareInputWorkbooks({
       candidate: await makeWorkbook([
-        baseRow({ fee_jpy: undefined }),
-        baseRow({ channel_title_jp: "タイトルB", fee_jpy: 70 }),
+        baseRow({ fee_jpy: { formula: "U6*0.1" } as ExcelJS.CellValue }),
+      ]),
+      golden: await makeWorkbook([
+        baseRow({ fee_jpy: { formula: "V6-W6" } as ExcelJS.CellValue }),
+      ]),
+    });
+    assert.equal(result.summary.matched_rows, 1);
+    assert.equal(result.summary.diff_total, 0, "uncached-vs-uncached must not diff");
+    assert.equal(result.summary.exact_rows, 1, "uncached-vs-uncached row is exact");
+    assert.equal(result.summary.formula_mismatches, 0);
+  }
+
+  // 4a. Uncached formula vs known (value or blank): no diff emitted and the
+  //     row still counts as business-exact.
+  {
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook([
+        baseRow({ fee_jpy: 70 }),
+        baseRow({ channel_title_jp: "タイトルB", fee_jpy: undefined }),
       ]),
       golden: await makeWorkbook([
         baseRow({ fee_jpy: { formula: "U6*0.1" } as ExcelJS.CellValue }),
@@ -171,13 +189,105 @@ async function run() {
         }),
       ]),
     });
-    const formulaDiffs = result.diffs.filter((d) => d.category === "formula");
-    assert.equal(formulaDiffs.length, 2, "blank-vs-formula and value-vs-formula");
-    assert.ok(formulaDiffs.every((d) => d.field === "fee_jpy"));
-    assert.equal(result.summary.formula_mismatches, 2);
+    assert.equal(result.summary.matched_rows, 2);
+    assert.equal(result.summary.diff_total, 0, "unknown-vs-known must not diff");
+    assert.equal(result.summary.exact_rows, 2, "unknown-vs-known rows stay business-exact");
+    assert.equal(result.summary.formula_mismatches, 0);
   }
 
-  // 4b. Same formula on different rows compares equal (row-masked).
+  // 4a2. Unknown cell plus a real known mismatch on the same row: the known
+  //      mismatch alone makes the row non-exact.
+  {
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook([
+        baseRow({ fee_jpy: 70, before_tax_income_jpy: 600 }),
+      ]),
+      golden: await makeWorkbook([
+        baseRow({
+          fee_jpy: { formula: "U6*0.1" } as ExcelJS.CellValue,
+          before_tax_income_jpy: 601,
+        }),
+      ]),
+    });
+    assert.equal(result.summary.matched_rows, 1);
+    assert.equal(result.summary.diff_total, 1, "only the known mismatch diffs");
+    assert.equal(result.diffs[0].field, "before_tax_income_jpy");
+    assert.equal(result.summary.exact_rows, 0, "known mismatch keeps the row non-exact");
+  }
+
+  // 4b. Cached formula vs raw value with the same semantic value: exact.
+  {
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook([
+        baseRow({ fee_jpy: { formula: "U6*0.1", result: 70 } as ExcelJS.CellValue }),
+      ]),
+      golden: await makeWorkbook([baseRow({ fee_jpy: 70 })]),
+    });
+    assert.equal(result.summary.diff_total, 0, "cached-formula-vs-raw same value must not diff");
+    assert.equal(result.summary.exact_rows, 1);
+  }
+
+  // 4c. Different formula text but the same cached result: exact.
+  {
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook([
+        baseRow({ fee_jpy: { formula: "U6*0.1", result: 70 } as ExcelJS.CellValue }),
+      ]),
+      golden: await makeWorkbook([
+        baseRow({ fee_jpy: { formula: "X6-Y6", result: 70 } as ExcelJS.CellValue }),
+      ]),
+    });
+    assert.equal(result.summary.diff_total, 0, "formula text must never diff on its own");
+    assert.equal(result.summary.exact_rows, 1);
+  }
+
+  // 4d. Cached formula vs raw value with different values: one 'field' diff.
+  {
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook([
+        baseRow({ fee_jpy: { formula: "U6*0.1", result: 70 } as ExcelJS.CellValue }),
+      ]),
+      golden: await makeWorkbook([baseRow({ fee_jpy: 71 })]),
+    });
+    assert.equal(result.summary.diff_total, 1);
+    assert.equal(result.diffs[0].category, "field");
+    assert.equal(result.diffs[0].field, "fee_jpy");
+    assert.equal(result.summary.exact_rows, 0);
+  }
+
+  // 4e. Excluded auto/template columns never affect exact/diff.
+  {
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook([
+        baseRow({ company: "REDICE", exchange_rate: 140.25, after_tax_income_vehicle: 123 }),
+      ]),
+      golden: await makeWorkbook([
+        baseRow({ company: "OTHER", exchange_rate: 9.5, after_tax_income_vehicle: 456 }),
+      ]),
+    });
+    assert.equal(result.summary.diff_total, 0, "excluded columns must not diff");
+    assert.equal(result.summary.exact_rows, 1, "excluded columns must not break exactness");
+  }
+
+  // 4f. Duplicate-identity buckets pair like-with-like under unknown
+  //     semantics, deterministically and order-independently.
+  {
+    const known = baseRow({ fee_jpy: 70 });
+    const uncached = baseRow({ fee_jpy: { formula: "U6*0.1" } as ExcelJS.CellValue });
+    const forward = await compareInputWorkbooks({
+      candidate: await makeWorkbook([uncached, known]),
+      golden: await makeWorkbook([known, uncached]),
+    });
+    assert.equal(forward.summary.exact_rows, 2, "uncached↔uncached and 70↔70 must pair");
+    assert.equal(forward.summary.diff_total, 0);
+    const reordered = await compareInputWorkbooks({
+      candidate: await makeWorkbook([known, uncached]),
+      golden: await makeWorkbook([uncached, known]),
+    });
+    assert.deepEqual(reordered.summary, forward.summary, "pairing must be order-invariant");
+  }
+
+  // 4g. Same formula on different rows compares equal (both uncached).
   {
     const result = await compareInputWorkbooks({
       candidate: await makeWorkbook([

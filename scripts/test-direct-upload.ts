@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 
 import {
   buildCleanupPreparedUploadRequest,
+  parentFolderHint,
 } from "../src/features/settlement/lib/storage/direct-upload-client";
 import {
   buildDirectUploadPath,
@@ -70,6 +71,29 @@ async function run() {
     content_type: null,
     active_month: "2026-05-01",
   }).ok, false);
+
+  // Regression: each selected file carries its OWN parent directory, not the
+  // selection's top-level folder — deposit dates live in per-file subfolder
+  // basenames (e.g. ichijinsha), so a shared top-level hint loses them.
+  assert.equal(
+    parentFolderHint("202606/deposit 2026.06.05/statement.xlsx"),
+    "202606/deposit 2026.06.05",
+  );
+  assert.equal(
+    parentFolderHint("202606\\deposit 2026.06.12\\statement.xls"),
+    "202606/deposit 2026.06.12",
+    "backslash-separated paths must resolve the same parent",
+  );
+  assert.equal(parentFolderHint("202606/statement.xlsx"), "202606");
+  // File-only selections (no directory) and empty paths carry no hint.
+  assert.equal(parentFolderHint("statement.xlsx"), undefined);
+  assert.equal(parentFolderHint(""), undefined);
+  assert.equal(parentFolderHint(undefined), undefined);
+  // The filename itself must never be part of the hint.
+  assert.doesNotMatch(
+    parentFolderHint("202606/deposit 2026.06.05/statement.xlsx") ?? "",
+    /statement\.xlsx/,
+  );
 
   assert.deepEqual(validateFolderHint(" 2026-05-statements "), {
     ok: true,

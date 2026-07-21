@@ -122,6 +122,12 @@ function shouldUseGenericSummaryFallback(filename: string, platformCode: string)
   // a zero-row parse there is a hard parser error that must surface instead
   // of being masked by a generic one-line summary.
   if (platformCode === "ichijinsha" && /詳細別送の内訳/.test(filename)) return false;
+  // The Shueisha 支払通知書 is the authoritative detail source for Manga Mee /
+  // Jumptoon rows and its parser already reconciles printed totals. Zero rows
+  // therefore means the local OCR pipeline itself failed (e.g. the deployed
+  // bundle is missing the @napi-rs/canvas native binding) and must surface as
+  // a hard failure instead of being masked by a generic one-line summary.
+  if (platformCode === "shueisha") return false;
   // The SB Creative monthly sales report is the authoritative EB detail
   // source: zero rows or a totals-reconciliation failure there must surface
   // as a parser error instead of being masked by a generic one-line summary.

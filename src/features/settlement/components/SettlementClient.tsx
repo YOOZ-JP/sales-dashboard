@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type Inp
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FolderOpen, Loader2, UploadCloud, Trash2 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import SettlementCompareClient from '@/features/settlement/components/SettlementCompareClient';
-import { uploadSettlementFileDirect } from '@/features/settlement/lib/storage/direct-upload-client';
+import { parentFolderHint, uploadSettlementFileDirect } from '@/features/settlement/lib/storage/direct-upload-client';
 
 type UploadResult = {
   file?: string;
@@ -247,9 +247,6 @@ export default function SettlementClient({
     const targetMonth = month;
     const targetIso = toIsoMonth(targetMonth);
     const targetLabel = monthLabel(targetMonth);
-    // Top-level folder name of the dropped selection, if any — platform
-    // detection aid only; never used for month decisions.
-    const folderHint = selected.find((sf) => sf.relativePath.includes('/'))?.relativePath.split('/')[0] ?? '';
     setMessage(null);
     setResults([]);
     setResultsExpanded(false);
@@ -283,7 +280,9 @@ export default function SettlementClient({
       for (const sf of selected) {
         setProgress({ current: sentFiles + 1, total: selected.length, currentFile: sf.relativePath });
         try {
-          const json = await uploadSettlementFileDirect(sf.file, targetIso, folderHint);
+          // Each file's own parent folder — platform/deposit-date detection
+          // aid only; never used for month decisions.
+          const json = await uploadSettlementFileDirect(sf.file, targetIso, parentFolderHint(sf.relativePath));
           if (Array.isArray(json.results)) aggregated.push(...json.results);
         } catch (err) {
           recordFailure(sf, (err as Error).message);
@@ -451,14 +450,30 @@ export default function SettlementClient({
       <header className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
         <p className="text-xs font-semibold uppercase tracking-[0.25em] text-blue-600">Settlement</p>
         <h1 className="mt-2 text-2xl font-bold text-slate-950 dark:text-white">{t('정산 / INPUT Export', '精算 / INPUT Export')}</h1>
-        <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
-          {t(
-            '정산월 선택부터 파일 업로드, INPUT 미리보기·내보내기, 정답지 비교, 담당자 검토까지 한 흐름에서 처리합니다.',
-            '精算月の選択からファイルアップロード、INPUTプレビュー・エクスポート、正解ファイル比較、担当者レビューまで一連の流れで処理します。',
-          )}
-        </p>
       </header>
 
+      <div className="inline-flex w-full rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:w-fit">
+        {[
+          ['work', t('정산 작업', '精算作業')],
+          ['compare', t('정답지 비교', '正解ファイル比較')],
+        ].map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            onClick={() => setTab(value as SettlementTab)}
+            className={`flex-1 rounded-lg px-4 py-2 text-sm font-bold transition sm:flex-none ${
+              tab === value
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'work' ? (
+        <>
       <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -563,28 +578,6 @@ export default function SettlementClient({
         </p>
       </section>
 
-      <div className="inline-flex w-full rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:w-fit">
-        {[
-          ['work', t('정산 작업', '精算作業')],
-          ['compare', t('정답지 비교', '正解ファイル比較')],
-        ].map(([value, label]) => (
-          <button
-            key={value}
-            type="button"
-            onClick={() => setTab(value as SettlementTab)}
-            className={`flex-1 rounded-lg px-4 py-2 text-sm font-bold transition sm:flex-none ${
-              tab === value
-                ? 'bg-blue-600 text-white shadow-sm'
-                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {tab === 'work' ? (
-        <>
       <section>
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <h2 className="text-sm font-bold text-slate-950 dark:text-white">{t('2. 파일 올리기', '2. ファイルをアップロード')}</h2>
@@ -791,7 +784,7 @@ export default function SettlementClient({
       )}
         </>
       ) : (
-        <SettlementCompareClient month={month} embedded />
+        <SettlementCompareClient month={month} />
       )}
     </div>
   );

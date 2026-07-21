@@ -31,6 +31,11 @@ export interface CellSnapshot {
   value: SemanticValue;
   /** Row-masked formula text (A7 → A#) so row position never causes a diff. */
   formula: string | null;
+  /**
+   * False only for formulas with no usable cached result (uncached or error):
+   * the semantic value is unknown, which is never a business difference.
+   */
+  known: boolean;
 }
 
 export interface InputRowSnapshot {
@@ -45,7 +50,7 @@ export interface InputSheetSnapshot {
   rows: InputRowSnapshot[];
 }
 
-const BLANK: CellSnapshot = { state: "blank", value: null, formula: null };
+const BLANK: CellSnapshot = { state: "blank", value: null, formula: null, known: true };
 
 function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -75,28 +80,41 @@ function snapshotCell(cell: ExcelJS.Cell): CellSnapshot {
     if ("formula" in v || "sharedFormula" in v) {
       const fv = v as ExcelJS.CellFormulaValue & { sharedFormula?: string };
       const formula = typeof fv.formula === "string" ? fv.formula : fv.sharedFormula ?? "";
+      const result = fv.result;
+      // No cached result (fresh ExcelJS output) or a cached error: the
+      // semantic value is unknown, not blank/zero.
+      const uncached =
+        result === null ||
+        result === undefined ||
+        (typeof result === "object" && !(result instanceof Date) && "error" in result);
       return {
         state: "formula",
-        value: semanticScalar(fv.result),
+        value: uncached ? null : semanticScalar(result),
         formula: normalizeFormulaText(formula),
+        known: !uncached,
       };
     }
     if ("richText" in v) {
       const text = (v as ExcelJS.CellRichTextValue).richText.map((r) => r.text).join("");
       const value = semanticScalar(text);
-      return value === null ? BLANK : { state: "value", value, formula: null };
+      return value === null ? BLANK : { state: "value", value, formula: null, known: true };
     }
     if ("text" in v) {
       const value = semanticScalar((v as ExcelJS.CellHyperlinkValue).text);
-      return value === null ? BLANK : { state: "value", value, formula: null };
+      return value === null ? BLANK : { state: "value", value, formula: null, known: true };
     }
     if ("error" in v) {
-      return { state: "value", value: String((v as ExcelJS.CellErrorValue).error), formula: null };
+      return {
+        state: "value",
+        value: String((v as ExcelJS.CellErrorValue).error),
+        formula: null,
+        known: true,
+      };
     }
     return BLANK;
   }
   const value = semanticScalar(v);
-  return value === null ? BLANK : { state: "value", value, formula: null };
+  return value === null ? BLANK : { state: "value", value, formula: null, known: true };
 }
 
 function headerText(ws: ExcelJS.Worksheet, col: number): string {

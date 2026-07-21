@@ -22,7 +22,11 @@ export async function GET(
     );
   }
 
-  const { records, source, loadError } = await loadInputV2Records(month);
+  // Preview is inspection-only: tolerate missing source families (unlike the
+  // strict export route) and surface them as warnings instead of a 409.
+  const { records, source, loadError, sourceWarnings } = await loadInputV2Records(month, {
+    allowIncompleteSources: true,
+  });
   if (loadError) {
     return NextResponse.json(
       { error: loadError.error, details: loadError.details },
@@ -55,7 +59,7 @@ export async function GET(
       publicationRows: result.publication_rows,
       generatedAt: new Date().toISOString(),
     });
-    return NextResponse.json(preview);
+    return NextResponse.json({ ...preview, sourceWarnings });
   } catch (err) {
     return NextResponse.json(
       {

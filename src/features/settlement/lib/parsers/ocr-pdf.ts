@@ -63,6 +63,23 @@ export interface TableGrid {
   ys: number[];
 }
 
+/**
+ * All canvas access goes through here so a missing platform binary
+ * (e.g. a prebuilt deploy that never bundled skia.linux-*.node) fails
+ * with an actionable message instead of a bare "Cannot find module".
+ */
+async function importCanvas(): Promise<typeof import("@napi-rs/canvas")> {
+  try {
+    return await import("@napi-rs/canvas");
+  } catch (e) {
+    throw new Error(
+      `ocr-pdf: @napi-rs/canvas native binding unavailable for ${process.platform}-${process.arch} — ` +
+      `the deployed bundle is missing the platform binary (deploy via scripts that run ` +
+      `scripts/ensure-canvas-linux-binding.mjs before "vercel build"): ${(e as Error).message}`,
+    );
+  }
+}
+
 function findLangSource(lang: string): string | null {
   const rel = `node_modules/@tesseract.js-data/${lang}/4.0.0_best_int/${lang}.traineddata.gz`;
   const candidates = [
@@ -98,7 +115,7 @@ export async function renderPdfPagesToPng(
   opts: { scale?: number } = {},
 ): Promise<Buffer[]> {
   const { getDocumentProxy, renderPageAsImage, createIsomorphicCanvasFactory } = await import("unpdf");
-  const canvasImport = () => import("@napi-rs/canvas");
+  const canvasImport = () => importCanvas();
   // Scanned pages are image XObjects; pdfjs needs a document-level canvas
   // factory to decode them (renderPageAsImage's canvasImport only covers the
   // output canvas).
@@ -135,7 +152,7 @@ export async function createLocalOcrWorker(langs: string): Promise<OcrWorker> {
  * corrupt digit OCR.
  */
 export async function binarizePng(png: Buffer, threshold = 150): Promise<BinarizedPage> {
-  const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+  const { createCanvas, loadImage } = await importCanvas();
   const img = await loadImage(png);
   const canvas = createCanvas(img.width, img.height);
   const ctx = canvas.getContext("2d");
@@ -318,7 +335,7 @@ export interface PageImage {
 }
 
 export async function loadPageImage(png: Buffer): Promise<PageImage> {
-  const { loadImage } = await import("@napi-rs/canvas");
+  const { loadImage } = await importCanvas();
   const img = await loadImage(png);
   return { img, width: img.width, height: img.height };
 }
@@ -334,7 +351,7 @@ async function cropUpscaled(
   scaleUp: number,
   threshold?: number,
 ): Promise<Buffer> {
-  const { createCanvas } = await import("@napi-rs/canvas");
+  const { createCanvas } = await importCanvas();
   const x = Math.max(0, Math.floor(rect.x));
   const y = Math.max(0, Math.floor(rect.y));
   const w = Math.max(1, Math.min(Math.floor(rect.w), page.width - x));

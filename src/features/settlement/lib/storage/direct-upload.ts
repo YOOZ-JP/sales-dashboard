@@ -254,6 +254,27 @@ export function statusAfterParseMetadata(
   return zeroRowFailure ? "failed" : "parsed";
 }
 
+/**
+ * Platforms whose parser output is the authoritative detail source: a
+ * zero-row parse there is always a hard failure, never a benign
+ * "supporting document" skip. Shueisha's scanned notice, in particular,
+ * yields zero rows when the serverless OCR runtime is broken (missing
+ * native canvas binding) — that must stay visible.
+ */
+const ZERO_ROW_HARD_FAILURE_PLATFORMS = new Set(["shueisha"]);
+
+export function isZeroRowParseFailure(platformCode: string, parsedRows: number, errors: string[]): boolean {
+  if (parsedRows > 0) return false;
+  if (platformCode === "unknown") return true;
+  if (ZERO_ROW_HARD_FAILURE_PLATFORMS.has(platformCode)) return true;
+  const joined = errors.join("; ").toLowerCase();
+  return (
+    joined.includes("no parser for platform") ||
+    joined.includes("no data rows parsed") ||
+    joined.includes("unsupported")
+  );
+}
+
 export function validateDirectUploadRow(row: DirectUploadRow): string | null {
   if (!isValidUploadId(row.id)) return "invalid upload row id";
   if (!row.storage_path.startsWith("uploads/")) return "invalid storage path";

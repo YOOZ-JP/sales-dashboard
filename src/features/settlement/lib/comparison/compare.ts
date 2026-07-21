@@ -5,11 +5,20 @@
  *
  * Rows are matched as an identity multiset on (channel, type, title): within
  * each identity group, candidate rows are paired to golden rows by an exact
- * globally minimum-cost assignment on field-mismatch counts (bitmask DP for
- * small groups, Hungarian for larger ones), computed over canonically sorted
- * rows so the pairing — and any tie between equal-cost assignments — is
- * independent of row order in either file. Unpaired golden rows are
- * 'missing', unpaired candidate rows are 'extra'.
+ * globally minimum-cost assignment (bitmask DP for small groups, Hungarian
+ * for larger ones), computed over canonically sorted rows so the pairing —
+ * and any tie between equal-cost assignments — is independent of row order
+ * in either file. Unpaired golden rows are 'missing', unpaired candidate
+ * rows are 'extra'.
+ *
+ * Only the 14 business fields (BUSINESS_COMPARE_FIELDS) are compared per
+ * paired row; the remaining template columns are formula/master-data driven
+ * and must never produce a business diff. Cells whose semantic value is
+ * unknown (formulas without a cached result) never diff and never disqualify
+ * a row: exact_rows means business-exact — a matched row with zero known
+ * business-field mismatches. Unknown only acts as a pairing-cost penalty so
+ * duplicate-identity groups still align cache-known rows optimally.
+ * Semantics ported from the proven diagnose-new44.mts golden comparator.
  */
 import type { Json } from "../supabase/types";
 import { normalizeIdentityPart, type RowIdentity } from "./identity";
@@ -21,7 +30,34 @@ import {
   type InputRowSnapshot,
 } from "./workbook";
 
+/**
+ * 'formula' is kept for API/schema compatibility with persisted runs but is
+ * no longer emitted: formula text and cached/uncached state never constitute
+ * a business difference on their own.
+ */
 export type ComparisonDiffCategory = "missing" | "extra" | "field" | "formula";
+
+/**
+ * The business fields compared per paired row, matching the authoritative
+ * golden comparator. Identity (channel, type, title) is handled by grouping;
+ * every other template column is auto-derived and excluded from comparison.
+ */
+export const BUSINESS_COMPARE_FIELDS = [
+  "clients",
+  "sales_month",
+  "month",
+  "settlement_month",
+  "deposit_month",
+  "total_amount_jpy",
+  "fee_jpy",
+  "before_tax_jpy",
+  "after_tax_jpy",
+  "rs",
+  "before_tax_income_jpy",
+  "withholding_tax_jpy",
+  "tax_jpy",
+  "after_tax_income_jpy",
+] as const satisfies readonly CompareField[];
 
 export interface ComparisonDiffFinding {
   category: ComparisonDiffCategory;
@@ -38,11 +74,13 @@ export interface ComparisonSummary {
   candidate_rows: number;
   golden_rows: number;
   matched_rows: number;
+  /** Business-exact matched rows: zero known business-field mismatches. */
   exact_rows: number;
   missing_rows: number;
   extra_rows: number;
-  /** Per-field mismatch counts, including formula-state mismatches. */
+  /** Per-business-field mismatch counts (both sides known, values differ). */
   field_mismatches: Record<string, number>;
+  /** Always 0 — kept for schema compatibility with persisted runs. */
   formula_mismatches: number;
   diff_total: number;
   diffs_truncated: boolean;
@@ -70,33 +108,61 @@ function valuesEqual(a: CellSnapshot["value"], b: CellSnapshot["value"]): boolea
   return a === b;
 }
 
+type CellVerdict = "equal" | "mismatch" | "unknown";
+
 /**
- * Field-level verdict for one paired cell.
- *  - equal: same state and same semantic value/formula
- *  - 'formula': the states disagree about formula-ness, or both are formulas
- *    with different (row-masked) formula text
- *  - 'field': plain value/blank disagreement
+ * Field-level verdict for one paired business cell.
+ *  - Both sides known (raw value or cached formula result): compare normalized
+ *    semantic values; formula/raw state and formula text never matter.
+ *  - Both sides unknown (uncached formulas): exact.
+ *  - One side unknown: no diff is emitted and the row still counts as
+ *    business-exact; 'unknown' only feeds the pairing cost.
  */
-function cellDiffCategory(
-  candidate: CellSnapshot,
-  golden: CellSnapshot,
-): ComparisonDiffCategory | null {
-  const cFormula = candidate.state === "formula";
-  const gFormula = golden.state === "formula";
-  if (cFormula !== gFormula) return "formula";
-  if (cFormula && gFormula) {
-    if (candidate.formula !== golden.formula) return "formula";
-    return null;
+function cellVerdict(candidate: CellSnapshot, golden: CellSnapshot): CellVerdict {
+  if (candidate.known && golden.known) {
+    return valuesEqual(candidate.value, golden.value) ? "equal" : "mismatch";
   }
-  return valuesEqual(candidate.value, golden.value) ? null : "field";
+  if (!candidate.known && !golden.known) return "equal";
+  return "unknown";
 }
 
-function countMismatches(candidate: InputRowSnapshot, golden: InputRowSnapshot): number {
-  let n = 0;
-  for (const field of COMPARE_FIELDS) {
-    if (cellDiffCategory(candidate.cells[field], golden.cells[field]) !== null) n += 1;
+/**
+ * Assignment-only cost tuple. Unlike the summary's business-exact notion,
+ * 'unknown' still penalizes here (notExact + unknown) so duplicate-identity
+ * pairing keeps preferring cache-known partners over uncached ones.
+ */
+interface PairCost {
+  /** 1 unless every business field is verdict-equal. */
+  notExact: number;
+  /** Both sides known, values differ. */
+  mismatch: number;
+  /** Exactly one side unknown. */
+  unknown: number;
+}
+
+function pairCost(candidate: InputRowSnapshot, golden: InputRowSnapshot): PairCost {
+  let mismatch = 0;
+  let unknown = 0;
+  for (const field of BUSINESS_COMPARE_FIELDS) {
+    const verdict = cellVerdict(candidate.cells[field], golden.cells[field]);
+    if (verdict === "mismatch") mismatch += 1;
+    else if (verdict === "unknown") unknown += 1;
   }
-  return n;
+  return { notExact: mismatch === 0 && unknown === 0 ? 0 : 1, mismatch, unknown };
+}
+
+const FIELD_COUNT = BUSINESS_COMPARE_FIELDS.length;
+
+/**
+ * Scalarize the lexicographic cost tuple (maximize exact pairs, then minimize
+ * known mismatches, then unknown pairings) with weights that dominate lower
+ * tiers across a whole bucket of `pairCount` pairs, as in diagnose-new44.mts.
+ */
+function scalarWeights(pairCount: number) {
+  const wUnknown = 1;
+  const wMismatch = 2 * FIELD_COUNT * pairCount + 1;
+  const wNotExact = (FIELD_COUNT * pairCount + 1) * wMismatch;
+  return { wUnknown, wMismatch, wNotExact };
 }
 
 function snapshotJson(snap: CellSnapshot): Json {
@@ -134,13 +200,18 @@ const DP_MAX_K = 14;
 const DP_MAX_M = 40;
 const HUNGARIAN_MAX_N = 150;
 
-/** Content key so pairing (and tie-breaking) never depends on file row order. */
+/**
+ * Content key so pairing (and tie-breaking) never depends on file row order.
+ * Built from the business fields under the same known/unknown semantics as
+ * the comparison itself, so formula text and excluded columns cannot reorder
+ * canonically equal rows.
+ */
 function canonicalRowKey(row: InputRowSnapshot): string {
   const parts: string[] = [];
-  for (const field of COMPARE_FIELDS) {
+  for (const field of BUSINESS_COMPARE_FIELDS) {
     const snap = row.cells[field];
-    if (snap.state === "formula") parts.push(`f:${snap.formula ?? ""}`);
-    else if (snap.state === "blank") parts.push("b");
+    if (!snap.known) parts.push("u");
+    else if (snap.value === null) parts.push("b");
     else {
       const value =
         typeof snap.value === "string" ? normalizeIdentityPart(snap.value) : String(snap.value);
@@ -315,7 +386,7 @@ function solveAssignment(
 }
 
 /**
- * Pair one identity group's rows by globally minimum total field-mismatch
+ * Pair one identity group's rows by globally minimum total business-field
  * cost — an exact assignment, not greedy selection, so no pairing can be
  * stranded with an avoidably expensive partner.
  */
@@ -324,7 +395,15 @@ function pairGroup(candidatesIn: InputRowSnapshot[], goldensIn: InputRowSnapshot
   const goldens = sortCanonical(goldensIn);
   const result: PairedRows = { pairs: [], missing: [], extra: [] };
 
-  const cost = goldens.map((g) => candidates.map((c) => countMismatches(c, g)));
+  const { wUnknown, wMismatch, wNotExact } = scalarWeights(
+    Math.min(goldens.length, candidates.length),
+  );
+  const cost = goldens.map((g) =>
+    candidates.map((c) => {
+      const t = pairCost(c, g);
+      return t.notExact * wNotExact + t.mismatch * wMismatch + t.unknown * wUnknown;
+    }),
+  );
   const assigned = solveAssignment(cost, goldens.length, candidates.length);
   assigned.sort((a, b) => a.g - b.g);
 
@@ -376,7 +455,6 @@ export async function compareInputWorkbooks(
   let exactRows = 0;
   let missingRows = 0;
   let extraRows = 0;
-  let formulaMismatches = 0;
   let diffTotal = 0;
 
   const pushDiff = (finding: ComparisonDiffFinding) => {
@@ -413,22 +491,23 @@ export async function compareInputWorkbooks(
 
     for (const { candidate, golden } of pairs) {
       matchedRows += 1;
-      let mismatched = false;
-      for (const field of COMPARE_FIELDS) {
-        const category = cellDiffCategory(candidate.cells[field], golden.cells[field]);
-        if (category === null) continue;
-        mismatched = true;
+      let exact = true;
+      for (const field of BUSINESS_COMPARE_FIELDS) {
+        const verdict = cellVerdict(candidate.cells[field], golden.cells[field]);
+        // Only a known business mismatch disqualifies exactness; 'unknown'
+        // (one side uncached) emits no diff and stays business-exact.
+        if (verdict !== "mismatch") continue;
+        exact = false;
         fieldMismatches[field] = (fieldMismatches[field] ?? 0) + 1;
-        if (category === "formula") formulaMismatches += 1;
         pushDiff({
-          category,
+          category: "field",
           identity: golden.identity,
           field,
           candidate: snapshotJson(candidate.cells[field]),
           golden: snapshotJson(golden.cells[field]),
         });
       }
-      if (!mismatched) exactRows += 1;
+      if (exact) exactRows += 1;
     }
   }
 
@@ -443,7 +522,7 @@ export async function compareInputWorkbooks(
       missing_rows: missingRows,
       extra_rows: extraRows,
       field_mismatches: fieldMismatches,
-      formula_mismatches: formulaMismatches,
+      formula_mismatches: 0,
       diff_total: diffTotal,
       diffs_truncated: diffTotal > diffs.length,
     },
@@ -452,4 +531,4 @@ export async function compareInputWorkbooks(
 }
 
 /** Fields compared per paired row — exported for tests/UI legends. */
-export const COMPARED_FIELDS: readonly CompareField[] = COMPARE_FIELDS;
+export const COMPARED_FIELDS: readonly CompareField[] = BUSINESS_COMPARE_FIELDS;
