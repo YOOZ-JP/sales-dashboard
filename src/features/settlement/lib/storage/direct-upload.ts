@@ -161,8 +161,16 @@ export function buildDirectUploadPath(
   const safeFilename = sanitizeFilename(filename);
   return {
     safeFilename,
-    path: `uploads/${activeMonth.slice(0, 7)}/${uuid()}_${safeFilename}`,
+    // Storage keys must stay ASCII-only: Supabase rejects Japanese/spaces/
+    // parentheses as "Invalid key". The original name lives in safeFilename
+    // (persisted on the DB row), never in the object key.
+    path: `uploads/${activeMonth.slice(0, 7)}/${uuid()}${asciiExtension(safeFilename)}`,
   };
+}
+
+function asciiExtension(name: string): string {
+  const match = /\.([A-Za-z0-9]{1,10})$/.exec(name);
+  return match ? `.${match[1]}` : "";
 }
 
 export function isValidUploadId(uploadId: unknown): uploadId is string {

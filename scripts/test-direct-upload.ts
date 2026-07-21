@@ -105,7 +105,36 @@ async function run() {
   // Paths are immutable, month-scoped, and filename-safe.
   {
     const path = buildDirectUploadPath("bad/name.xlsx", "2026-05-01", () => uploadId);
-    assert.equal(path.path, `uploads/2026-05/${uploadId}_bad_name.xlsx`);
+    assert.equal(path.path, `uploads/2026-05/${uploadId}.xlsx`);
+    assert.equal(path.safeFilename, "bad_name.xlsx");
+  }
+
+  // Regression: Japanese/space/paren filenames must never leak into the
+  // storage key (Supabase rejects them as "Invalid key"). The key is
+  // uploads/YYYY-MM/<uuid><ascii ext>; the original name stays in safeFilename.
+  {
+    const original = "416829-202606-LI-54575Apple Books(Multi)-報戻-202604.xls";
+    const prepared = buildDirectUploadPath(original, "2026-06-01", () => uploadId);
+    assert.equal(prepared.path, `uploads/2026-06/${uploadId}.xls`);
+    assert.match(
+      prepared.path,
+      /^uploads\/\d{4}-\d{2}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.[A-Za-z0-9]{1,10})?$/,
+      "storage key must be uuid-only with optional ascii extension",
+    );
+    assert.match(prepared.path, /^[A-Za-z0-9/._-]+$/, "storage key must be ASCII storage-safe");
+    assert.doesNotMatch(prepared.path, /[\s()（）-￿]/, "no spaces/parens/non-ASCII in key");
+    assert.equal(prepared.safeFilename, original, "original filename must survive for the DB row");
+  }
+
+  // Extension survives only when ASCII alphanumeric and bounded; otherwise omitted.
+  {
+    const noExt = buildDirectUploadPath("報告書", "2026-06-01", () => uploadId);
+    assert.equal(noExt.path, `uploads/2026-06/${uploadId}`);
+    assert.equal(noExt.safeFilename, "報告書");
+    const spacedExt = buildDirectUploadPath("data.xls x", "2026-06-01", () => uploadId);
+    assert.equal(spacedExt.path, `uploads/2026-06/${uploadId}`);
+    const longExt = buildDirectUploadPath(`report.${"a".repeat(11)}`, "2026-06-01", () => uploadId);
+    assert.equal(longExt.path, `uploads/2026-06/${uploadId}`);
   }
 
   // Stored bytes are downloaded and status is moved to parsing before caller parses.
