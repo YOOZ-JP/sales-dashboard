@@ -12,6 +12,12 @@
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createServiceClient } from "@/features/settlement/lib/supabase/server";
+import {
+  buildComparisonArtifactPath,
+  type ComparisonArtifactKind,
+} from "./comparison-artifact-path";
+
+export type { ComparisonArtifactKind } from "./comparison-artifact-path";
 
 const BUCKET = "upload-debug";
 
@@ -57,23 +63,16 @@ export async function writeToArchive(
 }
 
 /**
- * Comparison artifacts live in the same private bucket under dedicated
- * prefixes, separate from the raw-upload archive:
- *   comparisons/answer-keys/YYYY-MM/<ts>_<name>  — human answer-key workbooks
- *   comparisons/candidates/YYYY-MM/<ts>_<name>   — generated candidate workbooks
- */
-const ARTIFACT_PREFIX: Record<ComparisonArtifactKind, string> = {
-  "answer-key": "comparisons/answer-keys",
-  candidate: "comparisons/candidates",
-};
-
-export type ComparisonArtifactKind = "answer-key" | "candidate";
-
-/**
  * Write an immutable comparison artifact into the private archive bucket.
+ * Artifacts live under dedicated prefixes, separate from the raw-upload
+ * archive:
+ *   comparisons/answer-keys/YYYY-MM/<uuid><ext>  — human answer-key workbooks
+ *   comparisons/candidates/YYYY-MM/<uuid><ext>   — generated candidate workbooks
+ * Keys are UUID-based ASCII (see buildComparisonArtifactPath); the original
+ * filename is stored on the comparison run row, not in the key.
  *
  * Same durability contract as `writeToArchive`: private bucket only,
- * `upsert: false` so an existing object is never overwritten, timestamped
+ * `upsert: false` so an existing object is never overwritten, unique
  * path so retries create a new object instead of clobbering evidence.
  *
  * @param kind  Which dedicated prefix the artifact belongs under.
@@ -87,8 +86,7 @@ export async function writeComparisonArtifact(
   client?: SupabaseClient,
 ): Promise<ArchiveWriteResult> {
   const supabase = client ?? createServiceClient();
-  const folder = month ? month.slice(0, 7) : "undated";
-  const path = `${ARTIFACT_PREFIX[kind]}/${folder}/${Date.now()}_${safeName(filename)}`;
+  const path = buildComparisonArtifactPath(kind, filename, month);
   const { error } = await supabase.storage.from(BUCKET).upload(path, buffer, {
     contentType: "application/octet-stream",
     upsert: false,

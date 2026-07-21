@@ -168,7 +168,7 @@ export function buildDirectUploadPath(
   };
 }
 
-function asciiExtension(name: string): string {
+export function asciiExtension(name: string): string {
   const match = /\.([A-Za-z0-9]{1,10})$/.exec(name);
   return match ? `.${match[1]}` : "";
 }
