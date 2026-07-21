@@ -11,7 +11,7 @@
  *      `vercel build` (a darwin build otherwise ships only the darwin
  *      binding, which is exactly the production failure this covers).
  * Also pins the upload route's maxDuration so the OCR path keeps the
- * Pro-plan 800s budget instead of the 300s default.
+ * Pro-plan 1800s extended max duration (beta) instead of the 300s default.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -75,17 +75,19 @@ async function main() {
     );
   }
 
-  // 3. The upload route keeps the Pro-plan 800s timeout. Next.js statically
-  // extracts the literal into the function config, so assert the source
-  // export directly (importing the route would need runtime env).
+  // 3. The upload route keeps the Pro-plan 1800s extended max duration
+  // (beta) — production OCR was terminated exactly at the previous 800s
+  // limit. Next.js statically extracts the literal into the function
+  // config, so assert the source export directly (importing the route
+  // would need runtime env).
   const routeSource = fs.readFileSync(
     path.join(root, "app/api/settlement/upload/route.ts"),
     "utf8",
   );
   assert.match(
     routeSource,
-    /^export const maxDuration = 800;$/m,
-    "settlement upload route must export maxDuration = 800 (OCR exceeds the 300s default)",
+    /^export const maxDuration = 1800;$/m,
+    "settlement upload route must export maxDuration = 1800 (OCR exceeds the 300s default; Pro extended duration)",
   );
 
   // 4. Prebuilt deploys vendor the Linux binding before building.

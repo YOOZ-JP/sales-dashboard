@@ -43,9 +43,9 @@ import {
 } from "@/features/settlement/lib/storage/heartbeat-stream";
 
 export const runtime = "nodejs";
-// Pro plan allows up to 800s; deterministic image-PDF OCR (Shueisha) can
-// exceed the 300s default and was hitting the timeout in production.
-export const maxDuration = 800;
+// Pro plan extended max duration (beta) allows up to 1800s; deterministic
+// image-PDF OCR (Shueisha) was still hitting the 800s limit in production.
+export const maxDuration = 1800;
 
 type ParseFile = typeof import("@/features/settlement/lib/parsers").parseFile;
 type ParsedFile = Awaited<ReturnType<ParseFile>>;
