@@ -128,6 +128,39 @@ export function suppressExistingDuplicates<T extends Record<string, unknown>>(
   return { kept, skipped };
 }
 
+/**
+ * Insert-time duplicate policy, keyed by platform and upload path.
+ *
+ * Piccoma with `exactSourceGateApplied` keeps every transformed insert: the
+ * two legitimate companion files (出版社report / 取次report) intentionally
+ * produce statement-key twins across sequential uploads, the exact-source SHA
+ * gate has already rejected byte-identical reuploads on this path, and the
+ * INPUT v2 loader reconciles companions and same-role duplicates
+ * deterministically (dedupePiccomaStatementDuplicates). Any cross-upload
+ * suppression here would discard the second companion statement before that
+ * merge can run.
+ *
+ * Piccoma WITHOUT the gate (legacy multipart uploads, which archive but never
+ * compare SHAs) must not blanket-preserve — an identical reupload would stack
+ * duplicate sales_records — so it keeps the statement-key multiset
+ * suppression (suppressExistingPiccomaStatementDuplicates).
+ *
+ * Every other platform keeps the strict multiset suppression against rows
+ * already in the settlement batch, on both paths.
+ */
+export function suppressDuplicatesAtInsert<T extends Record<string, unknown>>(
+  platformCode: unknown,
+  inserts: T[],
+  existing: Array<Record<string, unknown>>,
+  options?: { exactSourceGateApplied?: boolean },
+): { kept: T[]; skipped: number } {
+  if (text(platformCode) === "piccoma") {
+    if (options?.exactSourceGateApplied) return { kept: inserts, skipped: 0 };
+    return suppressExistingPiccomaStatementDuplicates(inserts, existing);
+  }
+  return suppressExistingDuplicates(inserts, existing);
+}
+
 function piccomaStatementKey(r: Record<string, unknown>): string | null {
   const title = text(r.channel_title_jp) || text(r.title_jp);
   const type = text(r.type);

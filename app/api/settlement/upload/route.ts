@@ -35,8 +35,7 @@ import type {
 } from "@/features/settlement/lib/aggregation/to-sales-records";
 import {
   STRICT_KEY_COLUMNS,
-  suppressExistingPiccomaStatementDuplicates,
-  suppressExistingDuplicates,
+  suppressDuplicatesAtInsert,
 } from "@/features/settlement/lib/aggregation/strict-record-key";
 
 export const runtime = "nodejs";
@@ -59,6 +58,8 @@ type ProcessParsedArgs = {
   lookups: LookupMaps;
   toSalesRecords: ToSalesRecords;
   runLabel: string;
+  /** True only when the exact-source SHA duplicate gate already ran for this upload. */
+  exactSourceGateApplied: boolean;
 };
 
 export async function POST(request: Request) {
@@ -184,6 +185,9 @@ async function handleMultipartUpload(request: Request) {
       lookups: lookups.value,
       toSalesRecords,
       runLabel,
+      // Legacy multipart archives files but never compares SHAs, so identical
+      // reuploads reach the insert stage and must be suppressed there.
+      exactSourceGateApplied: false,
     }));
   }
 
@@ -252,6 +256,7 @@ async function handlePreparedUpload(request: Request) {
   // processed month is preserved as an audit row and skipped with zero writes.
   // A gate lookup failure only degrades to parsing normally — it never blocks.
   let duplicate: ExactSourceDuplicateDecision = { skip: false };
+  let exactSourceGateApplied = false;
   if (prepared.row.settlement_month) {
     try {
       const { data, error } = await supabaseServer
@@ -265,6 +270,7 @@ async function handlePreparedUpload(request: Request) {
         .returns<ExactSourceCandidate[]>();
       if (error) throw new Error(error.message);
       duplicate = evaluateExactSourceDuplicate(prepared.row, prepared.sha256, data ?? []);
+      exactSourceGateApplied = true;
     } catch (e) {
       console.warn(
         `[upload] ${prepared.row.filename}: exact-source duplicate check failed (${(e as Error).message}); continuing with parse`,
@@ -340,6 +346,9 @@ async function handlePreparedUpload(request: Request) {
     lookups: lookups.value,
     toSalesRecords: aggregation.toSalesRecords,
     runLabel: "",
+    // Preserve Piccoma companions only when the exact-source lookup really
+    // completed. A lookup failure falls back to conservative suppression.
+    exactSourceGateApplied,
   });
   return NextResponse.json({ results: [result] });
 }
@@ -375,6 +384,7 @@ async function processParsedUpload(args: ProcessParsedArgs): Promise<UploadResul
     lookups,
     toSalesRecords,
     runLabel,
+    exactSourceGateApplied,
   } = args;
 
   const resolution = resolveSettlementMonth({
@@ -522,9 +532,9 @@ async function processParsedUpload(args: ProcessParsedArgs): Promise<UploadResul
         if (data.length < PAGE) break;
       }
       if (existing.length > 0) {
-        const suppressed = parsed.platform_code === "piccoma"
-          ? suppressExistingPiccomaStatementDuplicates(inserts, existing)
-          : suppressExistingDuplicates(inserts, existing);
+        const suppressed = suppressDuplicatesAtInsert(parsed.platform_code, inserts, existing, {
+          exactSourceGateApplied,
+        });
         inserts = suppressed.kept;
         skippedDuplicates += suppressed.skipped;
         if (suppressed.skipped > 0) {

@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   dedupePiccomaStatementDuplicates,
   piccomaSourceRoleFromFilename,
+  suppressDuplicatesAtInsert,
   type PiccomaSourceRole,
 } from "../src/features/settlement/lib/aggregation/strict-record-key";
 
@@ -239,6 +240,57 @@ function fingerprint(rows: Row[]): string {
   );
   assert.equal(records.length, 2, "non-Piccoma duplicates are out of scope here");
   assert.equal(removed, 0);
+}
+
+// --- insert policy (direct path): piccoma preserves companion rows across sequential uploads ---
+{
+  // First direct upload (出版社report) already landed in the batch; the second
+  // (取次report) produces statement-key twins with different monetary fields.
+  // The exact-source SHA gate ran, so blanket preservation is safe.
+  const existing = [publisherRow(), publisherRow({ channel_title_jp: "作品B", title_jp: "作品B" })];
+  const incoming = [brokerRow(), brokerRow({ channel_title_jp: "作品B", title_jp: "作品B" })];
+  const { kept, skipped } = suppressDuplicatesAtInsert("piccoma", incoming, existing, {
+    exactSourceGateApplied: true,
+  });
+  assert.equal(kept.length, 2, "second companion statement is inserted in full");
+  assert.equal(skipped, 0, "no cross-upload statement suppression for piccoma");
+  assert.equal(fingerprint(kept), fingerprint(incoming), "inserts pass through untouched");
+}
+
+// --- insert policy (direct path): piccoma keeps even strict-key-identical rows (loader owns dedupe) ---
+{
+  const { kept, skipped } = suppressDuplicatesAtInsert("piccoma", [publisherRow()], [publisherRow()], {
+    exactSourceGateApplied: true,
+  });
+  assert.equal(kept.length, 1, "exact twin still inserted; loader dedupes deterministically");
+  assert.equal(skipped, 0);
+}
+
+// --- insert policy (legacy/default path): identical piccoma reupload is suppressed ---
+{
+  // Legacy multipart has no exact-source SHA gate, so an identical reupload
+  // reaches the insert stage and must fall back to statement-key suppression.
+  const existing = [publisherRow(), publisherRow({ channel_title_jp: "作品B", title_jp: "作品B" })];
+  const incoming = [publisherRow(), publisherRow({ channel_title_jp: "作品B", title_jp: "作品B" })];
+  const { kept, skipped } = suppressDuplicatesAtInsert("piccoma", incoming, existing);
+  assert.equal(skipped, 2, "identical reupload rows are suppressed without the SHA gate");
+  assert.equal(kept.length, 0, "no duplicate sales_records stack up on the legacy path");
+}
+
+// --- insert policy: non-piccoma strict suppression is unchanged ---
+{
+  const foreign = (overrides: Row = {}): Row => ({
+    ...publisherRow(),
+    clients: "Other Client",
+    channel: "other-channel",
+    ...overrides,
+  });
+  const existing = [foreign()];
+  const incoming = [foreign(), foreign({ total_amount_jpy: 9900 })];
+  const { kept, skipped } = suppressDuplicatesAtInsert("other-platform", incoming, existing);
+  assert.equal(skipped, 1, "strict duplicate of an existing row is suppressed");
+  assert.equal(kept.length, 1, "non-duplicate row is still inserted");
+  assert.equal(kept[0].total_amount_jpy, 9900, "the distinct row is the one kept");
 }
 
 console.log("piccoma-companion-reconcile: all checks passed");
