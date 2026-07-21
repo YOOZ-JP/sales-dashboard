@@ -10,6 +10,8 @@
  *   3. the prebuilt deploy script vendors the Linux binding before
  *      `vercel build` (a darwin build otherwise ships only the darwin
  *      binding, which is exactly the production failure this covers).
+ * Also pins the upload route's maxDuration so the OCR path keeps the
+ * Pro-plan 800s budget instead of the 300s default.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -73,7 +75,20 @@ async function main() {
     );
   }
 
-  // 3. Prebuilt deploys vendor the Linux binding before building.
+  // 3. The upload route keeps the Pro-plan 800s timeout. Next.js statically
+  // extracts the literal into the function config, so assert the source
+  // export directly (importing the route would need runtime env).
+  const routeSource = fs.readFileSync(
+    path.join(root, "app/api/settlement/upload/route.ts"),
+    "utf8",
+  );
+  assert.match(
+    routeSource,
+    /^export const maxDuration = 800;$/m,
+    "settlement upload route must export maxDuration = 800 (OCR exceeds the 300s default)",
+  );
+
+  // 4. Prebuilt deploys vendor the Linux binding before building.
   const scripts = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).scripts;
   const deploy: string = scripts.deploy ?? "";
   assert.ok(

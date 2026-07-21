@@ -39,7 +39,9 @@ import {
 } from "@/features/settlement/lib/aggregation/strict-record-key";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+// Pro plan allows up to 800s; deterministic image-PDF OCR (Shueisha) can
+// exceed the 300s default and was hitting the timeout in production.
+export const maxDuration = 800;
 
 type ParseFile = typeof import("@/features/settlement/lib/parsers").parseFile;
 type ParsedFile = Awaited<ReturnType<ParseFile>>;
