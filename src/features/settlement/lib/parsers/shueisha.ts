@@ -13,7 +13,10 @@
  *
  * Pages are rasterized + binarized, the ruled grids are detected from
  * pixel runs, and each cell is OCR'd locally (tesseract.js, packaged
- * jpn+eng data). Amount cells use a digits-only whitelist.
+ * jpn+eng data). Amount cells use a digits-only whitelist and OCR only
+ * a primary crop variant; alternate rect/threshold variants are read
+ * lazily — one bounded round at a time — only while the printed totals
+ * cannot be reconciled (serverless deadline protection).
  *
  * Validation is strict and the parser fails loudly (zero records) when
  *   · page-2 detail sum ≠ page-2 合計 支払額
@@ -173,6 +176,20 @@ export interface ShueishaDetailRow {
   payment_taxincl: number;
 }
 
+/** Privacy-safe OCR counters: recognize-call counts only, never values. */
+export interface ShueishaOcrStats {
+  /** amount cells OCR'd (each costs one primary recognize) */
+  amount_cells: number;
+  /** total amount recognize calls (primary + fallback) */
+  amount_calls: number;
+  /** amount recognize calls beyond the primary reading */
+  fallback_calls: number;
+}
+
+export function createShueishaOcrStats(): ShueishaOcrStats {
+  return { amount_cells: 0, amount_calls: 0, fallback_calls: 0 };
+}
+
 export interface ShueishaExtract {
   /** page-1 支払日 (exact printed date, ISO) */
   payment_date: string | null;
@@ -192,6 +209,8 @@ export interface ShueishaExtract {
   detail_total: number | null;
   /** hard OCR/structure failures collected while extracting */
   ocr_errors: string[];
+  /** privacy-safe recognize-call counters (absent in synthetic extracts) */
+  ocr_stats?: ShueishaOcrStats;
 }
 
 export interface ShueishaAggregatedRow {
@@ -518,10 +537,157 @@ function uniqueAmounts(amounts: Array<number | null | undefined>): number[] {
   return out;
 }
 
-interface Page1Reconciliation {
-  mangaCandidates: number[][];
-  summaryCandidates: number[];
-  grandCandidates: number[];
+// ---------------------------------------------------------------------------
+// Lazy amount cells (exported for privacy-safe synthetic tests)
+//
+// The old reader OCR'd 4 rect variants × 3 thresholds = 12 recognitions
+// per amount cell unconditionally, which blew the serverless deadline on
+// limited vCPU. Amount cells now OCR only the primary variant (exact
+// grid rect, threshold 150); the other 11 variants are read lazily, one
+// round at a time, and only while the printed totals cannot be
+// reconciled — bounded by a per-page recognize budget so the worst case
+// stays under the deadline and validation fails closed instead.
+// ---------------------------------------------------------------------------
+
+/** Fallback recognize-call budget; shared by all expansion on one page. */
+export interface RecognizeBudget {
+  remaining: number;
+}
+
+/**
+ * Per-page cap on fallback (beyond-primary) amount recognitions. The old
+ * exhaustive reader spent 11 extra recognitions on every amount cell
+ * (~120+ per page), which is what timed out on Vercel's limited vCPU;
+ * 48 keeps the worst-case page well under the 300s deadline while still
+ * letting several ambiguous cells expand through every variant. If the
+ * totals still cannot be reconciled within the budget, strict validation
+ * fails closed (zero records) — never a guess.
+ */
+const FALLBACK_RECOGNIZE_BUDGET_PER_PAGE = 48;
+
+export type AmountVariantReader = (rect: Rect, threshold: number) => Promise<number | null>;
+
+/**
+ * An amount cell whose primary variant has been OCR'd. expandNext reads
+ * one more variant in the same deterministic order the old exhaustive
+ * reader used, so a fully expanded cell reproduces the old candidate
+ * list exactly.
+ */
+export interface LazyAmountCell {
+  /** distinct readings so far, in read order (primary first when valid) */
+  readonly candidates: number[];
+  /** true once every rect×threshold variant has been OCR'd */
+  readonly exhausted: boolean;
+  /** OCR one more variant; false when out of variants or budget. */
+  expandNext(budget: RecognizeBudget): Promise<boolean>;
+}
+
+const AMOUNT_THRESHOLDS = [150, 170, 130];
+
+function amountRectVariants(rect: Rect): Rect[] {
+  return [
+    rect,
+    { x: rect.x - 8, y: rect.y - 3, w: rect.w + 16, h: rect.h + 6 },
+    { x: rect.x - 14, y: rect.y - 5, w: rect.w + 28, h: rect.h + 10 },
+    { x: rect.x + 4, y: rect.y, w: rect.w - 8, h: rect.h },
+  ];
+}
+
+export async function readLazyAmountCell(
+  read: AmountVariantReader,
+  rect: Rect,
+  stats: ShueishaOcrStats,
+): Promise<LazyAmountCell> {
+  const variants: Array<{ rect: Rect; threshold: number }> = [];
+  for (const candidate of amountRectVariants(rect)) {
+    for (const threshold of AMOUNT_THRESHOLDS) variants.push({ rect: candidate, threshold });
+  }
+  const seen = new Set<number>();
+  const candidates: number[] = [];
+  let next = 0;
+  const readNext = async (): Promise<void> => {
+    const variant = variants[next++];
+    stats.amount_calls += 1;
+    const amount = await read(variant.rect, variant.threshold);
+    if (amount !== null && !seen.has(amount)) {
+      seen.add(amount);
+      candidates.push(amount);
+    }
+  };
+  stats.amount_cells += 1;
+  await readNext(); // primary: exact grid rect, threshold 150
+  return {
+    candidates,
+    get exhausted() {
+      return next >= variants.length;
+    },
+    async expandNext(budget: RecognizeBudget): Promise<boolean> {
+      if (next >= variants.length || budget.remaining <= 0) return false;
+      budget.remaining -= 1;
+      stats.fallback_calls += 1;
+      await readNext();
+      return true;
+    },
+  };
+}
+
+/**
+ * One fallback round: one extra variant per cell, round-robin, so a
+ * tight budget still gives every ambiguous cell some alternates instead
+ * of spending everything on the first cell. Returns false once every
+ * cell is exhausted (or the budget is).
+ */
+export async function expandAmountCellsRound(
+  cells: LazyAmountCell[],
+  budget: RecognizeBudget,
+): Promise<boolean> {
+  let progressed = false;
+  for (const cell of cells) {
+    if (await cell.expandNext(budget)) progressed = true;
+  }
+  return progressed;
+}
+
+/**
+ * Page-2 detail amounts. Fast path: keep the primary readings when every
+ * row is readable and they already sum to the printed 合計 (the old
+ * exhaustive search would have picked exactly those readings). Otherwise
+ * expand the cells one round at a time, re-running the candidate search
+ * after each round, until the printed total is satisfied or the budget /
+ * variants run out — unresolved rows keep the -1 sentinel so strict
+ * validation fails closed.
+ */
+export async function resolveShueishaDetailAmounts(
+  rows: ShueishaDetailRow[],
+  cells: LazyAmountCell[],
+  detailTotal: number | null,
+  budget: RecognizeBudget,
+): Promise<void> {
+  if (detailTotal === null || rows.length !== cells.length) return;
+  const sum = rows.reduce((s, r) => s + r.payment_taxincl, 0);
+  if (rows.every((r) => r.payment_taxincl > 0) && sum === detailTotal) return;
+  const candidateLists = () => cells.map((cell) => cell.candidates);
+  let chosen = chooseAmountsBySum(candidateLists(), detailTotal);
+  while (!chosen) {
+    if (!(await expandAmountCellsRound(cells, budget))) break;
+    chosen = chooseAmountsBySum(candidateLists(), detailTotal);
+  }
+  if (!chosen) return;
+  for (let i = 0; i < chosen.length; i++) {
+    rows[i].payment_taxincl = chosen[i];
+  }
+}
+
+/** Page-1 amount cell plus free alternates parsed from row-level text. */
+export interface Page1AmountCell {
+  cell: LazyAmountCell;
+  textAmounts: number[];
+}
+
+export interface Page1Reconciliation {
+  mangaCells: Page1AmountCell[];
+  summaryCell: Page1AmountCell | null;
+  grandCell: Page1AmountCell | null;
 }
 
 async function readHeaderRow(
@@ -536,47 +702,29 @@ async function readHeaderRow(
   return headers;
 }
 
-async function readAmountCell(
-  worker: OcrWorker,
-  page: SourcePage,
-  rect: Rect,
-): Promise<number | null> {
-  return (await readAmountCandidates(worker, page, rect))[0] ?? null;
-}
-
-async function readAmountCandidates(
-  worker: OcrWorker,
-  page: SourcePage,
-  rect: Rect,
-): Promise<number[]> {
-  const seen = new Set<number>();
-  const amounts: number[] = [];
-  const variants: Rect[] = [
-    rect,
-    { x: rect.x - 8, y: rect.y - 3, w: rect.w + 16, h: rect.h + 6 },
-    { x: rect.x - 14, y: rect.y - 5, w: rect.w + 28, h: rect.h + 10 },
-    { x: rect.x + 4, y: rect.y, w: rect.w - 8, h: rect.h },
-  ];
-  for (const candidate of variants) {
-    for (const threshold of [150, 170, 130]) {
-      const amount = await ocrCellAmount(worker, page.img, candidate, { threshold, scaleUp: 4 });
-      if (amount !== null && !seen.has(amount)) {
-        seen.add(amount);
-        amounts.push(amount);
-      }
-    }
-  }
-  return amounts;
+/** Real AmountVariantReader over a rendered page's amount worker. */
+function pageAmountReader(worker: OcrWorker, page: SourcePage): AmountVariantReader {
+  return (rect, threshold) => ocrCellAmount(worker, page.img, rect, { threshold, scaleUp: 4 });
 }
 
 function chooseAmountsBySum(candidates: number[][], target: number): number[] | null {
+  // Printed amounts are positive integers, so only safe positive readings
+  // may enter the sum search; a row with no positive candidate cannot be
+  // solved yet, so return null and let bounded fallback keep expanding.
+  // Never admit a sentinel like -1 — it could cancel a misread positive
+  // (-1 + 501 === 500), stop fallback early, and strand unresolved rows.
+  // Positive-only candidates also keep the sum > target prune sound.
+  const lists = candidates.map((list) =>
+    list.filter((amount) => Number.isSafeInteger(amount) && amount > 0),
+  );
+  if (lists.some((list) => list.length === 0)) return null;
   const memo = new Set<string>();
   const dfs = (index: number, sum: number, picked: number[]): number[] | null => {
     if (sum > target) return null;
-    if (index === candidates.length) return sum === target ? picked : null;
+    if (index === lists.length) return sum === target ? picked : null;
     const key = `${index}:${sum}`;
     if (memo.has(key)) return null;
-    for (const amount of candidates[index]) {
+    for (const amount of lists[index]) {
       const found = dfs(index + 1, sum + amount, [...picked, amount]);
       if (found) return found;
     }
@@ -605,7 +753,9 @@ async function extractPage1(
   out: ShueishaExtract,
   reconciliation: Page1Reconciliation,
   errors: string[],
+  stats: ShueishaOcrStats,
 ): Promise<void> {
+  const readAmount = pageAmountReader(amountWorker, page);
   const grid = detectTableGrid(page.bin);
   if (!grid || grid.ys.length < 3) {
     errors.push("shueisha: page-1 table grid not detected");
@@ -654,12 +804,15 @@ async function extractPage1(
 
     if (/消費税|率別/.test(compact) && !/マンガM|Mee|ジャンプT/i.test(compact)) {
       const rowText = await ocrCellText(textWorker, page.img, gridRowRect(grid, row));
-      reconciliation.grandCandidates = uniqueAmounts([
-        ...(await readAmountCandidates(amountWorker, page, payRect)),
-        ...parseTaxIncludedAmountCandidatesFromRowText(rowText),
-        ...parseTaxIncludedAmountCandidatesFromRowText(rowLineText),
-      ]);
-      out.grand_total = reconciliation.grandCandidates[0] ?? null;
+      const cell = await readLazyAmountCell(readAmount, payRect, stats);
+      reconciliation.grandCell = {
+        cell,
+        textAmounts: uniqueAmounts([
+          ...parseTaxIncludedAmountCandidatesFromRowText(rowText),
+          ...parseTaxIncludedAmountCandidatesFromRowText(rowLineText),
+        ]),
+      };
+      out.grand_total = cell.candidates[0] ?? reconciliation.grandCell.textAmounts[0] ?? null;
       continue;
     }
     const isManga = /マンガM|Mee/i.test(compact);
@@ -667,12 +820,10 @@ async function extractPage1(
     if (!isManga && !isJumptoon) continue;
 
     const rowText = await ocrCellText(textWorker, page.img, gridRowRect(grid, row));
-    const amountCandidates = uniqueAmounts([
-      ...(await readAmountCandidates(amountWorker, page, payRect)),
+    const textAmounts = uniqueAmounts([
       ...parseTaxIncludedAmountCandidatesFromRowText(rowText),
       ...parseTaxIncludedAmountCandidatesFromRowText(rowLineText),
     ]);
-    const amount = amountCandidates[0] ?? null;
     if (isManga) {
       const geometryTitleText = ocrLinesForCell(pageLines, rowRect, contentRect);
       const title = pickShueishaTitleLine(geometryTitleText) ?? pickShueishaTitleLine(content);
@@ -683,19 +834,21 @@ async function extractPage1(
         errors.push("shueisha: page-1 Manga Mee row without a readable title");
         continue;
       }
+      const cell = await readLazyAmountCell(readAmount, payRect, stats);
       out.manga_rows.push({
         title,
-        payment_taxincl: amount ?? -1,
+        payment_taxincl: cell.candidates[0] ?? textAmounts[0] ?? -1,
         sales_month: parseShueishaAdSalesMonth(remark) ?? parseShueishaAdSalesMonth(rowText),
       });
-      reconciliation.mangaCandidates.push(amountCandidates.length > 0 ? amountCandidates : [-1]);
+      reconciliation.mangaCells.push({ cell, textAmounts });
     } else {
       if (out.jumptoon_summary_total !== null) {
         errors.push("shueisha: multiple Jumptoon summary rows on page 1");
         continue;
       }
-      out.jumptoon_summary_total = amount;
-      reconciliation.summaryCandidates = amountCandidates;
+      const cell = await readLazyAmountCell(readAmount, payRect, stats);
+      out.jumptoon_summary_total = cell.candidates[0] ?? textAmounts[0] ?? null;
+      reconciliation.summaryCell = { cell, textAmounts };
     }
   }
 }
@@ -706,7 +859,10 @@ async function extractPage2(
   page: SourcePage,
   out: ShueishaExtract,
   errors: string[],
+  stats: ShueishaOcrStats,
+  budget: RecognizeBudget,
 ): Promise<void> {
+  const readAmount = pageAmountReader(amountWorker, page);
   const grid = detectTableGrid(page.bin);
   if (!grid || grid.ys.length < 3) {
     errors.push("shueisha: page-2 table grid not detected");
@@ -743,8 +899,9 @@ async function extractPage2(
     }
   }
   const finalTotalRow = nonEmptyPayRows.at(-1) ?? -1;
-  const detailAmountCandidates: number[][] = [];
+  const detailCells: LazyAmountCell[] = [];
   const detailStartIndex = out.detail_rows.length;
+  let totalCell: LazyAmountCell | null = null;
   const pageLines = await ocrPngToLines(textWorker, page.png);
 
   for (let row = 1; row < grid.ys.length - 1; row++) {
@@ -759,7 +916,8 @@ async function extractPage2(
     const geometryTitleText = ocrLinesForCell(pageLines, rowRect, titleRect);
     const compact = compactText(geometryTitleText || titleText);
     if (row === finalTotalRow || /合計/.test(compact)) {
-      out.detail_total = await readAmountCell(amountWorker, page, payRect);
+      totalCell = await readLazyAmountCell(readAmount, payRect, stats);
+      out.detail_total = totalCell.candidates[0] ?? null;
       continue;
     }
     if (!hasPay) continue;
@@ -768,50 +926,105 @@ async function extractPage2(
     const work = geometryWork && cellWork
       ? { title: geometryWork.title, kind: cellWork.kind }
       : geometryWork ?? cellWork;
-    const amountCandidates = await readAmountCandidates(amountWorker, page, payRect);
-    const amount = amountCandidates[0] ?? null;
     if (!work) {
       errors.push("shueisha: page-2 detail row without a readable title");
       continue;
     }
+    const cell = await readLazyAmountCell(readAmount, payRect, stats);
     out.detail_rows.push({
       title: work.title,
       kind: work.kind,
-      payment_taxincl: amount ?? -1,
+      payment_taxincl: cell.candidates[0] ?? -1,
     });
-    detailAmountCandidates.push(amountCandidates.length > 0 ? amountCandidates : [-1]);
+    detailCells.push(cell);
   }
 
-  const target =
-    out.detail_total !== null ? out.detail_total : null;
-  if (target !== null) {
-    const chosen = chooseAmountsBySum(detailAmountCandidates, target);
-    if (chosen) {
-      for (let i = 0; i < chosen.length; i++) {
-        out.detail_rows[detailStartIndex + i].payment_taxincl = chosen[i];
-      }
+  // The printed 合計 anchors all reconciliation: if its primary reading
+  // failed, take the first variant (in legacy order) that parses at all.
+  if (totalCell && out.detail_total === null) {
+    while (totalCell.candidates.length === 0 && (await totalCell.expandNext(budget))) {
+      // keep expanding
     }
+    out.detail_total = totalCell.candidates[0] ?? null;
   }
+
+  await resolveShueishaDetailAmounts(
+    out.detail_rows.slice(detailStartIndex),
+    detailCells,
+    out.detail_total,
+    budget,
+  );
 }
 
-function reconcilePage1Amounts(out: ShueishaExtract, reconciliation: Page1Reconciliation): void {
-  if (out.detail_total !== null && reconciliation.summaryCandidates.includes(out.detail_total)) {
-    out.jumptoon_summary_total = out.detail_total;
+function mergedPage1Candidates(cell: Page1AmountCell): number[] {
+  return uniqueAmounts([...cell.cell.candidates, ...cell.textAmounts]);
+}
+
+/**
+ * Cross-page reconciliation of the page-1 amounts against the page-2
+ * printed 合計. Fast path first: when the primary readings already agree
+ * (summary === 合計, manga sum + 合計 === cover grand total) no fallback
+ * OCR runs at all. Otherwise cells expand one round at a time within the
+ * page-1 budget; an unreconciled outcome is left for strict validation
+ * to fail closed. Exported for privacy-safe synthetic tests.
+ */
+export async function reconcilePage1Amounts(
+  out: ShueishaExtract,
+  reconciliation: Page1Reconciliation,
+  budget: RecognizeBudget,
+): Promise<void> {
+  // Align the page-1 Jumptoon summary with the page-2 printed 合計 —
+  // expand the summary cell only while its readings disagree.
+  const summaryCell = reconciliation.summaryCell;
+  if (out.detail_total !== null && summaryCell) {
+    while (
+      !mergedPage1Candidates(summaryCell).includes(out.detail_total) &&
+      (await summaryCell.cell.expandNext(budget))
+    ) {
+      // keep expanding
+    }
+    if (mergedPage1Candidates(summaryCell).includes(out.detail_total)) {
+      out.jumptoon_summary_total = out.detail_total;
+    }
   }
 
   const targetDetail = out.detail_total ?? out.jumptoon_summary_total;
-  if (targetDetail === null || out.manga_rows.length !== reconciliation.mangaCandidates.length) return;
+  if (targetDetail === null || out.manga_rows.length !== reconciliation.mangaCells.length) return;
 
-  for (const grand of reconciliation.grandCandidates) {
-    const mangaTarget = grand - targetDetail;
-    if (mangaTarget <= 0) continue;
-    const mangaAmounts = chooseAmountsBySum(reconciliation.mangaCandidates, mangaTarget);
-    if (!mangaAmounts) continue;
-    out.grand_total = grand;
-    for (let i = 0; i < mangaAmounts.length; i++) {
-      out.manga_rows[i].payment_taxincl = mangaAmounts[i];
-    }
+  // Fast path: primary readings already add up to the cover grand total.
+  const primarySum = out.manga_rows.reduce((s, r) => s + r.payment_taxincl, 0);
+  if (
+    out.grand_total !== null &&
+    out.manga_rows.every((r) => r.payment_taxincl > 0) &&
+    primarySum + targetDetail === out.grand_total
+  ) {
     return;
+  }
+
+  const searchCells = [
+    ...(reconciliation.grandCell ? [reconciliation.grandCell.cell] : []),
+    ...reconciliation.mangaCells.map((c) => c.cell),
+  ];
+  const trySolve = (): boolean => {
+    const grandCandidates = reconciliation.grandCell
+      ? mergedPage1Candidates(reconciliation.grandCell)
+      : [];
+    const mangaCandidates = reconciliation.mangaCells.map((c) => mergedPage1Candidates(c));
+    for (const grand of grandCandidates) {
+      const mangaTarget = grand - targetDetail;
+      if (mangaTarget <= 0) continue;
+      const mangaAmounts = chooseAmountsBySum(mangaCandidates, mangaTarget);
+      if (!mangaAmounts) continue;
+      out.grand_total = grand;
+      for (let i = 0; i < mangaAmounts.length; i++) {
+        out.manga_rows[i].payment_taxincl = mangaAmounts[i];
+      }
+      return true;
+    }
+    return false;
+  };
+  while (!trySolve()) {
+    if (!(await expandAmountCellsRound(searchCells, budget))) return;
   }
 }
 
@@ -826,7 +1039,9 @@ export async function extractShueishaFromPdf(buffer: Buffer): Promise<ShueishaEx
     detail_rows: [],
     detail_total: null,
     ocr_errors: [],
+    ocr_stats: createShueishaOcrStats(),
   };
+  const stats = out.ocr_stats!;
 
   const pages = await renderPdfPagesToPng(buffer, { scale: 4 });
   if (pages.length !== 2) {
@@ -847,10 +1062,12 @@ export async function extractShueishaFromPdf(buffer: Buffer): Promise<ShueishaEx
     };
     const [page1, page2] = await Promise.all([prepare(pages[0]), prepare(pages[1])]);
     const reconciliation: Page1Reconciliation = {
-      mangaCandidates: [],
-      summaryCandidates: [],
-      grandCandidates: [],
+      mangaCells: [],
+      summaryCell: null,
+      grandCell: null,
     };
+    const page1Budget: RecognizeBudget = { remaining: FALLBACK_RECOGNIZE_BUDGET_PER_PAGE };
+    const page2Budget: RecognizeBudget = { remaining: FALLBACK_RECOGNIZE_BUDGET_PER_PAGE };
     // Per-page error sinks keep ocr_errors in a fixed page-1-then-page-2
     // order regardless of completion timing; allSettled guarantees both
     // extractions have finished before workers terminate (no in-flight
@@ -858,14 +1075,14 @@ export async function extractShueishaFromPdf(buffer: Buffer): Promise<ShueishaEx
     const page1Errors: string[] = [];
     const page2Errors: string[] = [];
     const settled = await Promise.allSettled([
-      extractPage1(page1Text, page1Amount, page1, out, reconciliation, page1Errors),
-      extractPage2(page2Text, page2Amount, page2, out, page2Errors),
+      extractPage1(page1Text, page1Amount, page1, out, reconciliation, page1Errors, stats),
+      extractPage2(page2Text, page2Amount, page2, out, page2Errors, stats, page2Budget),
     ]);
     out.ocr_errors.push(...page1Errors, ...page2Errors);
     for (const result of settled) {
       if (result.status === "rejected") throw result.reason;
     }
-    reconcilePage1Amounts(out, reconciliation);
+    await reconcilePage1Amounts(out, reconciliation, page1Budget);
   } finally {
     await terminateOcrWorkers(workers);
   }
