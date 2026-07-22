@@ -263,6 +263,77 @@ export type SbSalesReportParse = {
   errors: string[];
 };
 
+type SbAmountCandidate = {
+  index: number;
+  offset: number;
+  amount: number;
+  isDetail: boolean;
+};
+
+type SbSummaryTotals = {
+  gross: number;
+  draw: number;
+  final: number;
+};
+
+function findSbSummaryTotals(
+  detailRegion: string,
+  candidates: SbAmountCandidate[],
+  expectedDraw: number | null,
+): { totals: SbSummaryTotals | null; errors: string[] } {
+  const labelPositions = [
+    detailRegion.indexOf("総合計額"),
+    detailRegion.indexOf("当期売上合計"),
+    detailRegion.indexOf("当期MG取崩額"),
+    detailRegion.indexOf("MG一覧シート参照"),
+  ];
+  if (labelPositions.some((pos) => pos < 0)) {
+    return {
+      totals: null,
+      errors: ["sb-creative: summary cluster labels were not found"],
+    };
+  }
+  for (let i = 1; i < labelPositions.length; i++) {
+    if (labelPositions[i] <= labelPositions[i - 1]) {
+      return {
+        totals: null,
+        errors: ["sb-creative: summary cluster labels were not in the expected order"],
+      };
+    }
+  }
+
+  const summaryStart = labelPositions[0];
+  const pool = candidates.filter((c) => !c.isDetail && c.offset >= summaryStart && c.amount >= 0);
+  const matches: SbSummaryTotals[] = [];
+  for (const gross of pool) {
+    if (gross.amount <= 0) continue;
+    for (const draw of pool) {
+      if (draw.index === gross.index) continue;
+      if (expectedDraw !== null && draw.amount !== expectedDraw) continue;
+      for (const final of pool) {
+        if (final.index === gross.index || final.index === draw.index) continue;
+        if (gross.amount - draw.amount === final.amount) {
+          matches.push({ gross: gross.amount, draw: draw.amount, final: final.amount });
+        }
+      }
+    }
+  }
+
+  const unique = new Map(matches.map((m) => [`${m.gross}\u0000${m.draw}\u0000${m.final}`, m]));
+  if (unique.size !== 1) {
+    return {
+      totals: null,
+      errors: [
+        unique.size === 0
+          ? "sb-creative: summary cluster did not contain a gross - MG draw = final match"
+          : "sb-creative: summary cluster had multiple gross - MG draw = final matches",
+      ],
+    };
+  }
+
+  return { totals: [...unique.values()][0], errors: [] };
+}
+
 /**
  * Deterministic (no-AI) parse of unpdf-flattened sales-report text.
  * Pages arrive as one space-joined string each, "\n"-separated; token order
@@ -300,20 +371,24 @@ export function parseSbSalesReportText(flattenedText: string): SbSalesReportPars
 
   // Detail entries: stream-wide (title, ¥amount) pairing.
   const detailRows: SbSalesDetailRow[] = [];
-  let printedSalesTotal: number | null = null;
+  const amountCandidates: SbAmountCandidate[] = [];
   const amountRe = /[¥￥]\s*([-−▲]?[\d,]+)/g;
   let cursor = 0;
+  let amountIndex = 0;
   for (let m = amountRe.exec(detailRegion); m; m = amountRe.exec(detailRegion)) {
     const candidate = detailRegion.slice(cursor, m.index);
     cursor = amountRe.lastIndex;
     const amount = parseSignedAmount(m[1]);
     if (amount === null) continue;
-    if (printedSalesTotal === null && /当期売上合計/.test(candidate)) {
-      printedSalesTotal = amount;
-      continue;
-    }
     const title = cleanDetailTitle(candidate);
-    if (!isWorkDetailTitle(title)) continue;
+    const isDetail = isWorkDetailTitle(title);
+    amountCandidates.push({
+      index: amountIndex++,
+      offset: m.index,
+      amount,
+      isDetail,
+    });
+    if (!isDetail) continue;
     detailRows.push({ title, royalty_taxincl: amount });
   }
 
@@ -353,6 +428,11 @@ export function parseSbSalesReportText(flattenedText: string): SbSalesReportPars
     }
   }
 
+  const summary = findSbSummaryTotals(detailRegion, amountCandidates, printedDrawTotal);
+  errors.push(...summary.errors);
+  const printedSalesTotal = summary.totals?.gross ?? null;
+  const printedSummaryDrawTotal = summary.totals?.draw ?? null;
+
   if (printedSalesTotal !== null) {
     const sum = detailRows.reduce((s, r) => s + r.royalty_taxincl, 0);
     if (sum !== printedSalesTotal) {
@@ -361,11 +441,18 @@ export function parseSbSalesReportText(flattenedText: string): SbSalesReportPars
       );
     }
   }
-  if (printedDrawTotal !== null) {
+  if (
+    printedDrawTotal !== null &&
+    printedSummaryDrawTotal !== null &&
+    printedDrawTotal !== printedSummaryDrawTotal
+  ) {
+    errors.push("sb-creative: printed MG draw totals disagree between summary cluster and MG list header");
+  }
+  if (printedSummaryDrawTotal !== null) {
     const sum = mgRows.reduce((s, r) => s + r.current_draw_taxincl, 0);
-    if (sum !== printedDrawTotal) {
+    if (sum !== printedSummaryDrawTotal) {
       errors.push(
-        `sb-creative: parsed MG draw sum ${sum} does not match printed 当期MG取崩額 ${printedDrawTotal} — refusing to emit INPUT detail`,
+        `sb-creative: parsed MG draw sum ${sum} does not match printed 当期MG取崩額 ${printedSummaryDrawTotal} — refusing to emit INPUT detail`,
       );
     }
   }

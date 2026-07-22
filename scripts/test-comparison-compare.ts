@@ -31,6 +31,49 @@ async function makeWorkbook(
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
+async function makeMultiMonthWorkbook(
+  sheets: Array<{ name: string; rows: Row[]; legacy?: boolean }>,
+): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  for (const sheet of sheets) {
+    const ws = wb.addWorksheet(sheet.name);
+    const col = (field: Field): number => {
+      const current = ELECTRONIC_COL[field];
+      return sheet.legacy && current >= ELECTRONIC_COL.company ? current - 1 : current;
+    };
+    ws.getRow(4).getCell(col("unique_identifier")).value = "Unique Identifier";
+    ws.getRow(4).getCell(col("channel")).value = "Channel";
+    ws.getRow(4).getCell(col("type")).value = "Type";
+    sheet.rows.forEach((row, i) => {
+      const wsRow = ws.getRow(6 + i);
+      for (const [field, value] of Object.entries(row)) {
+        wsRow.getCell(col(field as Field)).value = value as ExcelJS.CellValue;
+      }
+    });
+  }
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+async function makePublicationWorkbook(rows: Row[]): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("input_出版");
+  const col = (field: Field): number => {
+    if (field === "month") return 12;
+    if (field === "settlement_month") return 11;
+    return ELECTRONIC_COL[field];
+  };
+  ws.getRow(5).getCell(col("unique_identifier")).value = "고유번호";
+  ws.getRow(5).getCell(col("channel")).value = "채널";
+  ws.getRow(5).getCell(col("type")).value = "유형";
+  rows.forEach((row, i) => {
+    const wsRow = ws.getRow(6 + i);
+    for (const [field, value] of Object.entries(row)) {
+      wsRow.getCell(col(field as Field)).value = value as ExcelJS.CellValue;
+    }
+  });
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
 function baseRow(overrides: Row = {}): Row {
   return {
     channel_title_jp: "タイトルA",
@@ -60,6 +103,50 @@ function vectorRow(bits: readonly number[]): Row {
 }
 
 async function run() {
+  // 0. Multi-month answer workbooks keep historical sheets left-to-right;
+  //    comparison must select the rightmost valid INPUT sheet.
+  {
+    const activeRows = [baseRow(), baseRow({ channel_title_jp: "タイトルB" })];
+    const result = await compareInputWorkbooks({
+      candidate: await makeWorkbook(activeRows, { sheetName: "input_電子_5月" }),
+      golden: await makeMultiMonthWorkbook([
+        { name: "input_電子_1月", rows: [baseRow({ channel_title_jp: "OLD" })], legacy: true },
+        { name: "input_電子_5月", rows: activeRows, legacy: true },
+      ]),
+    });
+    assert.equal(result.summary.golden_sheet, "input_電子_5月");
+    assert.equal(result.summary.golden_rows, 2);
+    assert.equal(result.summary.diff_total, 0);
+  }
+
+  // 0b. A multi-month candidate with no explicit sheet also selects rightmost/latest.
+  {
+    const activeRows = [baseRow(), baseRow({ channel_title_jp: "タイトルB" })];
+    const result = await compareInputWorkbooks({
+      candidate: await makeMultiMonthWorkbook([
+        { name: "input_電子_1月", rows: [baseRow({ channel_title_jp: "OLD" })] },
+        { name: "input_電子_5月", rows: activeRows },
+      ]),
+      golden: await makeWorkbook(activeRows, { sheetName: "input_電子_5月" }),
+    });
+    assert.equal(result.summary.candidate_sheet, "input_電子_5月");
+    assert.equal(result.summary.candidate_rows, 2);
+    assert.equal(result.summary.diff_total, 0);
+  }
+
+  // 0c. Explicit publication comparison uses its row-5 header and column contract.
+  {
+    const rows = [baseRow({ settlement_month: "2026-02-01" })];
+    const result = await compareInputWorkbooks({
+      candidate: await makePublicationWorkbook(rows),
+      golden: await makePublicationWorkbook(rows),
+      sheetName: "input_出版",
+    });
+    assert.equal(result.summary.candidate_sheet, "input_出版");
+    assert.equal(result.summary.exact_rows, 1);
+    assert.equal(result.summary.diff_total, 0);
+  }
+
   // 1. Identical workbooks → all rows exact, zero diffs.
   {
     const rows = [baseRow(), baseRow({ channel_title_jp: "タイトルB", total_amount_jpy: 50 })];

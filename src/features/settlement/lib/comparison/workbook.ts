@@ -5,10 +5,11 @@
  * answer-key). Strictly read-only: nothing here can write into either
  * workbook, so golden content can never leak into a candidate.
  *
- * Sheet selection: prefer the canonical sheet name (input_電子_N月), else the
- * first sheet whose row-4 header signature matches the known INPUT layout
- * (Unique Identifier / Channel / Type in the mapped columns). Anything else
- * is a clear error — we never guess a sheet.
+ * Sheet selection: a requested compatible sheet wins. Without an explicit
+ * request, compatible canonical input_電子_N月 sheets use the rightmost/latest
+ * worksheet in workbook order; a single other compatible INPUT sheet is the
+ * final fallback. Anything else is a clear error — we never guess by filename
+ * alone.
  */
 import ExcelJS from "exceljs";
 
@@ -21,6 +22,24 @@ const SHEET_NAME_PATTERN = /^input_電子_\d{1,2}月$/;
 
 export type CompareField = keyof typeof ELECTRONIC_COL;
 export const COMPARE_FIELDS = Object.keys(ELECTRONIC_COL) as CompareField[];
+type InputColumnMap = Record<CompareField, number>;
+
+// The 2026 v3 template inserted a blank G column. Historical answer keys use
+// the same schema with every field from company onward shifted one column left.
+const LEGACY_ELECTRONIC_COL = Object.fromEntries(
+  Object.entries(ELECTRONIC_COL).map(([field, col]) => [
+    field,
+    col >= ELECTRONIC_COL.company ? col - 1 : col,
+  ]),
+) as InputColumnMap;
+
+// Publication uses the v3 column positions but has no separate accounting
+// month column: settlement month is K and statement-received is L.
+const PUBLICATION_COL = {
+  ...ELECTRONIC_COL,
+  month: 12,
+  settlement_month: 11,
+} as InputColumnMap;
 
 export type CellState = "blank" | "formula" | "value";
 export type SemanticValue = string | number | boolean | null;
@@ -117,36 +136,88 @@ function snapshotCell(cell: ExcelJS.Cell): CellSnapshot {
   return value === null ? BLANK : { state: "value", value, formula: null, known: true };
 }
 
+function headerTextAt(ws: ExcelJS.Worksheet, row: number, col: number): string {
+  return normalizeIdentityPart(snapshotCell(ws.getRow(row).getCell(col)).value).toLowerCase();
+}
+
 function headerText(ws: ExcelJS.Worksheet, col: number): string {
-  return normalizeIdentityPart(snapshotCell(ws.getRow(HEADER_ROW).getCell(col)).value).toLowerCase();
+  return headerTextAt(ws, HEADER_ROW, col);
 }
 
 /** Row-4 signature of the known INPUT layout, in the mapped columns. */
-function headerLooksLikeInput(ws: ExcelJS.Worksheet): boolean {
+function headerLooksLikeInput(ws: ExcelJS.Worksheet, cols: InputColumnMap): boolean {
   return (
-    headerText(ws, ELECTRONIC_COL.unique_identifier) === "unique identifier" &&
-    headerText(ws, ELECTRONIC_COL.channel) === "channel" &&
-    headerText(ws, ELECTRONIC_COL.type) === "type"
+    headerText(ws, cols.unique_identifier) === "unique identifier" &&
+    headerText(ws, cols.channel) === "channel" &&
+    headerText(ws, cols.type) === "type"
   );
 }
 
-export async function readInputSheet(buffer: Buffer): Promise<InputSheetSnapshot> {
+function inputColumnMap(ws: ExcelJS.Worksheet): InputColumnMap | null {
+  if (ws.name.normalize("NFKC").trim() === "input_出版") {
+    const publicationHeaderOk =
+      headerTextAt(ws, 5, PUBLICATION_COL.unique_identifier) === "고유번호" &&
+      headerTextAt(ws, 5, PUBLICATION_COL.channel) === "채널" &&
+      headerTextAt(ws, 5, PUBLICATION_COL.type) === "유형";
+    if (publicationHeaderOk) return PUBLICATION_COL;
+  }
+  if (headerLooksLikeInput(ws, ELECTRONIC_COL)) return ELECTRONIC_COL;
+  if (headerLooksLikeInput(ws, LEGACY_ELECTRONIC_COL)) return LEGACY_ELECTRONIC_COL;
+  return null;
+}
+
+export async function readInputSheet(
+  buffer: Buffer,
+  preferredSheetName?: string,
+  strictPreferred = false,
+): Promise<InputSheetSnapshot> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer as unknown as ExcelJS.Buffer);
 
-  const byName = wb.worksheets.filter((ws) =>
-    SHEET_NAME_PATTERN.test(ws.name.normalize("NFKC").trim()),
-  );
-  let ws = byName.find(headerLooksLikeInput);
-  if (!ws) ws = wb.worksheets.find(headerLooksLikeInput);
-  if (!ws) {
+  const normalizedPreferred = preferredSheetName?.normalize("NFKC").trim();
+  if (normalizedPreferred) {
+    const preferred = wb.worksheets
+      .map((ws) => ({ ws, cols: inputColumnMap(ws) }))
+      .find(
+        (item): item is { ws: ExcelJS.Worksheet; cols: InputColumnMap } =>
+          item.ws.name.normalize("NFKC").trim() === normalizedPreferred && item.cols !== null,
+      );
+    if (preferred) return snapshotWorksheet(preferred.ws, preferred.cols);
+    if (strictPreferred) {
+      throw new Error(`requested INPUT sheet not found or incompatible: ${normalizedPreferred}`);
+    }
+  }
+
+  const canonical = wb.worksheets
+    .filter((ws) => SHEET_NAME_PATTERN.test(ws.name.normalize("NFKC").trim()))
+    .map((ws) => ({ ws, cols: inputColumnMap(ws) }))
+    .filter((item): item is { ws: ExcelJS.Worksheet; cols: InputColumnMap } => item.cols !== null);
+
+  let selected = normalizedPreferred
+    ? canonical.find((item) => item.ws.name.normalize("NFKC").trim() === normalizedPreferred)
+    : undefined;
+  if (!selected && canonical.length >= 1) {
+    // Historical multi-month workbooks accumulate INPUT sheets from left to
+    // right. The rightmost compatible canonical sheet is the active/latest one.
+    selected = canonical[canonical.length - 1];
+  }
+  if (!selected) {
+    const compatible = wb.worksheets
+      .map((ws) => ({ ws, cols: inputColumnMap(ws) }))
+      .filter((item): item is { ws: ExcelJS.Worksheet; cols: InputColumnMap } => item.cols !== null);
+    if (compatible.length === 1) selected = compatible[0];
+  }
+  if (!selected) {
     const names = wb.worksheets.map((w) => w.name).join(", ");
     throw new Error(
-      `electronic INPUT sheet not found: no sheet named like input_電子_N月 with the expected ` +
+      `electronic INPUT sheet not found: no unambiguous sheet named like input_電子_N月 with the expected ` +
         `row-${HEADER_ROW} headers (Unique Identifier / Channel / Type). Sheets present: ${names}`,
     );
   }
+  return snapshotWorksheet(selected.ws, selected.cols);
+}
 
+function snapshotWorksheet(ws: ExcelJS.Worksheet, cols: InputColumnMap): InputSheetSnapshot {
   const rows: InputRowSnapshot[] = [];
   const lastRow = Math.max(ws.actualRowCount, ws.rowCount, FIRST_DATA_ROW);
   for (let r = FIRST_DATA_ROW; r <= lastRow; r += 1) {
@@ -154,7 +225,7 @@ export async function readInputSheet(buffer: Buffer): Promise<InputSheetSnapshot
     const cells = {} as Record<CompareField, CellSnapshot>;
     let hasValue = false;
     for (const field of COMPARE_FIELDS) {
-      const snap = snapshotCell(row.getCell(ELECTRONIC_COL[field]));
+      const snap = snapshotCell(row.getCell(cols[field]));
       cells[field] = snap;
       if (snap.state === "value") hasValue = true;
     }

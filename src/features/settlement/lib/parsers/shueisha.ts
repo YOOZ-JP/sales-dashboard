@@ -1028,6 +1028,13 @@ export async function reconcilePage1Amounts(
   }
 }
 
+/**
+ * Language specs for the four OCR workers: page-1 text/amount, page-2 text/amount.
+ * tesseract.js 7 breaks on the combined `jpn+eng` worker spec in this runtime;
+ * text workers therefore use jpn-only while numeric workers use eng.
+ */
+export const SHUEISHA_OCR_WORKER_LANGS = ["jpn", "eng", "jpn", "eng"] as const;
+
 export async function extractShueishaFromPdf(buffer: Buffer): Promise<ShueishaExtract> {
   const out: ShueishaExtract = {
     payment_date: null,
@@ -1053,7 +1060,7 @@ export async function extractShueishaFromPdf(buffer: Buffer): Promise<ShueishaEx
   // truly concurrently. Worker parameter state (psm/whitelist) is per
   // worker, so per-page call sequences — and therefore OCR readings —
   // are identical to the old sequential run.
-  const workers = await createLocalOcrWorkers(["jpn+eng", "eng", "jpn+eng", "eng"]);
+  const workers = await createLocalOcrWorkers([...SHUEISHA_OCR_WORKER_LANGS]);
   const [page1Text, page1Amount, page2Text, page2Amount] = workers;
   try {
     const prepare = async (png: Buffer): Promise<SourcePage> => {

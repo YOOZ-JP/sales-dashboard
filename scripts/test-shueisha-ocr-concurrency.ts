@@ -15,6 +15,7 @@
  */
 import assert from "node:assert/strict";
 
+import { SHUEISHA_OCR_WORKER_LANGS } from "../src/features/settlement/lib/parsers/shueisha";
 import {
   createLocalOcrWorkers,
   terminateOcrWorkers,
@@ -40,9 +41,10 @@ function makeFake(langs: string, opts: { failTerminate?: boolean } = {}): FakeWo
 }
 
 const asWorker = (fake: FakeWorker): OcrWorker => fake as unknown as OcrWorker;
-const SPECS = ["jpn+eng", "eng", "jpn+eng", "eng"];
+const SPECS = [...SHUEISHA_OCR_WORKER_LANGS];
 
 async function main() {
+  assert.deepEqual(SPECS, ["jpn", "eng", "jpn", "eng"]);
   // --- 1+2: concurrent start, spec-ordered result ---
   const started: string[] = [];
   const resolvers: Array<() => void> = [];
@@ -83,7 +85,7 @@ async function main() {
   }
 
   // --- 4: terminateOcrWorkers never throws, terminates every worker ---
-  const mixed = [makeFake("jpn+eng", { failTerminate: true }), makeFake("eng")];
+  const mixed = [makeFake("jpn", { failTerminate: true }), makeFake("eng")];
   await terminateOcrWorkers(mixed.map(asWorker));
   for (const fake of mixed) {
     assert.equal(fake.terminated, true, "terminateOcrWorkers must reach every worker");

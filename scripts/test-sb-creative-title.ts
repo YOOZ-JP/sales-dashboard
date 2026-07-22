@@ -13,6 +13,7 @@ import {
   parseSbCreative,
   parseSbSalesReportText,
 } from "../src/features/settlement/lib/parsers/sb-creative";
+import { detectPlatform } from "../src/features/settlement/lib/parsers/registry";
 
 // ── normalizeSbWorkKey ──────────────────────────────────────────────────────
 
@@ -204,6 +205,21 @@ const SYNTH_PAGE_4 = [
 ].join(" ");
 const SYNTH_TEXT = [SYNTH_PAGE_1, SYNTH_PAGE_2, SYNTH_PAGE_3, SYNTH_PAGE_4].join("\n");
 
+function assertSyntheticTextParses(text: string, message: string): void {
+  const parsed = parseSbSalesReportText(text);
+  assert.deepEqual(parsed.errors, [], message);
+  assert.equal(
+    parsed.detailRows.reduce((s, r) => s + r.royalty_taxincl, 0),
+    14810,
+    "detail sum reconciles with the printed 当期売上合計①",
+  );
+  assert.deepEqual(
+    parsed.mgRows.map((r) => r.current_draw_taxincl),
+    [1100, 0, 0],
+    "MG draw is the third money value of each row",
+  );
+}
+
 {
   const parsed = parseSbSalesReportText(SYNTH_TEXT);
   assert.deepEqual(parsed.errors, [], "clean synthetic report text parses without errors");
@@ -256,6 +272,54 @@ const SYNTH_TEXT = [SYNTH_PAGE_1, SYNTH_PAGE_2, SYNTH_PAGE_3, SYNTH_PAGE_4].join
   );
 }
 
+// Old flattened summary layout: values may sit beside their visual labels
+// instead of arriving as one neat value row. Arithmetic, not adjacency, picks
+// the printed gross / MG draw / final cluster.
+{
+  const oldSummaryPage = [
+    "¥150 8 ネット 50.00% 電子書籍 10%",
+    "総合計額 ¥13,710 当期売上合計 ① ¥14,810",
+    "当期MG取崩額（MG一覧シート参照） ② ¥1,100 ③ ¥0",
+    "※当該対価金額が5,000円に満たない場合は繰り越されるものとします。 以上",
+    "作品B（コミック）１ ¥4,500",
+    "作品B【分冊版】（コミック）(1話～8話） ¥200",
+    "作品C（コミック）３ ¥1,000",
+  ].join(" ");
+  assertSyntheticTextParses(
+    [SYNTH_PAGE_1, oldSummaryPage, SYNTH_PAGE_3, SYNTH_PAGE_4].join("\n"),
+    "old summary layout parses without label-adjacent gross assumptions",
+  );
+}
+
+// Summary-value order is not trusted. The unique arithmetic cluster still has
+// to be gross - printed MG draw = final.
+{
+  const permutedSummaryPage = [
+    "¥150 8 ネット 50.00% 電子書籍 10%",
+    "当期売上合計 ① 当期MG取崩額（MG一覧シート参照） ② ③ 総合計額 ①－②＋③",
+    "¥1,100 ¥13,710 ¥14,810",
+    "※当該対価金額が5,000円に満たない場合は繰り越されるものとします。 以上",
+    "作品B（コミック）１ ¥4,500",
+    "作品B【分冊版】（コミック）(1話～8話） ¥200",
+    "作品C（コミック）３ ¥1,000",
+  ].join(" ");
+  assertSyntheticTextParses(
+    [SYNTH_PAGE_1, permutedSummaryPage, SYNTH_PAGE_3, SYNTH_PAGE_4].join("\n"),
+    "summary value permutation parses by arithmetic cluster",
+  );
+}
+
+// False-total trap: another non-detail arithmetic triple using the same MG
+// draw must make the summary ambiguous instead of silently choosing one.
+{
+  const trapped = parseSbSalesReportText(
+    SYNTH_TEXT.replace("¥14,810 ¥1,100 繰越分 ¥0 ¥13,710", "¥14,810 ¥1,100 ¥13,710 ¥9,999 ¥1,100 ¥8,899"),
+  );
+  assert.equal(trapped.errors.length, 1, "ambiguous summary totals are a hard parser error");
+  assert.match(trapped.errors[0], /summary cluster/);
+  assert.deepEqual(trapped.detailRows, [], "ambiguous summary emits no INPUT detail");
+}
+
 // Printed-total mismatch → explicit error and no INPUT detail at all.
 {
   const tampered = parseSbSalesReportText(SYNTH_TEXT.replace("¥5,000", "¥5,001"));
@@ -268,7 +332,7 @@ const SYNTH_TEXT = [SYNTH_PAGE_1, SYNTH_PAGE_2, SYNTH_PAGE_3, SYNTH_PAGE_4].join
     SYNTH_TEXT.replace("660,000 300,000 1,100 298,900", "660,000 300,000 9,999 298,900"),
   );
   assert.equal(tampered.errors.length, 1, "MG draw-sum mismatch is an explicit error");
-  assert.match(tampered.errors[0], /当期MG取崩額/);
+  assert.match(tampered.errors[0], /summary cluster|当期MG取崩額/);
   assert.deepEqual(tampered.detailRows, [], "MG mismatch emits no INPUT detail");
 }
 
@@ -278,6 +342,18 @@ assert.equal(classifySbSourceFile("【請求書】SBクリエイティブ様_「
 assert.equal(classifySbSourceFile("【請求書】SBクリエイティブ様_「作品」他（株式会社）.pdf"), "mg_invoice");
 assert.equal(classifySbSourceFile("支払通知書_2026年06月30日お支払い.pdf"), "payment_notice");
 assert.equal(classifySbSourceFile("12850_株式会社RIVERSE様【2026年06月】前払印税報告書.pdf"), "sales_report");
+
+assert.equal(
+  detectPlatform({ filename: "SBクリエイティブ_株式会社RIVERSE様【2026年01月】前払印税報告書.pdf" })
+    .platform_code,
+  "sb_creative_m",
+  "historical SB Creative sales-report filename remains narrowly detected",
+);
+assert.equal(
+  detectPlatform({ filename: "支払通知書_2026年06月30日お支払い.pdf" }).platform_code,
+  "sb_creative_e",
+  "SB Creative payment notice filename remains summary-file detected",
+);
 
 // Payment notices return zero INPUT records (audit evidence handled downstream).
 (async () => {

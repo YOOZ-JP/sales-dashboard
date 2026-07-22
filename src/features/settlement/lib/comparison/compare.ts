@@ -432,6 +432,11 @@ function groupByIdentity(rows: InputRowSnapshot[]): Map<string, InputRowSnapshot
 export interface CompareInputWorkbooksOptions {
   candidate: Buffer;
   golden: Buffer;
+  /** Force both sides to the same compatible sheet. */
+  sheetName?: string;
+  /** Optional side-specific sheet names for historical workbooks whose labels differ. */
+  candidateSheetName?: string;
+  goldenSheetName?: string;
   /** Structured diffs are capped here; summary counts always cover everything. */
   maxDiffs?: number;
 }
@@ -440,10 +445,13 @@ export async function compareInputWorkbooks(
   opts: CompareInputWorkbooksOptions,
 ): Promise<ComparisonResult> {
   const maxDiffs = opts.maxDiffs ?? DEFAULT_MAX_DIFFS;
-  const [candidateSheet, goldenSheet] = await Promise.all([
-    readInputSheet(opts.candidate),
-    readInputSheet(opts.golden),
-  ]);
+  const candidateSheetName = opts.candidateSheetName ?? opts.sheetName;
+  const strictCandidate = typeof candidateSheetName === "string" && candidateSheetName.trim().length > 0;
+  const candidateSheet = await readInputSheet(opts.candidate, candidateSheetName, strictCandidate);
+  const goldenSheetName = opts.goldenSheetName ?? opts.sheetName ?? candidateSheet.sheetName;
+  const strictGolden =
+    typeof opts.goldenSheetName === "string" || typeof opts.sheetName === "string";
+  const goldenSheet = await readInputSheet(opts.golden, goldenSheetName, strictGolden);
 
   const candidateGroups = groupByIdentity(candidateSheet.rows);
   const goldenGroups = groupByIdentity(goldenSheet.rows);

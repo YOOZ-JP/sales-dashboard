@@ -102,6 +102,8 @@ export const SIGNATURES: PlatformSignature[] = [
     code: "sb_creative_m",
     filenamePatterns: [
       /\d+_株式会社RIVERSE様【\d+年\d+月】前払印税報告書/,
+      // Historical form: SB brand prefix + underscore + RIVERSE report marker.
+      /^SBクリエイティブ_株式会社RIVERSE様【\d+年\d+月】前払印税報告書/,
       /【請求書】SBクリエイティブ様/,
     ],
     weight: 10,
